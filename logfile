@@ -1,0 +1,165 @@
+2026-04-28 00:22:51.785 CDT [227297] LOG:  starting PostgreSQL 17.8 on x86_64-pc-linux-gnu, compiled by clang version 21.1.7, 64-bit
+2026-04-28 00:22:51.786 CDT [227297] LOG:  listening on IPv6 address "::1", port 5432
+2026-04-28 00:22:51.786 CDT [227297] LOG:  listening on IPv4 address "127.0.0.1", port 5432
+2026-04-28 00:22:51.786 CDT [227297] FATAL:  could not create lock file "/run/postgresql/.s.PGSQL.5432.lock": No such file or directory
+2026-04-28 00:22:51.789 CDT [227297] LOG:  database system is shut down
+2026-04-28 00:24:29.575 CDT [228234] LOG:  starting PostgreSQL 17.8 on x86_64-pc-linux-gnu, compiled by clang version 21.1.7, 64-bit
+2026-04-28 00:24:29.575 CDT [228234] LOG:  listening on IPv6 address "::1", port 5432
+2026-04-28 00:24:29.575 CDT [228234] LOG:  listening on IPv4 address "127.0.0.1", port 5432
+2026-04-28 00:24:29.576 CDT [228234] FATAL:  could not create lock file "/run/postgresql/.s.PGSQL.5432.lock": No such file or directory
+2026-04-28 00:24:29.578 CDT [228234] LOG:  database system is shut down
+2026-04-28 00:26:00.491 CDT [229330] LOG:  starting PostgreSQL 17.8 on x86_64-pc-linux-gnu, compiled by clang version 21.1.7, 64-bit
+2026-04-28 00:26:00.492 CDT [229330] LOG:  listening on IPv6 address "::1", port 5432
+2026-04-28 00:26:00.492 CDT [229330] LOG:  listening on IPv4 address "127.0.0.1", port 5432
+2026-04-28 00:26:00.493 CDT [229330] LOG:  listening on Unix socket "/tmp/.s.PGSQL.5432"
+2026-04-28 00:26:00.496 CDT [229333] LOG:  database system was shut down at 2026-04-28 00:24:29 CDT
+2026-04-28 00:26:00.500 CDT [229330] LOG:  database system is ready to accept connections
+2026-04-28 00:28:40.335 CDT [230823] FATAL:  lock file "postmaster.pid" already exists
+2026-04-28 00:28:40.335 CDT [230823] HINT:  Is another postmaster (PID 229330) running in data directory "/home/shlok/Documents/Programming/Sandbox/obsidian-sync-engine/db_data"?
+2026-04-28 00:29:07.095 CDT [229330] LOG:  received fast shutdown request
+2026-04-28 00:29:07.096 CDT [229330] LOG:  aborting any active transactions
+2026-04-28 00:29:07.098 CDT [229330] LOG:  background worker "logical replication launcher" (PID 229336) exited with exit code 1
+2026-04-28 00:29:07.099 CDT [229331] LOG:  shutting down
+2026-04-28 00:29:07.100 CDT [229331] LOG:  checkpoint starting: shutdown immediate
+2026-04-28 00:29:07.107 CDT [229331] LOG:  checkpoint complete: wrote 46 buffers (0.3%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.003 s, sync=0.002 s, total=0.008 s; sync files=11, longest=0.001 s, average=0.001 s; distance=270 kB, estimate=270 kB; lsn=0/15304D8, redo lsn=0/15304D8
+2026-04-28 00:29:07.116 CDT [229330] LOG:  database system is shut down
+2026-04-28 00:29:08.965 CDT [231243] LOG:  starting PostgreSQL 17.8 on x86_64-pc-linux-gnu, compiled by clang version 21.1.7, 64-bit
+2026-04-28 00:29:08.966 CDT [231243] LOG:  listening on IPv6 address "::1", port 5432
+2026-04-28 00:29:08.966 CDT [231243] LOG:  listening on IPv4 address "127.0.0.1", port 5432
+2026-04-28 00:29:08.967 CDT [231243] LOG:  listening on Unix socket "/tmp/.s.PGSQL.5432"
+2026-04-28 00:29:08.970 CDT [231246] LOG:  database system was shut down at 2026-04-28 00:29:07 CDT
+2026-04-28 00:29:08.974 CDT [231243] LOG:  database system is ready to accept connections
+2026-04-28 00:29:13.715 CDT [231243] LOG:  received fast shutdown request
+2026-04-28 00:29:13.717 CDT [231243] LOG:  aborting any active transactions
+2026-04-28 00:29:13.719 CDT [231243] LOG:  background worker "logical replication launcher" (PID 231249) exited with exit code 1
+2026-04-28 00:29:13.719 CDT [231244] LOG:  shutting down
+2026-04-28 00:29:13.720 CDT [231244] LOG:  checkpoint starting: shutdown immediate
+2026-04-28 00:29:13.725 CDT [231244] LOG:  checkpoint complete: wrote 3 buffers (0.0%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.002 s, sync=0.001 s, total=0.006 s; sync files=2, longest=0.001 s, average=0.001 s; distance=0 kB, estimate=0 kB; lsn=0/1530550, redo lsn=0/1530550
+2026-04-28 00:29:13.734 CDT [231243] LOG:  database system is shut down
+2026-04-28 00:29:17.485 CDT [231393] LOG:  starting PostgreSQL 17.8 on x86_64-pc-linux-gnu, compiled by clang version 21.1.7, 64-bit
+2026-04-28 00:29:17.485 CDT [231393] LOG:  listening on IPv6 address "::1", port 5432
+2026-04-28 00:29:17.485 CDT [231393] LOG:  listening on IPv4 address "127.0.0.1", port 5432
+2026-04-28 00:29:17.487 CDT [231393] LOG:  listening on Unix socket "/tmp/.s.PGSQL.5432"
+2026-04-28 00:29:17.490 CDT [231407] LOG:  database system was shut down at 2026-04-28 00:29:13 CDT
+2026-04-28 00:29:17.493 CDT [231393] LOG:  database system is ready to accept connections
+2026-04-28 00:29:18.519 CDT [231393] LOG:  received fast shutdown request
+2026-04-28 00:29:18.520 CDT [231393] LOG:  aborting any active transactions
+2026-04-28 00:29:18.522 CDT [231393] LOG:  background worker "logical replication launcher" (PID 231410) exited with exit code 1
+2026-04-28 00:29:18.522 CDT [231405] LOG:  shutting down
+2026-04-28 00:29:18.523 CDT [231405] LOG:  checkpoint starting: shutdown immediate
+2026-04-28 00:29:18.528 CDT [231405] LOG:  checkpoint complete: wrote 3 buffers (0.0%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.002 s, sync=0.001 s, total=0.006 s; sync files=2, longest=0.001 s, average=0.001 s; distance=0 kB, estimate=0 kB; lsn=0/15305C8, redo lsn=0/15305C8
+2026-04-28 00:29:18.533 CDT [231393] LOG:  database system is shut down
+2026-04-28 00:29:19.615 CDT [231503] LOG:  starting PostgreSQL 17.8 on x86_64-pc-linux-gnu, compiled by clang version 21.1.7, 64-bit
+2026-04-28 00:29:19.615 CDT [231503] LOG:  listening on IPv6 address "::1", port 5432
+2026-04-28 00:29:19.615 CDT [231503] LOG:  listening on IPv4 address "127.0.0.1", port 5432
+2026-04-28 00:29:19.617 CDT [231503] LOG:  listening on Unix socket "/tmp/.s.PGSQL.5432"
+2026-04-28 00:29:19.620 CDT [231506] LOG:  database system was shut down at 2026-04-28 00:29:18 CDT
+2026-04-28 00:29:19.623 CDT [231503] LOG:  database system is ready to accept connections
+2026-04-28 00:29:20.010 CDT [231503] LOG:  received fast shutdown request
+2026-04-28 00:29:20.011 CDT [231503] LOG:  aborting any active transactions
+2026-04-28 00:29:20.013 CDT [231503] LOG:  background worker "logical replication launcher" (PID 231509) exited with exit code 1
+2026-04-28 00:29:20.014 CDT [231504] LOG:  shutting down
+2026-04-28 00:29:20.015 CDT [231504] LOG:  checkpoint starting: shutdown immediate
+2026-04-28 00:29:20.020 CDT [231504] LOG:  checkpoint complete: wrote 3 buffers (0.0%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.002 s, sync=0.001 s, total=0.006 s; sync files=2, longest=0.001 s, average=0.001 s; distance=0 kB, estimate=0 kB; lsn=0/1530640, redo lsn=0/1530640
+2026-04-28 00:29:20.026 CDT [231503] LOG:  database system is shut down
+2026-04-28 00:29:24.172 CDT [231695] LOG:  starting PostgreSQL 17.8 on x86_64-pc-linux-gnu, compiled by clang version 21.1.7, 64-bit
+2026-04-28 00:29:24.172 CDT [231695] LOG:  listening on IPv6 address "::1", port 5432
+2026-04-28 00:29:24.172 CDT [231695] LOG:  listening on IPv4 address "127.0.0.1", port 5432
+2026-04-28 00:29:24.174 CDT [231695] LOG:  listening on Unix socket "/tmp/.s.PGSQL.5432"
+2026-04-28 00:29:24.176 CDT [231698] LOG:  database system was shut down at 2026-04-28 00:29:24 CDT
+2026-04-28 00:29:24.180 CDT [231695] LOG:  database system is ready to accept connections
+2026-04-28 00:29:30.997 CDT [231695] LOG:  received fast shutdown request
+2026-04-28 00:29:30.998 CDT [231695] LOG:  aborting any active transactions
+2026-04-28 00:29:31.002 CDT [231695] LOG:  background worker "logical replication launcher" (PID 231701) exited with exit code 1
+2026-04-28 00:29:31.002 CDT [231696] LOG:  shutting down
+2026-04-28 00:29:31.002 CDT [231696] LOG:  checkpoint starting: shutdown immediate
+2026-04-28 00:29:31.008 CDT [231696] LOG:  checkpoint complete: wrote 3 buffers (0.0%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.002 s, sync=0.001 s, total=0.007 s; sync files=2, longest=0.001 s, average=0.001 s; distance=0 kB, estimate=0 kB; lsn=0/14ECCB0, redo lsn=0/14ECCB0
+2026-04-28 00:29:31.014 CDT [231695] LOG:  database system is shut down
+2026-04-28 00:31:45.081 CDT [233580] LOG:  starting PostgreSQL 17.8 on x86_64-pc-linux-gnu, compiled by clang version 21.1.7, 64-bit
+2026-04-28 00:31:45.082 CDT [233580] LOG:  listening on IPv6 address "::1", port 5432
+2026-04-28 00:31:45.082 CDT [233580] LOG:  listening on IPv4 address "127.0.0.1", port 5432
+2026-04-28 00:31:45.083 CDT [233580] LOG:  listening on Unix socket "/tmp/.s.PGSQL.5432"
+2026-04-28 00:31:45.086 CDT [233591] LOG:  database system was shut down at 2026-04-28 00:29:31 CDT
+2026-04-28 00:31:45.091 CDT [233580] LOG:  database system is ready to accept connections
+2026-04-28 00:31:48.191 CDT [233580] LOG:  received fast shutdown request
+2026-04-28 00:31:48.193 CDT [233580] LOG:  aborting any active transactions
+2026-04-28 00:31:48.195 CDT [233580] LOG:  background worker "logical replication launcher" (PID 233598) exited with exit code 1
+2026-04-28 00:31:48.196 CDT [233589] LOG:  shutting down
+2026-04-28 00:31:48.196 CDT [233589] LOG:  checkpoint starting: shutdown immediate
+2026-04-28 00:31:48.201 CDT [233589] LOG:  checkpoint complete: wrote 3 buffers (0.0%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.002 s, sync=0.001 s, total=0.006 s; sync files=2, longest=0.001 s, average=0.001 s; distance=0 kB, estimate=0 kB; lsn=0/14ECD28, redo lsn=0/14ECD28
+2026-04-28 00:31:48.206 CDT [233580] LOG:  database system is shut down
+2026-04-28 00:31:48.346 CDT [233684] LOG:  starting PostgreSQL 17.8 on x86_64-pc-linux-gnu, compiled by clang version 21.1.7, 64-bit
+2026-04-28 00:31:48.347 CDT [233684] LOG:  listening on IPv6 address "::1", port 5432
+2026-04-28 00:31:48.347 CDT [233684] LOG:  listening on IPv4 address "127.0.0.1", port 5432
+2026-04-28 00:31:48.348 CDT [233684] LOG:  listening on Unix socket "/tmp/.s.PGSQL.5432"
+2026-04-28 00:31:48.351 CDT [233687] LOG:  database system was shut down at 2026-04-28 00:31:48 CDT
+2026-04-28 00:31:48.355 CDT [233684] LOG:  database system is ready to accept connections
+2026-04-28 00:31:49.174 CDT [233684] LOG:  received fast shutdown request
+2026-04-28 00:31:49.175 CDT [233684] LOG:  aborting any active transactions
+2026-04-28 00:31:49.178 CDT [233684] LOG:  background worker "logical replication launcher" (PID 233690) exited with exit code 1
+2026-04-28 00:31:49.178 CDT [233685] LOG:  shutting down
+2026-04-28 00:31:49.178 CDT [233685] LOG:  checkpoint starting: shutdown immediate
+2026-04-28 00:31:49.183 CDT [233685] LOG:  checkpoint complete: wrote 3 buffers (0.0%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.002 s, sync=0.001 s, total=0.006 s; sync files=2, longest=0.001 s, average=0.001 s; distance=0 kB, estimate=0 kB; lsn=0/14ECDA0, redo lsn=0/14ECDA0
+2026-04-28 00:31:49.189 CDT [233684] LOG:  database system is shut down
+2026-04-28 00:31:49.337 CDT [233700] LOG:  starting PostgreSQL 17.8 on x86_64-pc-linux-gnu, compiled by clang version 21.1.7, 64-bit
+2026-04-28 00:31:49.337 CDT [233700] LOG:  listening on IPv6 address "::1", port 5432
+2026-04-28 00:31:49.337 CDT [233700] LOG:  listening on IPv4 address "127.0.0.1", port 5432
+2026-04-28 00:31:49.338 CDT [233700] LOG:  listening on Unix socket "/tmp/.s.PGSQL.5432"
+2026-04-28 00:31:49.341 CDT [233703] LOG:  database system was shut down at 2026-04-28 00:31:49 CDT
+2026-04-28 00:31:49.345 CDT [233700] LOG:  database system is ready to accept connections
+2026-04-28 00:31:49.735 CDT [233700] LOG:  received fast shutdown request
+2026-04-28 00:31:49.736 CDT [233700] LOG:  aborting any active transactions
+2026-04-28 00:31:49.738 CDT [233700] LOG:  background worker "logical replication launcher" (PID 233706) exited with exit code 1
+2026-04-28 00:31:49.739 CDT [233701] LOG:  shutting down
+2026-04-28 00:31:49.740 CDT [233701] LOG:  checkpoint starting: shutdown immediate
+2026-04-28 00:31:49.744 CDT [233701] LOG:  checkpoint complete: wrote 3 buffers (0.0%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.002 s, sync=0.001 s, total=0.006 s; sync files=2, longest=0.001 s, average=0.001 s; distance=0 kB, estimate=0 kB; lsn=0/14ECE18, redo lsn=0/14ECE18
+2026-04-28 00:31:49.752 CDT [233700] LOG:  database system is shut down
+2026-04-28 00:31:49.892 CDT [233728] LOG:  starting PostgreSQL 17.8 on x86_64-pc-linux-gnu, compiled by clang version 21.1.7, 64-bit
+2026-04-28 00:31:49.893 CDT [233728] LOG:  listening on IPv6 address "::1", port 5432
+2026-04-28 00:31:49.893 CDT [233728] LOG:  listening on IPv4 address "127.0.0.1", port 5432
+2026-04-28 00:31:49.894 CDT [233728] LOG:  listening on Unix socket "/tmp/.s.PGSQL.5432"
+2026-04-28 00:31:49.897 CDT [233731] LOG:  database system was shut down at 2026-04-28 00:31:49 CDT
+2026-04-28 00:31:49.901 CDT [233728] LOG:  database system is ready to accept connections
+2026-04-28 00:31:50.353 CDT [233728] LOG:  received fast shutdown request
+2026-04-28 00:31:50.355 CDT [233728] LOG:  aborting any active transactions
+2026-04-28 00:31:50.357 CDT [233728] LOG:  background worker "logical replication launcher" (PID 233734) exited with exit code 1
+2026-04-28 00:31:50.358 CDT [233729] LOG:  shutting down
+2026-04-28 00:31:50.358 CDT [233729] LOG:  checkpoint starting: shutdown immediate
+2026-04-28 00:31:50.363 CDT [233729] LOG:  checkpoint complete: wrote 3 buffers (0.0%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.002 s, sync=0.001 s, total=0.006 s; sync files=2, longest=0.001 s, average=0.001 s; distance=0 kB, estimate=0 kB; lsn=0/14ECE90, redo lsn=0/14ECE90
+2026-04-28 00:31:50.371 CDT [233728] LOG:  database system is shut down
+2026-04-28 00:31:50.509 CDT [233744] LOG:  starting PostgreSQL 17.8 on x86_64-pc-linux-gnu, compiled by clang version 21.1.7, 64-bit
+2026-04-28 00:31:50.510 CDT [233744] LOG:  listening on IPv6 address "::1", port 5432
+2026-04-28 00:31:50.510 CDT [233744] LOG:  listening on IPv4 address "127.0.0.1", port 5432
+2026-04-28 00:31:50.511 CDT [233744] LOG:  listening on Unix socket "/tmp/.s.PGSQL.5432"
+2026-04-28 00:31:50.514 CDT [233747] LOG:  database system was shut down at 2026-04-28 00:31:50 CDT
+2026-04-28 00:31:50.519 CDT [233744] LOG:  database system is ready to accept connections
+2026-04-28 00:31:50.970 CDT [233744] LOG:  received fast shutdown request
+2026-04-28 00:31:50.971 CDT [233744] LOG:  aborting any active transactions
+2026-04-28 00:31:50.974 CDT [233744] LOG:  background worker "logical replication launcher" (PID 233750) exited with exit code 1
+2026-04-28 00:31:50.974 CDT [233745] LOG:  shutting down
+2026-04-28 00:31:50.975 CDT [233745] LOG:  checkpoint starting: shutdown immediate
+2026-04-28 00:31:50.980 CDT [233745] LOG:  checkpoint complete: wrote 3 buffers (0.0%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.002 s, sync=0.001 s, total=0.006 s; sync files=2, longest=0.001 s, average=0.001 s; distance=0 kB, estimate=0 kB; lsn=0/14ECF08, redo lsn=0/14ECF08
+2026-04-28 00:31:50.987 CDT [233744] LOG:  database system is shut down
+2026-04-28 00:31:51.130 CDT [233760] LOG:  starting PostgreSQL 17.8 on x86_64-pc-linux-gnu, compiled by clang version 21.1.7, 64-bit
+2026-04-28 00:31:51.130 CDT [233760] LOG:  listening on IPv6 address "::1", port 5432
+2026-04-28 00:31:51.130 CDT [233760] LOG:  listening on IPv4 address "127.0.0.1", port 5432
+2026-04-28 00:31:51.131 CDT [233760] LOG:  listening on Unix socket "/tmp/.s.PGSQL.5432"
+2026-04-28 00:31:51.135 CDT [233763] LOG:  database system was shut down at 2026-04-28 00:31:50 CDT
+2026-04-28 00:31:51.139 CDT [233760] LOG:  database system is ready to accept connections
+2026-04-28 00:36:51.229 CDT [233761] LOG:  checkpoint starting: time
+2026-04-28 00:36:55.543 CDT [233761] LOG:  checkpoint complete: wrote 46 buffers (0.3%); 0 WAL file(s) added, 0 removed, 0 recycled; write=4.309 s, sync=0.003 s, total=4.315 s; sync files=11, longest=0.001 s, average=0.001 s; distance=270 kB, estimate=270 kB; lsn=0/1530800, redo lsn=0/15307A8
+2026-04-28 00:38:06.899 CDT [233760] LOG:  received fast shutdown request
+2026-04-28 00:38:06.900 CDT [233760] LOG:  aborting any active transactions
+2026-04-28 00:38:06.903 CDT [233760] LOG:  background worker "logical replication launcher" (PID 233766) exited with exit code 1
+2026-04-28 00:38:06.903 CDT [233761] LOG:  shutting down
+2026-04-28 00:38:06.904 CDT [233761] LOG:  checkpoint starting: shutdown immediate
+2026-04-28 00:38:06.907 CDT [233761] LOG:  checkpoint complete: wrote 0 buffers (0.0%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.001 s, sync=0.001 s, total=0.004 s; sync files=0, longest=0.000 s, average=0.000 s; distance=0 kB, estimate=243 kB; lsn=0/15308B0, redo lsn=0/15308B0
+2026-04-28 00:38:06.915 CDT [233760] LOG:  database system is shut down
+2026-04-28 00:38:10.997 CDT [236456] LOG:  starting PostgreSQL 17.8 on x86_64-pc-linux-gnu, compiled by clang version 21.1.7, 64-bit
+2026-04-28 00:38:10.997 CDT [236456] LOG:  listening on IPv6 address "::1", port 5432
+2026-04-28 00:38:10.997 CDT [236456] LOG:  listening on IPv4 address "127.0.0.1", port 5432
+2026-04-28 00:38:10.999 CDT [236456] LOG:  listening on Unix socket "/tmp/.s.PGSQL.5432"
+2026-04-28 00:38:11.002 CDT [236459] LOG:  database system was shut down at 2026-04-28 00:38:06 CDT
+2026-04-28 00:38:11.007 CDT [236456] LOG:  database system is ready to accept connections
+2026-04-28 00:43:11.036 CDT [236457] LOG:  checkpoint starting: time
+2026-04-28 00:43:11.042 CDT [236457] LOG:  checkpoint complete: wrote 3 buffers (0.0%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.002 s, sync=0.001 s, total=0.006 s; sync files=2, longest=0.001 s, average=0.001 s; distance=0 kB, estimate=0 kB; lsn=0/15309B8, redo lsn=0/1530960

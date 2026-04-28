@@ -1,4 +1,12 @@
 procs:
   plugin:
+    shell: "cd plugin && npm run dev"
+  server:
+    shell: "cd server && npm run dev"
+  db:
+    shell: "./db_setup.sh"
+  pluginmove:
     shell: "./plugin/movestuff.sh"
-  
+  tunnel:
+    shell: "./server/tunnel.sh"
+
