@@ -1,0 +1,11 @@
+{
+	"id": "obsidian-sync-engine",
+	"name": "Sync Files",
+	"version": "1.0.0",
+	"minAppVersion": "0.15.0",
+	"description": "Sync files with realtime functionality",
+	"author": "Obsidian",
+	"authorUrl": "https://github.com/Shlok-Bhakta/obsidian-sync-engine",
+	"fundingUrl": "https://github.com/Shlok-Bhakta/obsidian-sync-engine",
+	"isDesktopOnly": false
+}
