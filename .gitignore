@@ -20,3 +20,9 @@ data.json
 
 # Exclude macOS Finder (System Explorer) View States
 .DS_Store
+
+# file to move stuff to the right dir automatically
+movestuff.sh
+
+# tunnel out my ports to test on multiple devices using cloudflare tunnels
+tunnel.sh

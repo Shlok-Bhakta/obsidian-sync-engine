@@ -1,0 +1,4 @@
+procs:
+  plugin:
+    shell: "./plugin/movestuff.sh"
+  
