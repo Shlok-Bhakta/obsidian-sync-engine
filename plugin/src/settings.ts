@@ -1,18 +1,18 @@
 import {App, PluginSettingTab, Setting} from "obsidian";
-import MyPlugin from "./main";
+import SyncEngine from "./main";
 
-export interface MyPluginSettings {
-	mySetting: string;
+export interface SyncEngineSettings {
+	backendUrl: string;
 }
 
-export const DEFAULT_SETTINGS: MyPluginSettings = {
-	mySetting: 'default'
+export const DEFAULT_SETTINGS: SyncEngineSettings = {
+	backendUrl: 'http://localhost:3000'
 }
 
-export class SampleSettingTab extends PluginSettingTab {
-	plugin: MyPlugin;
+export class SyncEngineSettingTab extends PluginSettingTab {
+	plugin: SyncEngine;
 
-	constructor(app: App, plugin: MyPlugin) {
+	constructor(app: App, plugin: SyncEngine) {
 		super(app, plugin);
 		this.plugin = plugin;
 	}
@@ -23,13 +23,13 @@ export class SampleSettingTab extends PluginSettingTab {
 		containerEl.empty();
 
 		new Setting(containerEl)
-			.setName('Settings #1')
-			.setDesc('It\'s a secret')
+			.setName('Backend URL')
+			.setDesc('The URL of the server that will be used to sync the files')
 			.addText(text => text
-				.setPlaceholder('Enter your secret')
-				.setValue(this.plugin.settings.mySetting)
+				.setPlaceholder(DEFAULT_SETTINGS.backendUrl)
+				.setValue(this.plugin.settings.backendUrl)
 				.onChange(async (value) => {
-					this.plugin.settings.mySetting = value;
+					this.plugin.settings.backendUrl = value;
 					await this.plugin.saveSettings();
 				}));
 	}
