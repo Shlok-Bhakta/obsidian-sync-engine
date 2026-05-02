@@ -30,3 +30,4 @@ tunnel.sh
 # you can prolly guess what this is lmao
 # data dir for postgres so I can clear and regenerate easily cuz I dont like writing migrations :/
 db_data/*
+logfile

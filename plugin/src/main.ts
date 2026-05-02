@@ -1,14 +1,18 @@
-import {App, Editor, MarkdownView, Modal, Notice, Plugin} from 'obsidian';
+import {App, Editor, MarkdownFileInfo, MarkdownView, Modal, Notice, Plugin, TFile} from 'obsidian';
 import {DEFAULT_SETTINGS, SyncEngineSettings, SyncEngineSettingTab} from "./settings";
+import { yDb } from 'db/db';
 
 // Remember to rename these classes and interfaces!
 
 
 export default class SyncEngine extends Plugin {
 	settings: SyncEngineSettings;
-
+	db: yDb;
 	async onload() {
 		await this.loadSettings();
+		this.db = new yDb();
+		await this.db.open();
+
 		
 		// This creates an icon in the left ribbon.
 		this.addRibbonIcon('dice', 'Sample', (evt: MouseEvent) => {
@@ -73,10 +77,18 @@ export default class SyncEngine extends Plugin {
 
 		// When registering intervals, this function will automatically clear the interval when the plugin is disabled.
 		this.registerInterval(window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000));
+		
 
+		// try out getting the content
+		this.registerEvent(
+			this.app.workspace.on('editor-change', (editor: Editor, info: MarkdownFileInfo) => {
+				new Notice('Editor changed: ' + editor.getDoc());
+			})
+		);
 	}
 
 	onunload() {
+		this.db.close();
 	}
 
 	async loadSettings() {
