@@ -1,12 +1,12 @@
 procs:
   plugin:
-    shell: "cd plugin && npm run dev"
+    shell: "cd plugin && npm i && npm run dev"
   server:
     shell: "cd server && bun run dev"
   db:
     shell: "./db_setup.sh"
   pluginmove:
-    shell: "./plugin/movestuff.sh"
+    shell: "./plugin/movestuff.py"
   tunnel:
-    shell: "./server/tunnel.sh"
+    shell: "./server/tunnel.py"
 
