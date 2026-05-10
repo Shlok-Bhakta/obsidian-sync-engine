@@ -2,7 +2,7 @@ procs:
   plugin:
     shell: "cd plugin && npm i && npm run dev"
   server:
-    shell: "cd server && bun run dev"
+    shell: "cd server && bun i && bun run dev"
   db:
     shell: "./db_setup.sh"
   pluginmove:
