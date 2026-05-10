@@ -18,7 +18,7 @@ export default class SyncEngine extends Plugin {
 		this.addRibbonIcon('dice', 'Sample', (evt: MouseEvent) => {
 			// Called when the user clicks the icon.
 			// try to call the backend API here
-			fetch(this.settings.backendUrl).then(async data => {
+			fetch(this.settings.backendUrl + "health").then(async data => {
 				new Notice('Response: ' + await data.text());
 			}).catch(error => {
 				new Notice('Error: ' + error.message);
