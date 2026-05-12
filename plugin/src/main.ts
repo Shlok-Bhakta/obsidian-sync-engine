@@ -2,7 +2,7 @@ import {App, Editor, MarkdownFileInfo, MarkdownView, Modal, Notice, Plugin, TFil
 import {DEFAULT_SETTINGS, SyncEngineSettings, SyncEngineSettingTab} from "./settings";
 import { yDb } from 'db/db';
 import { EditorView, ViewUpdate } from "@codemirror/view";
-import { Path } from "../../shared/types";
+import { outboxData, Path } from "../../shared/types";
 import { DocSync } from 'yjs/DocSync';
 
 // Remember to rename these classes and interfaces!
@@ -98,36 +98,47 @@ export default class SyncEngine extends Plugin {
 	private makeEditorOutboxExtension(){
 		return EditorView.updateListener.of((update: ViewUpdate) => {
 			if(update){
-				let file = this.app.workspace.getActiveFile();
-				if(!file){
-					return;
+				if (update.docChanged) {
+					let file = this.app.workspace.getActiveFile();
+					if(!file){
+						return;
+					}
+					let pathID = file.path;
+					let doc = this.docs.get(pathID);
+					if(!doc){
+						console.log("new doc");
+						doc = this.newDoc(pathID, update.startState.doc.toString());
+					}
+					let row: outboxData = {
+						fileId: pathID,
+						operation: "Update",
+						data: update.changes.toJSON(),
+						created: Date.now()
+					}
+					doc.applyChanges(update.changes, row);
 				}
-				let pathID = file.path;
-				let doc = this.docs.get(pathID);
-				if(!doc){
-					console.log("new doc");
-					doc = this.newDoc(pathID);
-				}
-				doc.applyChanges(update.changes);
 			}
 		})
 	}
 
-	private newDoc(pathID : Path): DocSync{
+	private newDoc(pathID : Path, initialContent: string): DocSync{
 		// 10 is a random ahh number I picked. This is so opening 50 docs in a session doesnt eat all the ram of 50 y.Doc() objects
 		if(this.docs.size > 10){
-			let mintime = this.docs.keys().next().value.getTimeOpened();
-			let oldest = this.docs.keys().next().value;
+			let mintime = Infinity;
+			let oldestpath: Path | null = null;
 			for(let [path, doc] of this.docs){
 				if(doc.getTimeOpened() < mintime){
 					mintime = doc.getTimeOpened();
-					oldest = path;
+					oldestpath = path;
 				}
 			}
-			this.docs.get(oldest)?.destroy();
-			this.docs.delete(oldest);
+			if(oldestpath){
+				console.log("evicting " + oldestpath);
+				this.docs.get(oldestpath)?.destroy();
+				this.docs.delete(oldestpath);
+			}
 		}
-		let dsync = new DocSync(this.db);
+		let dsync = new DocSync(this.db, initialContent);
 		this.docs.set(pathID, dsync);
 		return dsync
 	}
