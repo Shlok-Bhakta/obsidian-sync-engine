@@ -4,6 +4,8 @@ import { yDb } from 'db/db';
 import { EditorView, ViewUpdate } from "@codemirror/view";
 import { outboxData, Path } from "../../shared/types";
 import { DocSync } from 'yjs/DocSync';
+// @ts-expect-error esbuild-plugin-inline-worker turns this worker entry into a Worker factory.
+import createSyncWorker from "./worker/SyncWorker.worker";
 
 // Remember to rename these classes and interfaces!
 
@@ -13,11 +15,20 @@ export default class SyncEngine extends Plugin {
 	settings: SyncEngineSettings;
 	db: yDb;
 	docs: Map<Path, DocSync>;
+	syncWorker: Worker;
 	async onload() {
 		await this.loadSettings();
 		this.db = new yDb();
 		this.docs = new Map<Path, DocSync>();
 		await this.db.open();
+		this.syncWorker = createSyncWorker();
+		this.syncWorker.onmessage = (event) => {
+			console.log("worker msg", event.data);
+		};
+		this.syncWorker.onerror = (event) => {
+			console.error("worker failed", event.message);
+		};
+
 
 		
 		// // This creates an icon in the left ribbon.
@@ -144,6 +155,7 @@ export default class SyncEngine extends Plugin {
 	}
 
 	onunload() {
+		this.syncWorker?.terminate();
 		this.db.close();
 	}
 

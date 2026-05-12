@@ -8,6 +8,7 @@ import { outboxData } from "../../../shared/types";
 
 export class DocSync {
     private db: yDb;
+    private syncWorker: Worker;
     private ydoc = new Y.Doc();
     private ytext = this.ydoc.getText('markdown');  
     private openedTime = Date.now();

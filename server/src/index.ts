@@ -1,13 +1,18 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 
-const app = new Hono()
-app.use("/*", cors())
+const app = new Hono();
+app.use("/*", cors());
 
 app.get('/', (c) => {
-  return c.text('Hello Hono!')
+  return c.text('Hello Hono!');
 })
 app.get('/health', (c) => {
-  return c.text('OK')
+  return c.text('OK');
 })
-export default app
+
+app.get("/worker", (c) => {
+  console.log("worker running");
+  return c.text("worker running");
+})
+export default app;

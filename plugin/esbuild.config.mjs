@@ -1,6 +1,7 @@
 import esbuild from "esbuild";
 import process from "process";
 import { builtinModules } from 'node:module';
+import inlineWorkerPlugin from "esbuild-plugin-inline-worker";
 
 const banner =
 `/*
@@ -39,6 +40,14 @@ const context = await esbuild.context({
 	treeShaking: true,
 	outfile: "main.js",
 	minify: prod,
+	plugins: [
+		inlineWorkerPlugin({
+			target: "es2018",
+			format: "iife",
+			minify: prod,
+			sourcemap: prod ? false : "inline",
+		}),
+	],
 });
 
 if (prod) {

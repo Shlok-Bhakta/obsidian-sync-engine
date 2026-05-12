@@ -34,6 +34,7 @@ def movefiles():
 
 # check file timestamps every second if changed then movefiles()
 def checkfiles():
+    movefiles()
     while True:
         for file in files:
             src = pathlib.Path(f"plugin/{file}")
