@@ -28,7 +28,7 @@ export class yDb extends Dexie {
         this.version(5).stores({
             outbox: '++id, fileId, operation, created',
             inbox: '++id, fileId, operation, updated'
-        });``
+        });
     }
 
     // async insert(data: yDbRow){
