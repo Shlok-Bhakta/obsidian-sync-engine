@@ -10,7 +10,6 @@ import createSyncWorker from "./worker/SyncWorker.worker";
 // Remember to rename these classes and interfaces!
 
 
-
 export default class SyncEngine extends Plugin {
 	settings: SyncEngineSettings;
 	db: yDb;
@@ -24,11 +23,16 @@ export default class SyncEngine extends Plugin {
 		this.syncWorker = createSyncWorker();
 		this.syncWorker.onmessage = (event) => {
 			console.log("worker msg", event.data);
+			if (event.data.type === "ready") {
+				this.syncWorker.postMessage({ type: "start" });
+			}
 		};
 		this.syncWorker.onerror = (event) => {
 			console.error("worker failed", event.message);
 		};
-
+		// send init wait for ready
+		this.syncWorker.postMessage({ type: "init", serverurl: this.settings.backendUrl });
+		
 
 		
 		// // This creates an icon in the left ribbon.
@@ -127,6 +131,7 @@ export default class SyncEngine extends Plugin {
 						created: Date.now()
 					}
 					doc.applyChanges(update.changes, row);
+					this.syncWorker.postMessage({ type: "wake" });
 				}
 			}
 		})

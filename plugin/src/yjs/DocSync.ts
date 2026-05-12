@@ -34,7 +34,7 @@ export class DocSync {
     }
 
     public applyChanges(changeset: ChangeSet, row: outboxData){
-        console.log(JSON.stringify(changeset));
+        // console.log(JSON.stringify(changeset));
         const before = Y.encodeStateVector(this.ydoc);
         this.ydoc.transact(() => {
             changeset.iterChanges((fromA, toA, _fromB, _toB, inserted) => {

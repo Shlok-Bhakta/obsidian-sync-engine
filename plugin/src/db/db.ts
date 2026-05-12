@@ -6,7 +6,7 @@ import { outboxData, Path } from '../../../shared/types';
 
 export class yDb extends Dexie {
 
-    private outbox !: Dexie.Table<outboxData, "id">;
+    private outbox !: Dexie.Table<outboxData, number>;
     constructor() {
         super('obsidian-sync-engine');
         this.version(1).stores({
@@ -37,7 +37,15 @@ export class yDb extends Dexie {
 
     public putInOutbox(row: outboxData){
         // return outbox.add()
-        console.log("putting in outbox" + JSON.stringify(row));
+        // console.log("putting in outbox" + JSON.stringify(row));
         return this.outbox.add(row);
+    }
+
+    public getFirstOutbox(){
+        return this.outbox.orderBy("created").first();
+    }
+
+    public removeOutbox(id: number){
+        return this.outbox.delete(id);
     }
 }
