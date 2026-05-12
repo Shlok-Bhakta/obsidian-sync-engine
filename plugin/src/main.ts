@@ -112,7 +112,7 @@ export default class SyncEngine extends Plugin {
 					let row: outboxData = {
 						fileId: pathID,
 						operation: "Update",
-						data: update.changes.toJSON(),
+						data: new Uint8Array(),
 						created: Date.now()
 					}
 					doc.applyChanges(update.changes, row);
