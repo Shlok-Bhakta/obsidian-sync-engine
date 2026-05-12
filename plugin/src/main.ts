@@ -171,6 +171,10 @@ export default class SyncEngine extends Plugin {
 	async saveSettings() {
 		await this.saveData(this.settings);
 	}
+
+	updateWorkerBackendUrl() {
+		this.syncWorker?.postMessage({ type: "update-backend-url", serverurl: this.settings.backendUrl });
+	}
 }
 
 class SampleModal extends Modal {

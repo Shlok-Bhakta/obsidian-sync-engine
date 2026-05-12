@@ -28,9 +28,10 @@ export class SyncEngineSettingTab extends PluginSettingTab {
 			.addText(text => text
 				.setPlaceholder(DEFAULT_SETTINGS.backendUrl)
 				.setValue(this.plugin.settings.backendUrl)
-				.onChange(async (value) => {
-					this.plugin.settings.backendUrl = value;
-					await this.plugin.saveSettings();
-				}));
+					.onChange(async (value) => {
+						this.plugin.settings.backendUrl = value;
+						await this.plugin.saveSettings();
+						this.plugin.updateWorkerBackendUrl();
+					}));
 	}
 }

@@ -10,6 +10,15 @@ const db: yDb = new yDb();
 let draining = false;
 let pollInterval: ReturnType<typeof setInterval> | null = null;
 
+function toWebSocketUrl(backendUrl: string): string {
+    const url = new URL(backendUrl);
+    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+    url.pathname = "/worker";
+    url.search = "";
+    url.hash = "";
+    return url.toString();
+}
+
 function sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -88,8 +97,6 @@ async function checkForNewOutbox(){
     return false;
 }
 
-// void emptyOutbox();
-
 function closeSocket() {
     if (ws && ws.readyState !== WebSocket.CLOSED) {
         ws.close();
@@ -165,13 +172,19 @@ async function emptyOutbox() {
 self.onmessage = async (event) => {
 	console.log("worker msg", event.data);
     if (event.data.type === "init") {
-        serverurl = event.data.serverurl;
-        serverurl = serverurl.replace(/^https?:\/\//, "");
-        serverurl = "ws://" + serverurl + "/worker";
+        serverurl = toWebSocketUrl(event.data.serverurl);
         await ensureWebsocketConnection();
         await db.open();
         console.log("init", serverurl);
         postMessage({ type: "ready" });
+    }
+    if (event.data.type === "update-backend-url") {
+        const nextUrl = toWebSocketUrl(event.data.serverurl);
+        if (nextUrl !== serverurl) {
+            serverurl = nextUrl;
+            closeSocket();
+            void emptyOutbox();
+        }
     }
     if (event.data.type === "start") {
         void emptyOutbox();
