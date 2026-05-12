@@ -13,7 +13,12 @@ export class yDb extends Dexie {
     constructor() {
         super('obsidian-sync-engine');
         this.version(1).stores({
-            updates: '++id, path' // id is auto-incrementing primary key
+            updates: '++id, path'
+        });
+        this.version(2).stores({
+            updates: null,
+            outbox: '++id, fileid, operation, data',
+            inbox: '++id, fileid, operation, data'
         });
     }
 
