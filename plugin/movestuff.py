@@ -36,12 +36,16 @@ def movefiles():
 def checkfiles():
     movefiles()
     while True:
-        for file in files:
-            src = pathlib.Path(f"plugin/{file}")
-            dst = pathlib.Path(f"{VAULT_DIR}/{PLUGIN_DIR}/{PLUGIN_NAME}/{file}")
-            if src.stat().st_mtime > dst.stat().st_mtime:
-                movefiles()
-        time.sleep(1)
+        try:
+            for file in files:
+                src = pathlib.Path(f"plugin/{file}")
+                dst = pathlib.Path(f"{VAULT_DIR}/{PLUGIN_DIR}/{PLUGIN_NAME}/{file}")
+                if src.stat().st_mtime > dst.stat().st_mtime:
+                    movefiles()
+            time.sleep(1)
+        except Exception as e:
+            print(e)
+            time.sleep(1)
 
 hotplugin()
 print("===== READY =====")

@@ -2,6 +2,11 @@ import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { upgradeWebSocket, websocket } from 'hono/bun'
 import { outboxData } from '../../shared/types'
+import { bootstrapDB } from './db/MigrationRunner'
+
+// before we run the app we need to "bootstrap" the database
+bootstrapDB();
+
 
 const app = new Hono();
 app.use("/*", cors());
