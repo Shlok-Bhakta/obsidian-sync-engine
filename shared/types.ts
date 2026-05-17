@@ -29,14 +29,17 @@ export type updatePacket = {
 
 // WS Protocol
 export enum opType {
-    Ack,
-    Update,
-    CreateFile,
-    RenameFile,
-    DeleteFile,
-    CreateFolder,
-    RenameFolder,
-    DeleteFolder,
+    Ack = "Ack",
+    Update = "Update",
+    CreateFile = "CreateFile",
+    RenameFile = "RenameFile",
+    DeleteFile = "DeleteFile",
+    CreateFolder = "CreateFolder",
+    RenameFolder = "RenameFolder",
+    DeleteFolder = "DeleteFolder",
+    Auth = "Auth",
+    AuthAck = "AuthAck",
+    AuthDeny = "AuthDeny",
 }
 export type wsPacket = { // ping pong thing but simpler
     type: opType.Ack;
@@ -68,4 +71,14 @@ export type wsPacket = { // ping pong thing but simpler
 } | { // Folder Deletion
     type: opType.DeleteFolder;
     path: Path;
+} | { // Auth packet
+    type: opType.Auth;
+    clientKey: string;
+    protocolVersion: number;
+} | { // Auth Ack
+    type: opType.AuthAck;
+    newCleanStart: string;
+} | { // Auth Deny
+    type: opType.AuthDeny;
+    message: string;
 }
