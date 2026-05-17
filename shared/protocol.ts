@@ -1,6 +1,7 @@
 // shared protocol between client and server that is used to communicate over websockets
 import { wsPacket, opType } from "./types";
 
+export const PROTOCOL_VERSION: number = 1;
 
 function bytesToBase64(bytes: Uint8Array): string {
     let binary = "";
@@ -20,8 +21,6 @@ for (let i = 0; i < binary.length; i++) {
 
 return bytes;
 }
-
-
 
 export function encodePacket(packet: wsPacket) : string{
     if(packet.type === opType.Update){

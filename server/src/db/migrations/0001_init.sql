@@ -18,3 +18,11 @@ CREATE TABLE IF NOT EXISTS client_bootstrapped (
 
 -- actually create the row`
 INSERT INTO client_bootstrapped (id, bootstrapped) VALUES (1, FALSE) ON CONFLICT (id) DO NOTHING;
+
+-- security table to store client keys and their associated client names
+CREATE TABLE IF NOT EXISTS client_keys (
+    id BIGSERIAL PRIMARY KEY,
+    client_key TEXT NOT NULL UNIQUE,
+    valid BOOLEAN NOT NULL DEFAULT TRUE, -- if false, the client key is invalid (but it is valuable for incase websockets get disconnected in a weird state)
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
