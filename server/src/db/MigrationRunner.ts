@@ -72,7 +72,6 @@ async function applyMigrations() {
             continue;
         }
         console.log("applying migration", migration.name);
-        // console.log("sql", await Bun.file(migration.sql).text());
         await sql.unsafe(await Bun.file(migration.sql).text());
         console.log("applied migration", migration.name);
         await sql`INSERT INTO migrations (name, created_at) VALUES (${migration.name}, NOW());`;

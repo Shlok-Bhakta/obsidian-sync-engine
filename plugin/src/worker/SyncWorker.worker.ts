@@ -1,4 +1,6 @@
 import { yDb } from "db/db";
+import { opType, wsPacket } from "../../../shared/types";
+import { decodePacket, encodePacket } from "../../../shared/protocol";
 
 console.log("worker running");
 
@@ -53,44 +55,44 @@ function waitForOpen(ws: WebSocket): Promise<void> {
 
 function waitForAck(ws: WebSocket, id: number): Promise<void> {
     return new Promise((resolve, reject) => {
-      const onMessage = (event: MessageEvent) => {
-          console.log("got msg", event.data);
-          const msg = JSON.parse(event.data);
-          console.log("parsed msg", JSON.stringify(msg));
+        const onMessage = (event: MessageEvent) => {
+            console.log("got msg", event.data);
+            const msg: wsPacket = decodePacket(event.data);
+            console.log("parsed msg", JSON.stringify(msg));
 
-        if (msg.type === "ack" && msg.id === id) {
-        console.log("acked");
-          cleanup();
-          resolve();
-        }
-      };
+            if (msg.type === opType.Ack && msg.id === id) {
+                console.log("acked");
+                cleanup();
+                resolve();
+            }
+        };
 
-      const onClose = () => {
-        cleanup();
-        reject(new Error("WebSocket closed before ack"));
-      };
+        const onClose = () => {
+            cleanup();
+            reject(new Error("WebSocket closed before ack"));
+        };
 
-      const onError = () => {
-        cleanup();
-        reject(new Error("WebSocket errored before ack"));
-      };
+        const onError = () => {
+            cleanup();
+            reject(new Error("WebSocket errored before ack"));
+        };
 
-      const cleanup = () => {
-        ws.removeEventListener("message", onMessage);
-        ws.removeEventListener("close", onClose);
-        ws.removeEventListener("error", onError);
-      };
+        const cleanup = () => {
+            ws.removeEventListener("message", onMessage);
+            ws.removeEventListener("close", onClose);
+            ws.removeEventListener("error", onError);
+        };
 
-      ws.addEventListener("message", onMessage);
-      ws.addEventListener("close", onClose, { once: true });
-      ws.addEventListener("error", onError, { once: true });
+        ws.addEventListener("message", onMessage);
+        ws.addEventListener("close", onClose, { once: true });
+        ws.addEventListener("error", onError, { once: true });
     });
-	  }
+}
 
 
-async function checkForNewOutbox(){
+async function checkForNewOutbox() {
     let row = await db.getFirstOutbox();
-    if(row){
+    if (row) {
         emptyOutbox();
         return true;
     }
@@ -130,28 +132,37 @@ async function ensureWebsocketConnection(): Promise<WebSocket> {
 }
 
 async function emptyOutbox() {
-    if(draining){
+    if (draining) {
         return;
     }
+    // me when lock for async :( 
+    // me when use variable instead :)
     draining = true;
     try {
         let empty = 0;
-        while(true){
+        while (true) {
             try {
                 const openWs = await ensureWebsocketConnection();
                 // send first, then wait for ack, then delete
                 let row = await db.getFirstOutbox();
-                if(row){
+                if (row) {
                     empty = 0;
-                    if(row.id !== undefined){
+                    if (row.id !== undefined) {
                         const ack = waitForAck(openWs, row.id);
-                        openWs.send(JSON.stringify(row));
+                        const packet: wsPacket = {
+                            type: opType.Update,
+                            id: row.id,
+                            fileId: row.fileId,
+                            data: row.data,
+                            updateTime: row.created
+                        };
+                        openWs.send(encodePacket(packet));
                         await ack;
                         await db.removeOutbox(row.id);
                     }
-                }else{
+                } else {
                     empty++;
-                    if(empty > 5){
+                    if (empty > 5) {
                         // no more files so stop here
                         return;
                     }
@@ -170,7 +181,7 @@ async function emptyOutbox() {
 
 
 self.onmessage = async (event) => {
-	console.log("worker msg", event.data);
+    console.log("worker msg", event.data);
     if (event.data.type === "init") {
         serverurl = toWebSocketUrl(event.data.serverurl);
         await ensureWebsocketConnection();

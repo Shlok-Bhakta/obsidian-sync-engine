@@ -24,3 +24,48 @@ export type updatePacket = {
 
 
 }
+
+
+
+// WS Protocol
+export enum opType {
+    Ack,
+    Update,
+    CreateFile,
+    RenameFile,
+    DeleteFile,
+    CreateFolder,
+    RenameFolder,
+    DeleteFolder,
+}
+export type wsPacket = { // ping pong thing but simpler
+    type: opType.Ack;
+    id: number;
+} | { // literally the same thing as outboxData just used in the protocol context
+    type: opType.Update;
+    id: number;
+    fileId: Path;
+    data: Uint8Array;
+    updateTime: number;
+} | { // File Creation 
+    type: opType.CreateFile;
+    path: Path;
+    initialContent: string;
+} | { // File Renaming
+    type: opType.RenameFile;
+    fromPath: Path;
+    toPath: Path;
+} | { // File Deletion
+    type: opType.DeleteFile;
+    path: Path;
+} | { // Folder Creation
+    type: opType.CreateFolder;
+    path: Path;
+} | { // Folder Renaming
+    type: opType.RenameFolder;
+    fromPath: Path;
+    toPath: Path;
+} | { // Folder Deletion
+    type: opType.DeleteFolder;
+    path: Path;
+}
