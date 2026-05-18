@@ -81,3 +81,28 @@ export type wsPacket = { // ping pong thing but simpler
     type: opType.Deny;
     message: string;
 }
+
+// Sync Worker Protocol
+export enum workerOpType {
+    Init = "init",
+    UpdateBackendUrl = "update-backend-url",
+    Start = "start",
+    Wake = "wake",
+    Ready = "ready",
+}
+
+export type workerPacket = {
+    type: workerOpType.Init;
+    serverurl: string;
+    clientKey: string;
+    clientName: string;
+} | {
+    type: workerOpType.UpdateBackendUrl;
+    serverurl: string;
+} | {
+    type: workerOpType.Start;
+} | {
+    type: workerOpType.Wake;
+} | {
+    type: workerOpType.Ready;
+}

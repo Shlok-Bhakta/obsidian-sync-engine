@@ -2,36 +2,47 @@ import {App, Editor, MarkdownFileInfo, MarkdownView, Modal, Notice, Plugin, TFil
 import {DEFAULT_SETTINGS, SyncEngineSettings, SyncEngineSettingTab} from "./settings";
 import { yDb } from 'db/db';
 import { EditorView, ViewUpdate } from "@codemirror/view";
-import { outboxData, Path } from "../../shared/types";
+import { outboxData, Path, workerOpType, workerPacket } from "../../shared/types";
 import { DocSync } from 'yjs/DocSync';
 // @ts-expect-error esbuild-plugin-inline-worker turns this worker entry into a Worker factory.
 import createSyncWorker from "./worker/SyncWorker.worker";
 
 // Remember to rename these classes and interfaces!
 
+type SyncWorker = Omit<Worker, "onmessage" | "postMessage"> & {
+	onmessage: ((this: Worker, event: MessageEvent<workerPacket>) => void) | null;
+	postMessage(message: workerPacket, transfer?: Transferable[]): void;
+};
 
 export default class SyncEngine extends Plugin {
 	settings: SyncEngineSettings;
 	db: yDb;
 	docs: Map<Path, DocSync>;
-	syncWorker: Worker;
+	syncWorker: SyncWorker;
 	async onload() {
 		await this.loadSettings();
 		this.db = new yDb();
 		this.docs = new Map<Path, DocSync>();
 		await this.db.open();
-		this.syncWorker = createSyncWorker();
+		this.syncWorker = createSyncWorker() as SyncWorker;
 		this.syncWorker.onmessage = (event) => {
 			console.log("worker msg", event.data);
-			if (event.data.type === "ready") {
-				this.syncWorker.postMessage({ type: "start" });
+			if (event.data.type === workerOpType.Ready) {
+				const startPacket: workerPacket = { type: workerOpType.Start };
+				this.syncWorker.postMessage(startPacket);
 			}
 		};
 		this.syncWorker.onerror = (event) => {
 			console.error("worker failed", event.message);
 		};
 		// send init wait for ready
-		this.syncWorker.postMessage({ type: "init", serverurl: this.settings.backendUrl });
+		const initPacket: workerPacket = { 
+			type: workerOpType.Init, 
+			serverurl: this.settings.backendUrl,
+			clientKey: this.settings.clientKey,
+			clientName: this.settings.clientName
+		};
+		this.syncWorker.postMessage(initPacket);
 		
 
 		
@@ -131,7 +142,8 @@ export default class SyncEngine extends Plugin {
 						created: Date.now()
 					}
 					doc.applyChanges(update.changes, row);
-					this.syncWorker.postMessage({ type: "wake" });
+					const wakePacket: workerPacket = { type: workerOpType.Wake };
+					this.syncWorker.postMessage(wakePacket);
 				}
 			}
 		})
@@ -173,7 +185,8 @@ export default class SyncEngine extends Plugin {
 	}
 
 	updateWorkerBackendUrl() {
-		this.syncWorker?.postMessage({ type: "update-backend-url", serverurl: this.settings.backendUrl });
+		const updateBackendUrlPacket: workerPacket = { type: workerOpType.UpdateBackendUrl, serverurl: this.settings.backendUrl };
+		this.syncWorker?.postMessage(updateBackendUrlPacket);
 	}
 }
 

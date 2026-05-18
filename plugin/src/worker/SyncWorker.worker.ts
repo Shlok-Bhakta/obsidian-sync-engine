@@ -1,6 +1,6 @@
 import { yDb } from "db/db";
-import { opType, wsPacket } from "../../../shared/types";
-import { decodePacket, encodePacket } from "../../../shared/protocol";
+import { opType, workerOpType, workerPacket, wsPacket } from "../../../shared/types";
+import { decodePacket, encodePacket, PROTOCOL_VERSION } from "../../../shared/protocol";
 
 console.log("worker running");
 
@@ -11,6 +11,12 @@ let ws: WebSocket | null = null;
 const db: yDb = new yDb();
 let draining = false;
 let pollInterval: ReturnType<typeof setInterval> | null = null;
+let clientKey: string;
+let clientName: string;
+
+function sendClientPacket(packet: workerPacket) {
+    postMessage(packet);
+}
 
 function toWebSocketUrl(backendUrl: string): string {
     const url = new URL(backendUrl);
@@ -180,31 +186,104 @@ async function emptyOutbox() {
 }
 
 
-self.onmessage = async (event) => {
-    console.log("worker msg", event.data);
-    if (event.data.type === "init") {
-        serverurl = toWebSocketUrl(event.data.serverurl);
-        await ensureWebsocketConnection();
+
+
+function waitForAuthAck(ws: WebSocket): Promise<wsPacket | null> {
+    return new Promise((resolve, reject) => {
+        const onMessage = (event: MessageEvent) => {
+            console.log("got msg", event.data);
+            const msg: wsPacket = decodePacket(event.data);
+            console.log("parsed msg", JSON.stringify(msg));
+
+            if (msg.type === opType.AuthAck) {
+                console.log("auth acked");
+                cleanup();
+                resolve(msg);
+                return;
+            }
+            if(msg.type === opType.Deny){
+                console.log(msg.type, msg.message);
+                cleanup();
+                resolve(null);
+                return;
+            }
+
+            cleanup();
+            resolve(null);
+        };
+
+        const onClose = () => {
+            cleanup();
+            reject(new Error("WebSocket closed before ack"));
+        };
+
+        const onError = () => {
+            cleanup();
+            reject(new Error("WebSocket errored before ack"));
+        };
+
+        const cleanup = () => {
+            ws.removeEventListener("message", onMessage);
+            ws.removeEventListener("close", onClose);
+            ws.removeEventListener("error", onError);
+        };
+
+        ws.addEventListener("message", onMessage);
+        ws.addEventListener("close", onClose, { once: true });
+        ws.addEventListener("error", onError, { once: true });
+    });
+}
+
+async function backendAuth(){
+    // validate connection with websocket, update the key in settings
+    const openWs = await ensureWebsocketConnection();
+    const authPacket: wsPacket = {
+        type: opType.Auth,
+        clientKey: clientKey,
+        clientName: clientName,
+        protocolVersion: PROTOCOL_VERSION
+    }
+    console.log("sending off auth")
+    const authAck = waitForAuthAck(openWs);
+    openWs.send(encodePacket(authPacket));
+    const ack = await authAck;
+    if (!ack || ack.type !== opType.AuthAck) {
+        throw new Error("Backend did not auth ack");
+    }
+    // clientKey = ack.newClientKey;
+    console.log("authenticated with backend" + ack.newClientKey);
+    return ack;
+}
+
+self.onmessage = async (event: MessageEvent<workerPacket>) => {
+    const packet = event.data;
+    console.log("worker msg", packet);
+    if (packet.type === workerOpType.Init) {
+        serverurl = toWebSocketUrl(packet.serverurl);
+        clientKey = packet.clientKey;
+        clientName = packet.clientName;
+        await backendAuth();
         await db.open();
         console.log("init", serverurl);
-        postMessage({ type: "ready" });
+        const readyPacket: workerPacket = { type: workerOpType.Ready };
+        sendClientPacket(readyPacket);
     }
-    if (event.data.type === "update-backend-url") {
-        const nextUrl = toWebSocketUrl(event.data.serverurl);
+    if (packet.type === workerOpType.UpdateBackendUrl) {
+        const nextUrl = toWebSocketUrl(packet.serverurl);
         if (nextUrl !== serverurl) {
             serverurl = nextUrl;
             closeSocket();
             void emptyOutbox();
         }
     }
-    if (event.data.type === "start") {
+    if (packet.type === workerOpType.Start) {
         void emptyOutbox();
         // setup system to check every 2 seconds if there is a new outbox message if so activate
         if (pollInterval === null) {
             pollInterval = setInterval(checkForNewOutbox, 2000);
         }
     }
-    if (event.data.type === "wake") {
+    if (packet.type === workerOpType.Wake) {
         void emptyOutbox();
     }
 };

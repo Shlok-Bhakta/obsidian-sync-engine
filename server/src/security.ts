@@ -8,10 +8,24 @@ export function generateClientKey(): string {
 type ClientKeyRow = {
     valid: boolean;
 }
+
+type ClientKeyCount = {
+    count: string;
+}
 export async function validateClientKey(clientKey: string): Promise<boolean> {
     if(!clientKey.startsWith("obs_sync_")){
         return false;
     }
+    // check length of table, if size is 0 this means it is init time and we can just return valid
+    const zerocheck = await sql<ClientKeyCount[]>`SELECT COUNT(valid) FROM client_keys`;
+    const rowcount = parseInt(zerocheck[0].count, 10);
+    if(rowcount === 0){
+        // this means there is no keys at all so this is part of the init bootstrap process
+        return true;
+    }
+    
+
+
     // check in db to see if the client key is valid
     const result = await sql<ClientKeyRow[]>`
     SELECT valid FROM client_keys WHERE client_key = ${clientKey};`;
