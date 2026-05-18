@@ -6,14 +6,91 @@ export function generateClientKey(): string {
 
 
 type ClientKeyRow = {
+    id: string;
+    clientKey: string;
     valid: boolean;
 }
 
 type ClientKeyCount = {
     count: string;
 }
+
+export type ClientKeyRotationResult = {
+    authenticated: boolean;
+    clientKey?: string;
+};
+
+function isClientKeyShape(clientKey: string): boolean {
+    return clientKey.startsWith("obs_sync_");
+}
+
 export async function validateClientKey(clientKey: string): Promise<boolean> {
-    if(!clientKey.startsWith("obs_sync_")){
+    return isClientKeyAccepted(clientKey);
+}
+
+export async function rotateClientKey(clientKey: string): Promise<ClientKeyRotationResult> {
+    if(!isClientKeyShape(clientKey)){
+        return { authenticated: false };
+    }
+
+    return sql.begin(async tx => {
+        await tx`SELECT pg_advisory_xact_lock(918342781);`;
+        const zerocheck = await tx<ClientKeyCount[]>`SELECT COUNT(valid) FROM client_keys`;
+        const rowcount = parseInt(zerocheck[0]?.count ?? "0", 10);
+        if(rowcount === 0){
+            await tx`INSERT INTO client_keys (client_key, previous_key_id, valid) VALUES (${clientKey}, NULL, TRUE);`;
+            return { authenticated: true, clientKey };
+        }
+
+        const existing = await tx<ClientKeyRow[]>`
+            SELECT id, client_key AS "clientKey", valid
+            FROM client_keys
+            WHERE client_key = ${clientKey}
+            FOR UPDATE;
+        `;
+        if(existing.length === 0){
+            return { authenticated: false };
+        }
+
+        const keyRow = existing[0];
+        if(keyRow.valid){
+            const key = generateClientKey();
+            await tx`
+                INSERT INTO client_keys (client_key, previous_key_id, valid)
+                VALUES (${key}, ${keyRow.id}, TRUE);
+            `;
+            await tx`UPDATE client_keys SET valid = FALSE WHERE id = ${keyRow.id};`;
+            return { authenticated: true, clientKey: key };
+        }
+
+        const current = await tx<ClientKeyRow[]>`
+            WITH RECURSIVE descendants AS (
+                SELECT id, client_key, valid, created_at, 1 AS depth
+                FROM client_keys
+                WHERE previous_key_id = ${keyRow.id}
+
+                UNION ALL
+
+                SELECT child.id, child.client_key, child.valid, child.created_at, descendants.depth + 1
+                FROM client_keys child
+                JOIN descendants ON child.previous_key_id = descendants.id
+            )
+            SELECT id, client_key AS "clientKey", valid
+            FROM descendants
+            WHERE valid = TRUE
+            ORDER BY depth DESC, created_at DESC
+            LIMIT 1;
+        `;
+        if(current.length === 0){
+            return { authenticated: false };
+        }
+
+        return { authenticated: true, clientKey: current[0].clientKey };
+    });
+}
+
+async function isClientKeyAccepted(clientKey: string): Promise<boolean> {
+    if(!isClientKeyShape(clientKey)){
         return false;
     }
     // check length of table, if size is 0 this means it is init time and we can just return valid
@@ -34,7 +111,7 @@ export async function validateClientKey(clientKey: string): Promise<boolean> {
     }
     console.log("result", result[0].valid);
     // return result[0].valid;
-    return clientKey.startsWith("obs_sync_");
+    return result[0].valid;
 
 }
 
@@ -42,8 +119,18 @@ export async function invalidateClientKey(clientKey: string): Promise<void> {
     await sql`UPDATE client_keys SET valid = FALSE WHERE client_key = ${clientKey};`;
 }
 
-export async function mintNewClientKey(): Promise<string> {
+export async function mintNewClientKey(previousClientKey?: string): Promise<string> {
     const key = generateClientKey();
-    await sql`INSERT INTO client_keys (client_key, valid) VALUES (${key}, TRUE);`;
+    if(previousClientKey){
+        const previous = await sql<ClientKeyRow[]>`
+            SELECT id, client_key AS "clientKey", valid
+            FROM client_keys
+            WHERE client_key = ${previousClientKey};
+        `;
+        const previousKeyId = previous[0]?.id ?? null;
+        await sql`INSERT INTO client_keys (client_key, previous_key_id, valid) VALUES (${key}, ${previousKeyId}, TRUE);`;
+        return key;
+    }
+    await sql`INSERT INTO client_keys (client_key, previous_key_id, valid) VALUES (${key}, NULL, TRUE);`;
     return key;
 }

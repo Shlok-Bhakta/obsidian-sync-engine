@@ -1,14 +1,14 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { upgradeWebSocket, websocket } from 'hono/bun'
-import { opType, outboxData, wsPacket } from '../../shared/types'
-import { decodePacket, encodePacket, PROTOCOL_VERSION } from '../../shared/protocol'
+import { opType, wsPacket } from '../../shared/types'
+import { decodePacket, decodeUpdateBatchJsonl, encodePacket, PROTOCOL_VERSION } from '../../shared/protocol'
 import { bootstrapDB } from './db/MigrationRunner'
-import { generateClientKey, mintNewClientKey, validateClientKey } from './security'
+import { rotateClientKey } from './security'
 
 
 // before we run the app we need to "bootstrap" the database
-bootstrapDB();
+await bootstrapDB();
 
 
 const app = new Hono();
@@ -25,6 +25,16 @@ type Client = {
   isAuthenticated: boolean;
   clientName: string;
 }
+
+function logUpdate(data: wsPacket): void {
+  if (data.type !== opType.Update) {
+    return;
+  }
+
+  console.log("got update");
+  console.log("got data", JSON.stringify(data));
+}
+
 app.get(
   '/worker',
   upgradeWebSocket((c) => {
@@ -34,8 +44,6 @@ app.get(
     }
     return {
       async onMessage(event, ws) {
-        // get data wait for "processing" then ack
-        console.log('Message received:', event.data)
         let raw = event.data;
         if (raw instanceof Uint8Array) {
           raw = new TextDecoder().decode(raw);
@@ -47,6 +55,7 @@ app.get(
         // console.log("raw value", raw);
 
         const data: wsPacket = decodePacket(raw);
+        console.log("message received:", data.type);
         // console.log("got data", data);
 
         if(!client.isAuthenticated){
@@ -67,7 +76,8 @@ app.get(
               ws.send(encodePacket(deny));
               return;
             }
-            if(!(await validateClientKey(data.clientKey))){
+            const auth = await rotateClientKey(data.clientKey);
+            if(!auth.authenticated || !auth.clientKey){
               const deny: wsPacket = { 
                 type: opType.Deny, 
                 message: "Client key is invalid" 
@@ -77,8 +87,7 @@ app.get(
             }
             client.isAuthenticated = true;
             client.clientName = data.clientName;
-            // const key = await mintNewClientKey();
-            const ack: wsPacket = { type: opType.AuthAck, newClientKey: "123456789" };
+            const ack: wsPacket = { type: opType.AuthAck, newClientKey: auth.clientKey };
             console.log("sending ack [redacted for security]");
             ws.send(encodePacket(ack));
             console.log("sent ack [redacted for security]");
@@ -97,10 +106,18 @@ app.get(
           console.log("got ack");
           return;
         } else if (data.type === opType.Update) {
-          console.log("got update");
-          console.log("got data", JSON.stringify(data));
+          logUpdate(data);
           const ack: wsPacket = { type: opType.Ack, id: data.id };
           console.log("sending ack", ack);
+          ws.send(encodePacket(ack));
+          return;
+        } else if (data.type === opType.UpdateBatch) {
+          console.log("got update batch", data.segmentId);
+          for (const update of decodeUpdateBatchJsonl(data.jsonl)) {
+            logUpdate(update);
+          }
+          const ack: wsPacket = { type: opType.BatchAck, segmentId: data.segmentId };
+          console.log("sending batch ack", ack);
           ws.send(encodePacket(ack));
           return;
         } else if (data.type === opType.CreateFile) {

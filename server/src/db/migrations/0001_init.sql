@@ -23,6 +23,11 @@ INSERT INTO client_bootstrapped (id, bootstrapped) VALUES (1, FALSE) ON CONFLICT
 CREATE TABLE IF NOT EXISTS client_keys (
     id BIGSERIAL PRIMARY KEY,
     client_key TEXT NOT NULL UNIQUE,
+    previous_key_id BIGINT REFERENCES client_keys(id),
     valid BOOLEAN NOT NULL DEFAULT TRUE, -- if false, the client key is invalid (but it is valuable for incase websockets get disconnected in a weird state)
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS client_keys_one_valid_child_per_previous
+    ON client_keys(previous_key_id)
+    WHERE previous_key_id IS NOT NULL AND valid = TRUE;

@@ -42,8 +42,13 @@ export class SyncClient {
     private flushTimer: number | null = null;
     private pollInterval: number | null = null;
     private authenticated = false;
+    private authPromise: Promise<WebSocket> | null = null;
 
-    constructor(private readonly outbox: OutboxStore, settings: SyncEngineSettings) {
+    constructor(
+        private readonly outbox: OutboxStore,
+        settings: SyncEngineSettings,
+        private readonly onClientKeyRotated: (clientKey: string) => Promise<void> = async () => {},
+    ) {
         this.serverUrl = toWebSocketUrl(settings.backendUrl);
         this.clientKey = settings.clientKey;
         this.clientName = settings.clientName;
@@ -51,8 +56,12 @@ export class SyncClient {
 
     start(): void {
         this.stopped = false;
+        this.connectSoon();
         this.wakeSoon();
-        this.pollInterval = window.setInterval(() => this.wakeSoon(), 5000);
+        this.pollInterval = window.setInterval(() => {
+            this.connectSoon();
+            this.wakeSoon();
+        }, 5000);
     }
 
     stop(): void {
@@ -77,7 +86,19 @@ export class SyncClient {
             this.serverUrl = nextUrl;
             this.closeSocket();
         }
+        this.connectSoon();
         this.wakeSoon();
+    }
+
+    connectSoon(): void {
+        if (this.stopped) {
+            return;
+        }
+
+        void this.ensureAuthenticatedSocket().catch(error => {
+            console.error("failed to connect sync client", error);
+            this.closeSocket();
+        });
     }
 
     wakeSoon(): void {
@@ -131,27 +152,32 @@ export class SyncClient {
     }
 
     private async sendSegment(segment: OutboxSegment): Promise<void> {
-        const rows = await this.outbox.readSegment(segment);
-        for (const row of rows) {
-            if (row.id === undefined) {
-                throw new Error(`Outbox row in ${segment.path} is missing an id`);
-            }
-
-            const openWs = await this.ensureAuthenticatedSocket();
-            const packet: wsPacket = {
-                type: opType.Update,
-                id: row.id,
-                fileId: row.fileId,
-                data: row.data,
-                updateTime: row.created,
-            };
-            const ack = this.waitForAck(openWs, row.id);
-            openWs.send(encodePacket(packet));
-            await ack;
-        }
+        const jsonl = await this.outbox.readSegmentJsonl(segment);
+        const openWs = await this.ensureAuthenticatedSocket();
+        const packet: wsPacket = {
+            type: opType.UpdateBatch,
+            segmentId: segment.id,
+            jsonl,
+        };
+        const ack = this.waitForBatchAck(openWs, segment.id);
+        openWs.send(encodePacket(packet));
+        await ack;
     }
 
     private async ensureAuthenticatedSocket(): Promise<WebSocket> {
+        if (this.authPromise) {
+            return this.authPromise;
+        }
+
+        this.authPromise = this.authenticateSocket();
+        try {
+            return await this.authPromise;
+        } finally {
+            this.authPromise = null;
+        }
+    }
+
+    private async authenticateSocket(): Promise<WebSocket> {
         const openWs = await this.ensureSocket();
         if (this.authenticated) {
             return openWs;
@@ -168,6 +194,14 @@ export class SyncClient {
         const packet = await ack;
         if (!packet || packet.type !== opType.AuthAck) {
             throw new Error("Backend did not acknowledge authentication");
+        }
+
+        if (!packet.newClientKey.startsWith("obs_sync_")) {
+            throw new Error("Backend returned an invalid client key");
+        }
+        if (packet.newClientKey !== this.clientKey) {
+            await this.onClientKeyRotated(packet.newClientKey);
+            this.clientKey = packet.newClientKey;
         }
 
         this.authenticated = true;
@@ -228,7 +262,7 @@ export class SyncClient {
         });
     }
 
-    private waitForAck(ws: WebSocket, id: number): Promise<void> {
+    private waitForBatchAck(ws: WebSocket, segmentId: string): Promise<void> {
         return new Promise((resolve, reject) => {
             const onMessage = (event: MessageEvent) => {
                 let msg: wsPacket;
@@ -240,7 +274,7 @@ export class SyncClient {
                     return;
                 }
 
-                if (msg.type === opType.Ack && msg.id === id) {
+                if (msg.type === opType.BatchAck && msg.segmentId === segmentId) {
                     cleanup();
                     resolve();
                     return;
@@ -252,11 +286,11 @@ export class SyncClient {
             };
             const onClose = () => {
                 cleanup();
-                reject(new Error("WebSocket closed before ack"));
+                reject(new Error("WebSocket closed before batch ack"));
             };
             const onError = () => {
                 cleanup();
-                reject(new Error("WebSocket errored before ack"));
+                reject(new Error("WebSocket errored before batch ack"));
             };
             const cleanup = () => {
                 ws.removeEventListener("message", onMessage);
@@ -316,6 +350,7 @@ export class SyncClient {
 
     private closeSocket(): void {
         this.authenticated = false;
+        this.authPromise = null;
         if (this.ws && this.ws.readyState !== WebSocket.CLOSED) {
             this.ws.close();
         }

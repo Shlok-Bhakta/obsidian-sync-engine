@@ -1,10 +1,15 @@
-import { sql, Glob } from "bun";
+import { sql } from "bun";
 import migration0001 from "./migrations/0001_init.sql" with { type: "file" };
+import migration0002 from "./migrations/0002_client_key_previous.sql" with { type: "file" };
 
 const migrationsManifest = [
     {
         name: "0001_init",
         sql: migration0001,
+    },
+    {
+        name: "0002_client_key_previous",
+        sql: migration0002,
     }
 ]
 

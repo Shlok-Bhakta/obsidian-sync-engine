@@ -6,6 +6,10 @@ import { outboxData, Path } from "../../shared/types";
 import { DocSync } from 'yjs/DocSync';
 import { SyncClient } from 'sync/SyncClient';
 
+function generateClientKey(): string {
+	return "obs_sync_" + crypto.randomUUID();
+}
+
 export default class SyncEngine extends Plugin {
 	settings: SyncEngineSettings;
 	db: OutboxStore;
@@ -16,8 +20,16 @@ export default class SyncEngine extends Plugin {
 		this.db = new JsonlOutboxStore(this.app, this.manifest);
 		this.docs = new Map<Path, DocSync>();
 		await this.db.open();
-		this.syncClient = new SyncClient(this.db, this.settings);
-		this.syncClient.start();
+		this.syncClient = new SyncClient(this.db, this.settings, async (clientKey) => {
+			this.settings = {
+				...this.settings,
+				clientKey,
+			};
+			await this.saveSettings();
+		});
+		this.app.workspace.onLayoutReady(() => {
+			this.syncClient.start();
+		});
 
 		this.addSettingTab(new SyncEngineSettingTab(this.app, this));
 		this.registerEditorExtension(this.makeEditorOutboxExtension());
@@ -81,6 +93,13 @@ export default class SyncEngine extends Plugin {
 
 	async loadSettings() {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData() as Partial<SyncEngineSettings>);
+		if (!this.settings.clientKey.trim() || this.settings.clientKey === DEFAULT_SETTINGS.clientKey) {
+			this.settings = {
+				...this.settings,
+				clientKey: generateClientKey(),
+			};
+			await this.saveSettings();
+		}
 	}
 
 	async saveSettings() {

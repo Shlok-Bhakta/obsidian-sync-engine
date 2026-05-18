@@ -28,7 +28,9 @@ export type updatePacket = {
 // WS Protocol
 export enum opType {
     Ack = "Ack",
+    BatchAck = "BatchAck",
     Update = "Update",
+    UpdateBatch = "UpdateBatch",
     CreateFile = "CreateFile",
     RenameFile = "RenameFile",
     DeleteFile = "DeleteFile",
@@ -48,6 +50,13 @@ export type wsPacket = { // ping pong thing but simpler
     fileId: Path;
     data: Uint8Array;
     updateTime: number;
+} | {
+    type: opType.UpdateBatch;
+    segmentId: string;
+    jsonl: string;
+} | {
+    type: opType.BatchAck;
+    segmentId: string;
 } | { // File Creation 
     type: opType.CreateFile;
     path: Path;

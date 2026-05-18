@@ -21,6 +21,7 @@ export interface OutboxStore {
     close(): Promise<void>;
     putInOutbox(row: outboxData): Promise<number>;
     claimNextSegment(sealActive: boolean): Promise<OutboxSegment | null>;
+    readSegmentJsonl(segment: OutboxSegment): Promise<string>;
     readSegment(segment: OutboxSegment): Promise<outboxData[]>;
     completeSegment(segment: OutboxSegment): Promise<void>;
     releaseSegment(segment: OutboxSegment): Promise<void>;
@@ -143,7 +144,7 @@ export class JsonlOutboxStore implements OutboxStore {
     }
 
     async readSegment(segment: OutboxSegment): Promise<outboxData[]> {
-        const raw = await this.app.vault.adapter.read(segment.path);
+        const raw = await this.readSegmentJsonl(segment);
         const rows: outboxData[] = [];
 
         for (const line of raw.split("\n")) {
@@ -159,6 +160,10 @@ export class JsonlOutboxStore implements OutboxStore {
         }
 
         return rows;
+    }
+
+    async readSegmentJsonl(segment: OutboxSegment): Promise<string> {
+        return this.app.vault.adapter.read(segment.path);
     }
 
     async completeSegment(segment: OutboxSegment): Promise<void> {
