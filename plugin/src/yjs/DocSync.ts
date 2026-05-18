@@ -1,5 +1,4 @@
-import { yDb } from "db/db";
-import { Editor } from "obsidian";
+import { OutboxStore } from "db/db";
 import * as Y from 'yjs';
 import { ChangeSet } from "@codemirror/state";
 import { outboxData } from "../../../shared/types";
@@ -7,14 +6,13 @@ import { outboxData } from "../../../shared/types";
 // one stop shop for all the document syncing needs
 
 export class DocSync {
-    private db: yDb;
-    private syncWorker: Worker;
+    private db: OutboxStore;
     private ydoc = new Y.Doc();
     private ytext = this.ydoc.getText('markdown');  
     private openedTime = Date.now();
 
 
-    constructor(db: yDb, content: string) {
+    constructor(db: OutboxStore, content: string) {
         this.db = db;
         // do nothing yipee
         this.ydoc.transact(() => {
@@ -51,7 +49,8 @@ export class DocSync {
         const updates = Y.encodeStateAsUpdateV2(this.ydoc, before);
         // console.log(JSON.stringify(after));
         row.data = updates;
-        this.db.putInOutbox(row);
-        // wake up service worker to go do stuff
+        void this.db.putInOutbox(row).catch(error => {
+            console.error("failed to write update to outbox", error);
+        });
     }
 }

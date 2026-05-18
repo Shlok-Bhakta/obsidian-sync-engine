@@ -113,7 +113,7 @@ export class SyncEngineSettingTab extends PluginSettingTab {
 
 						this.plugin.settings = {...this.pendingSettings};
 						await this.plugin.saveSettings();
-						this.plugin.updateWorkerBackendUrl();
+						this.plugin.updateSyncSettings();
 
 						this.hasUnsavedChanges = false;
 						refresh();
