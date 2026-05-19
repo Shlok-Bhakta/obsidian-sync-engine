@@ -122,12 +122,60 @@ async function consumeBootstrapLink(token: string): Promise<BootstrapLink | null
   return link;
 }
 
+async function getBootstrapLink(token: string): Promise<BootstrapLink | null> {
+  const link = bootstrapLinks.get(token);
+  if (!link) {
+    return null;
+  }
+  if (Date.now() >= link.expiresAt) {
+    await expireBootstrapLink(token);
+    return null;
+  }
+  return link;
+}
+
 function makeDownloadUrl(request: Request, token: string): string {
   const url = new URL(request.url);
   url.pathname = `/v1/bootstrap/${encodeURIComponent(token)}`;
   url.search = "";
   url.hash = "";
   return url.toString();
+}
+
+function makeBootstrapDownloadHref(request: Request, token: string): string {
+  const url = new URL(request.url);
+  url.searchParams.set("download", "1");
+  return url.toString();
+}
+
+function bootstrapLandingPage(request: Request, link: BootstrapLink): string {
+  const downloadHref = makeBootstrapDownloadHref(request, link.token);
+  return `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Download ${escapeHtml(link.vaultName)}</title>
+    <style>
+      body { font-family: system-ui, sans-serif; margin: 40px; line-height: 1.4; }
+      a { display: inline-block; padding: 10px 14px; background: #2563eb; color: white; border-radius: 6px; text-decoration: none; }
+      p { color: #475569; }
+    </style>
+  </head>
+  <body>
+    <h1>${escapeHtml(link.vaultName)}</h1>
+    <p>This one-time bootstrap link expires in ${Math.ceil(remainingMs(link.expiresAt)! / 1000)} seconds.</p>
+    <a href="${escapeHtml(downloadHref)}">Download vault zip</a>
+  </body>
+</html>`;
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }
 
 async function registerBootstrapLink(
@@ -225,13 +273,21 @@ app.get("/v1/blobs/:path", async c => {
 
 app.get("/v1/bootstrap/:token", async c => {
   const token = c.req.param("token");
-  const link = await consumeBootstrapLink(token);
+  const link = await getBootstrapLink(token);
   if (!link) {
     return c.text("Bootstrap link is invalid or expired", 404);
   }
 
+  if (c.req.query("download") !== "1") {
+    return c.html(bootstrapLandingPage(c.req.raw, link));
+  }
+
   try {
     const bytes = await Bun.file(link.zipPath).arrayBuffer();
+    const consumed = await consumeBootstrapLink(token);
+    if (!consumed) {
+      return c.text("Bootstrap link is invalid or expired", 404);
+    }
     await link.cleanup();
     publishBootstrapStatus({
       status: "downloaded",
@@ -241,6 +297,7 @@ app.get("/v1/bootstrap/:token", async c => {
     return new Response(bytes, {
       headers: {
         "Content-Type": "application/zip",
+        "Content-Length": String(bytes.byteLength),
         "Content-Disposition": `attachment; filename="${encodeURIComponent(link.vaultName)}.zip"`,
       },
     });
@@ -251,6 +308,21 @@ app.get("/v1/bootstrap/:token", async c => {
     console.error("bootstrap download failed:", error);
     return c.text("Bootstrap download failed", 500);
   }
+});
+
+app.on("HEAD", "/v1/bootstrap/:token", async c => {
+  const link = await getBootstrapLink(c.req.param("token"));
+  if (!link) {
+    return new Response(null, { status: 404 });
+  }
+  const file = Bun.file(link.zipPath);
+  return new Response(null, {
+    headers: {
+      "Content-Type": "application/zip",
+      "Content-Length": String(file.size),
+      "Content-Disposition": `attachment; filename="${encodeURIComponent(link.vaultName)}.zip"`,
+    },
+  });
 });
 
 app.on("HEAD", "/v1/blobs/:path", async c => {

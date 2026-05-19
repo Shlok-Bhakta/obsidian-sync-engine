@@ -387,7 +387,7 @@ async function applyMutation(tx: typeof sql, clientId: string, mutation: SyncMut
   } else if (mutation.operation === "UpsertFile") {
     const isYjs = mutation.isYjs ?? shouldUseYjs(mutation.path);
     const storageKind = mutation.storageKind ?? (isYjs ? "text" : mutation.contentBytes ? "bytea" : "text");
-    const yjsState = isYjs ? docStateFromContent(mutation.content ?? "") : null;
+    const yjsState = isYjs ? mutation.yjsState ?? docStateFromContent(mutation.content ?? "") : null;
     const existingFile = await tx<{ contentOid: number | null }[]>`
       SELECT content_oid AS "contentOid"
       FROM files
@@ -803,7 +803,7 @@ export async function compactMaterializedSyncEvents(): Promise<string> {
 
 export async function handlePull(packet: Extract<wsPacket, { type: opType.PullSince }>): Promise<wsPacket> {
   const hasState = await serverHasAnyState();
-  if (!hasState && packet.revision === "0") {
+  if (!hasState) {
     return {
       type: opType.InitRequired,
       serverRevision: "0",

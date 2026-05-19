@@ -170,6 +170,7 @@ export class SyncClient {
     }
 
     async generateBootstrapLink(vaultName: string, configDir: string, pluginId: string): Promise<void> {
+        await this.ensureStartupSynced();
         const openWs = await this.ensureAuthenticatedSocket();
         const backendUrl = this.httpBackendUrl();
         openWs.send(encodePacket({
@@ -250,6 +251,19 @@ export class SyncClient {
         } finally {
             this.draining = false;
         }
+    }
+
+    private async ensureStartupSynced(): Promise<void> {
+        if (this.startupSynced) {
+            return;
+        }
+        if (this.startupSyncPromise) {
+            await this.startupSyncPromise;
+            if (this.startupSynced) {
+                return;
+            }
+        }
+        await this.runStartupSync();
     }
 
     private async runStartupSync(): Promise<void> {
@@ -338,13 +352,20 @@ export class SyncClient {
                 const isYjs = shouldUseYjs(entry.path, this.app.vault.configDir);
                 if (isYjs) {
                     const loaded = this.app.vault.getAbstractFileByPath(entry.path);
+                    const content = loaded instanceof TFile
+                        ? await this.app.vault.read(loaded)
+                        : await this.app.vault.adapter.read(entry.path);
+                    let yjsState = await this.stateStore.get(entry.path);
+                    if (!yjsState) {
+                        yjsState = docStateFromContent(content, Y);
+                        await this.stateStore.put(entry.path, yjsState);
+                    }
                     changes.push({
                         mutationId: crypto.randomUUID(),
                         operation: "UpsertFile",
                         path: entry.path,
-                        content: loaded instanceof TFile
-                            ? await this.app.vault.read(loaded)
-                            : await this.app.vault.adapter.read(entry.path),
+                        content,
+                        yjsState,
                         isFolder: false,
                         isYjs: true,
                         storageKind: "text",

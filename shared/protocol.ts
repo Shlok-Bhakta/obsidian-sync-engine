@@ -3,9 +3,10 @@ import { validatePacket } from "./validate";
 
 export const PROTOCOL_VERSION: number = 6;
 
-type EncodedMutation = Omit<SyncMutation, "data" | "contentBytes"> & {
+type EncodedMutation = Omit<SyncMutation, "data" | "contentBytes" | "yjsState"> & {
     data?: string;
     contentBytes?: string;
+    yjsState?: string;
 };
 
 type EncodedServerChange = Omit<ServerChange, "data" | "contentBytes" | "yjsState"> & {
@@ -59,6 +60,7 @@ function encodeMutation(mutation: SyncMutation): EncodedMutation {
         ...mutation,
         data: mutation.data ? bytesToBase64(mutation.data) : undefined,
         contentBytes: mutation.contentBytes ? bytesToBase64(mutation.contentBytes) : undefined,
+        yjsState: mutation.yjsState ? bytesToBase64(mutation.yjsState) : undefined,
     };
 }
 
@@ -67,6 +69,7 @@ function decodeMutation(mutation: EncodedMutation): SyncMutation {
         ...mutation,
         data: mutation.data ? base64ToBytes(mutation.data) : undefined,
         contentBytes: mutation.contentBytes ? base64ToBytes(mutation.contentBytes) : undefined,
+        yjsState: mutation.yjsState ? base64ToBytes(mutation.yjsState) : undefined,
     };
 }
 

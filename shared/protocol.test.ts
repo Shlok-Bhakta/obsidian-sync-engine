@@ -83,6 +83,27 @@ describe("encodePacket / decodePacket", () => {
         expect(decodePacket(encodePacket(packet))).toEqual(packet);
     });
 
+    it("round-trips init upload yjsState", () => {
+        const yjsState = new Uint8Array([5, 6, 7, 8]);
+        const packet = {
+            type: opType.InitUploadBatch as const,
+            segmentId: "init-1",
+            changes: [{
+                mutationId: "init-notes-a",
+                operation: "UpsertFile" as const,
+                path: "notes/a.md",
+                content: "hello",
+                yjsState,
+                isFolder: false,
+                isYjs: true,
+                storageKind: "text" as const,
+                created: 1,
+            }],
+        };
+
+        expect(decodePacket(encodePacket(packet))).toEqual(packet);
+    });
+
     it("round-trips BootstrapCreate and BootstrapStatus", () => {
         const create = {
             type: opType.BootstrapCreate as const,

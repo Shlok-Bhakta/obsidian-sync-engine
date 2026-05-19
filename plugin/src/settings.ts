@@ -194,7 +194,7 @@ export class SyncEngineSettingTab extends PluginSettingTab {
 				});
 				panel.createEl("a", {
 					cls: "sync-engine-bootstrap-link__open",
-					text: "Open download link",
+					text: "Open download page",
 					href: status.downloadUrl,
 				});
 			} else if (status.status === "downloaded") {

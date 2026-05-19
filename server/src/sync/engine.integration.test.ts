@@ -27,6 +27,7 @@ import {
   mutationYjsUpdate,
   readDoc,
   seedMarkdownFile,
+  stateFromMarkdown,
   uploadYjsEdit,
 } from "../test/yjsHarness";
 import { applyYjsPayload } from "../yjs/apply";
@@ -123,8 +124,8 @@ describeIntegration("sync engine postgres integration", () => {
       ORDER BY id;
     `;
     expect(rows).toHaveLength(1);
-    expect(rows[0]?.clientKey).toBe(auth.clientKey);
-    expect(rows[0]?.valid).toBe(true);
+    expect(rows[0]!.clientKey).toBe(auth.clientKey!);
+    expect(rows[0]!.valid).toBe(true);
   });
 
   it("UpsertFile writes files.content and files.yjs_state", async () => {
@@ -141,6 +142,25 @@ describeIntegration("sync engine postgres integration", () => {
     const upsertEvents = events.filter(event => event.operation === "UpsertFile");
     expect(upsertEvents).toHaveLength(1);
     expect(upsertEvents[0]?.content).toBe("hello");
+  });
+
+  it("initial markdown UpsertFile preserves client-supplied yjs_state", async () => {
+    const clientState = stateFromMarkdown("client seeded");
+
+    await acceptMutations(CLIENT_A, [{
+      mutationId: crypto.randomUUID(),
+      operation: "UpsertFile",
+      path: NOTE_PATH,
+      content: "client seeded",
+      yjsState: clientState,
+      isYjs: true,
+      storageKind: "text",
+      created: Date.now(),
+    }]);
+
+    const file = await getFile(NOTE_PATH);
+    expect(file?.content).toBe("client seeded");
+    expect(file?.yjsState).toEqual(clientState);
   });
 
   it("rejects plugin-internal paths", async () => {
@@ -179,6 +199,15 @@ describeIntegration("sync engine postgres integration", () => {
     const change = snapshot.files.find(entry => entry.path === path);
     expect(change?.contentBytes).toEqual(contentBytes);
     expect(change?.storageKind).toBe("bytea");
+  });
+
+  it("empty server requires init even when client revision is nonzero", async () => {
+    const pull = await handlePull({ type: opType.PullSince, revision: "42" });
+
+    expect(pull.type).toBe(opType.InitRequired);
+    if (pull.type === opType.InitRequired) {
+      expect(pull.serverRevision).toBe("0");
+    }
   });
 
   it("stores and unlinks Large Object blob files", async () => {
@@ -542,6 +571,13 @@ describeIntegration("sync engine postgres integration", () => {
   });
 
   it("builds a bootstrap zip from compacted server state", async () => {
+    await acceptMutations(CLIENT_A, [{
+      mutationId: crypto.randomUUID(),
+      operation: "CreateFolder",
+      path: "/",
+      isFolder: true,
+      created: Date.now(),
+    }]);
     await seedMarkdownFile(CLIENT_A, NOTE_PATH, "bootstrap note");
     await acceptMutations(CLIENT_A, [{
       mutationId: crypto.randomUUID(),
@@ -577,6 +613,7 @@ describeIntegration("sync engine postgres integration", () => {
       const entries = await readStoredZip(built.zipPath);
       const centralNames = await readStoredZipCentralDirectory(built.zipPath);
       expect([...entries.keys()].every(name => name.startsWith("Bootstrap Vault/"))).toBe(true);
+      expect(centralNames).toContain("Bootstrap Vault/");
       expect(centralNames).toContain("Bootstrap Vault/notes/test.md");
       expect(new TextDecoder().decode(entries.get("Bootstrap Vault/notes/test.md"))).toBe("bootstrap note");
       expect(entries.get("Bootstrap Vault/.obsidian/workspace.json")).toEqual(new TextEncoder().encode('{"pane":"left"}'));

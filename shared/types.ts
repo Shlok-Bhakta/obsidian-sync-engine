@@ -17,6 +17,7 @@ export type SyncMutation = {
     content?: string;
     contentBytes?: Uint8Array;
     data?: Uint8Array;
+    yjsState?: Uint8Array;
     isFolder?: boolean;
     isYjs?: boolean;
     storageKind?: "text" | "bytea" | "lo";

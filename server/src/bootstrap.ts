@@ -60,6 +60,10 @@ function ensureSafeVaultPath(path: string): void {
   }
 }
 
+function isVaultRootPath(path: string): boolean {
+  return path === "/" || path === ".";
+}
+
 function randomClientName(): string {
   const adjective = adjectives[Math.floor(Math.random() * adjectives.length)] ?? adjectives[0];
   const noun = nouns[Math.floor(Math.random() * nouns.length)] ?? nouns[0];
@@ -245,6 +249,9 @@ export async function buildBootstrapZip(request: BootstrapBuildRequest): Promise
   try {
     const rows = await readBootstrapRows();
     for (const row of rows) {
+      if (isVaultRootPath(row.path)) {
+        continue;
+      }
       ensureSafeVaultPath(row.path);
       const target = join(vaultRoot, ...row.path.split("/"));
       if (row.isFolder) {
