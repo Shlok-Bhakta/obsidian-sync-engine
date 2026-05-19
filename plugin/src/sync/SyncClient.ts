@@ -1,12 +1,20 @@
-import { Notice } from "obsidian";
+import { App, Notice, TFile, TFolder, normalizePath } from "obsidian";
+import * as Y from "yjs";
 import { OutboxSegment, OutboxStore } from "db/db";
-import { opType, wsPacket } from "../../../shared/types";
-import { decodePacket, encodePacket, PROTOCOL_VERSION } from "../../../shared/protocol";
+import { opType, ServerChange, SyncMutation, wsPacket } from "../../../shared/types";
+import { bytesToBase64, decodePacket, encodePacket, PROTOCOL_VERSION } from "../../../shared/protocol";
+import { docStateFromContent, MARKDOWN_FIELD } from "../../../shared/yjsSeed";
+import { buildUploadFromSyncedDoc, shouldApplyDocSyncCatchUp } from "../../../shared/yjsUpload";
 import { SyncEngineSettings } from "../settings";
+import { DocSync } from "../yjs/DocSync";
+import { YjsStateStore } from "../yjs/YjsStateStore";
 
 const EMPTY_BACKOFF_MS = 1000;
 const ERROR_BACKOFF_MS = 2000;
 const IDLE_EMPTY_SEGMENTS = 3;
+const CONNECT_BACKOFF_INITIAL_MS = 5000;
+const CONNECT_BACKOFF_MAX_MS = 60000;
+const WS_WAIT_TIMEOUT_MS = 60_000;
 
 function sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
@@ -32,35 +40,72 @@ function asError(error: unknown): Error {
     return error instanceof Error ? error : new Error(String(error));
 }
 
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+    return new Promise((resolve, reject) => {
+        const timer = window.setTimeout(() => reject(new Error(message)), ms);
+        promise.then(
+            value => {
+                window.clearTimeout(timer);
+                resolve(value);
+            },
+            error => {
+                window.clearTimeout(timer);
+                reject(asError(error));
+            },
+        );
+    });
+}
+
+function dirname(path: string): string {
+    const index = path.lastIndexOf("/");
+    return index === -1 ? "" : path.slice(0, index);
+}
+
 export class SyncClient {
     private ws: WebSocket | null = null;
     private serverUrl: string;
+    private clientId: string;
     private clientKey: string;
     private clientName: string;
+    private lastPulledRevision: string;
     private draining = false;
     private stopped = false;
     private flushTimer: number | null = null;
     private pollInterval: number | null = null;
     private authenticated = false;
     private authPromise: Promise<WebSocket> | null = null;
+    private startupSyncPromise: Promise<void> | null = null;
+    private startupSynced = false;
+    private applyingRemote = false;
+    private failedConnectAttempts = 0;
+    private nextConnectAt = 0;
 
     constructor(
+        private readonly app: App,
         private readonly outbox: OutboxStore,
+        private readonly stateStore: YjsStateStore,
         settings: SyncEngineSettings,
         private readonly onClientKeyRotated: (clientKey: string) => Promise<void> = async () => {},
+        private readonly onLastPulledRevisionChanged: (revision: string) => Promise<void> = async () => {},
+        private readonly getDocSync: (path: string) => DocSync | undefined = () => undefined,
     ) {
         this.serverUrl = toWebSocketUrl(settings.backendUrl);
+        this.clientId = settings.clientId;
         this.clientKey = settings.clientKey;
         this.clientName = settings.clientName;
+        this.lastPulledRevision = settings.lastPulledRevision;
+    }
+
+    isApplyingRemoteChanges(): boolean {
+        return this.applyingRemote;
     }
 
     start(): void {
         this.stopped = false;
+        this.recordConnectionSuccess();
         this.connectSoon();
-        this.wakeSoon();
         this.pollInterval = window.setInterval(() => {
             this.connectSoon();
-            this.wakeSoon();
         }, 5000);
     }
 
@@ -79,30 +124,47 @@ export class SyncClient {
 
     updateSettings(settings: SyncEngineSettings): void {
         const nextUrl = toWebSocketUrl(settings.backendUrl);
-        const authChanged = settings.clientKey !== this.clientKey || settings.clientName !== this.clientName;
+        const authChanged =
+            settings.clientId !== this.clientId ||
+            settings.clientKey !== this.clientKey ||
+            settings.clientName !== this.clientName;
+        this.clientId = settings.clientId;
         this.clientKey = settings.clientKey;
         this.clientName = settings.clientName;
+        this.lastPulledRevision = settings.lastPulledRevision;
         if (nextUrl !== this.serverUrl || authChanged) {
             this.serverUrl = nextUrl;
+            this.startupSyncPromise = null;
+            this.startupSynced = false;
+            this.recordConnectionSuccess();
             this.closeSocket();
         }
         this.connectSoon();
-        this.wakeSoon();
     }
 
     connectSoon(): void {
-        if (this.stopped) {
+        if (this.stopped || this.startupSyncPromise || this.startupSynced) {
+            return;
+        }
+        if (Date.now() < this.nextConnectAt) {
             return;
         }
 
-        void this.ensureAuthenticatedSocket().catch(error => {
-            console.error("failed to connect sync client", error);
-            this.closeSocket();
-        });
+        this.startupSyncPromise = this.runStartupSync()
+            .catch(error => {
+                this.recordConnectionFailure(error);
+                this.closeSocket();
+            })
+            .finally(() => {
+                this.startupSyncPromise = null;
+                if (this.startupSynced) {
+                    this.wakeSoon();
+                }
+            });
     }
 
     wakeSoon(): void {
-        if (this.stopped || this.flushTimer !== null) {
+        if (this.stopped || this.flushTimer !== null || this.startupSyncPromise || !this.startupSynced) {
             return;
         }
 
@@ -113,7 +175,7 @@ export class SyncClient {
     }
 
     async drainOutbox(): Promise<void> {
-        if (this.draining || this.stopped) {
+        if (this.draining || this.stopped || this.startupSyncPromise || !this.startupSynced) {
             return;
         }
 
@@ -151,17 +213,453 @@ export class SyncClient {
         }
     }
 
-    private async sendSegment(segment: OutboxSegment): Promise<void> {
-        const jsonl = await this.outbox.readSegmentJsonl(segment);
+    private async runStartupSync(): Promise<void> {
         const openWs = await this.ensureAuthenticatedSocket();
+        const pullResponse = await this.pullSince(openWs, this.lastPulledRevision);
+
+        if (pullResponse.type === opType.InitRequired) {
+            await this.uploadInitialSnapshot(openWs);
+        } else if (pullResponse.type === opType.ChangeBatch) {
+            await this.applyChangeBatch(pullResponse);
+        } else if (pullResponse.type === opType.SnapshotReset) {
+            await this.applySnapshotReset(pullResponse);
+        } else {
+            throw new Error(`Unexpected pull response: ${pullResponse.type}`);
+        }
+        this.startupSynced = true;
+        this.recordConnectionSuccess();
+    }
+
+    private recordConnectionFailure(error: unknown): void {
+        this.failedConnectAttempts++;
+        const exponent = Math.min(this.failedConnectAttempts - 1, 6);
+        const delay = Math.min(CONNECT_BACKOFF_INITIAL_MS * (2 ** exponent), CONNECT_BACKOFF_MAX_MS);
+        this.nextConnectAt = Date.now() + delay;
+        console.warn(`sync client connection failed; retrying in ${Math.round(delay / 1000)}s`, error);
+    }
+
+    private recordConnectionSuccess(): void {
+        this.failedConnectAttempts = 0;
+        this.nextConnectAt = 0;
+    }
+
+    private async sendSegment(segment: OutboxSegment): Promise<void> {
+        const openWs = await this.ensureAuthenticatedSocket();
+        const jsonl = await this.prepareSegmentJsonl(openWs, segment);
         const packet: wsPacket = {
             type: opType.UpdateBatch,
             segmentId: segment.id,
             jsonl,
         };
-        const ack = this.waitForBatchAck(openWs, segment.id);
+        const ack = withTimeout(
+            this.waitForBatchAck(openWs, segment.id),
+            WS_WAIT_TIMEOUT_MS,
+            `Timed out waiting for batch ack (${segment.id})`,
+        );
         openWs.send(encodePacket(packet));
-        await ack;
+        const revision = await ack;
+        await this.persistLastPulledRevision(revision);
+    }
+
+    private async uploadInitialSnapshot(ws: WebSocket): Promise<void> {
+        const packet: wsPacket = {
+            type: opType.InitUploadBatch,
+            segmentId: `init-${Date.now()}`,
+            changes: await this.readVaultSnapshot(),
+        };
+        const ack = withTimeout(
+            this.waitForBatchAck(ws, packet.segmentId),
+            WS_WAIT_TIMEOUT_MS,
+            `Timed out waiting for init upload ack (${packet.segmentId})`,
+        );
+        ws.send(encodePacket(packet));
+        const revision = await ack;
+        await this.persistLastPulledRevision(revision);
+    }
+
+    private async readVaultSnapshot(): Promise<SyncMutation[]> {
+        const created = Date.now();
+        const changes: SyncMutation[] = [];
+        const configPrefix = `${this.app.vault.configDir}/`;
+        const loaded = this.app.vault.getAllLoadedFiles()
+            .filter(file => file.path && !file.path.startsWith(configPrefix))
+            .sort((a, b) => a.path.localeCompare(b.path));
+
+        for (const file of loaded) {
+            if (file instanceof TFolder) {
+                changes.push({
+                    mutationId: crypto.randomUUID(),
+                    operation: "CreateFolder",
+                    path: file.path,
+                    isFolder: true,
+                    created,
+                });
+            }
+        }
+
+        for (const file of loaded) {
+            if (file instanceof TFile) {
+                changes.push({
+                    mutationId: crypto.randomUUID(),
+                    operation: "UpsertFile",
+                    path: file.path,
+                    content: await this.app.vault.read(file),
+                    isFolder: false,
+                    isYjs: file.extension === "md",
+                    created,
+                });
+            }
+        }
+
+        return changes;
+    }
+
+    private async applyChangeBatch(packet: Extract<wsPacket, { type: opType.ChangeBatch }>): Promise<void> {
+        await this.applyServerChanges(packet.changes);
+        await this.persistLastPulledRevision(packet.serverRevision);
+    }
+
+    private async applySnapshotReset(packet: Extract<wsPacket, { type: opType.SnapshotReset }>): Promise<void> {
+        const snapshotPaths = new Set(packet.files.map(file => normalizePath(file.path)));
+        const toDelete = [...this.app.vault.getFiles()]
+            .filter(file => !file.path.startsWith(`${this.app.vault.configDir}/`) && !snapshotPaths.has(normalizePath(file.path)));
+        const hasPendingChanges = await this.outbox.hasPendingChanges();
+        if (toDelete.length > 0 && hasPendingChanges) {
+            new Notice(`Sync snapshot reset: preserving ${toDelete.length} local file(s) while pending changes upload`);
+        } else if (toDelete.length > 0) {
+            new Notice(`Sync snapshot reset: removing ${toDelete.length} local file(s) not on server`);
+            await this.deletePathsMissingFromSnapshot(snapshotPaths);
+        }
+        await this.applyServerChanges(packet.files);
+        await this.persistLastPulledRevision(packet.targetRevision);
+    }
+
+    private async applyServerChanges(changes: ServerChange[]): Promise<void> {
+        this.applyingRemote = true;
+        try {
+            for (const change of changes) {
+                if (change.operation === "CreateFolder") {
+                    await this.ensureFolder(change.path);
+                } else if (change.operation === "UpsertFile") {
+                    await this.upsertFile(change.path, change.content ?? "");
+                    await this.refreshYjsState(change.path, change.content ?? "", change.yjsState);
+                } else if (change.operation === "Delete") {
+                    await this.deletePath(change.path);
+                } else if (change.operation === "Rename" && change.toPath) {
+                    await this.renamePath(change.path, change.toPath);
+                } else if (change.operation === "YjsUpdate" && change.data) {
+                    await this.applyYjsUpdate(change.path, change.data);
+                }
+            }
+        } finally {
+            this.applyingRemote = false;
+        }
+    }
+
+    private async deletePathsMissingFromSnapshot(paths: Set<string>): Promise<void> {
+        this.applyingRemote = true;
+        try {
+            const configPrefix = `${this.app.vault.configDir}/`;
+            const files = [...this.app.vault.getFiles()]
+                .filter(file => !file.path.startsWith(configPrefix) && !paths.has(normalizePath(file.path)))
+                .sort((a, b) => b.path.length - a.path.length);
+            for (const file of files) {
+                await this.app.fileManager.trashFile(file);
+                await this.stateStore.delete(file.path);
+            }
+        } finally {
+            this.applyingRemote = false;
+        }
+    }
+
+    private async ensureFolder(path: string): Promise<void> {
+        const normalized = normalizePath(path);
+        if (!normalized || await this.app.vault.adapter.exists(normalized)) {
+            return;
+        }
+        const parent = dirname(normalized);
+        if (parent) {
+            await this.ensureFolder(parent);
+        }
+        try {
+            await this.app.vault.createFolder(normalized);
+        } catch (error) {
+            if (!(await this.app.vault.adapter.exists(normalized))) {
+                throw error;
+            }
+        }
+    }
+
+    private async upsertFile(path: string, content: string): Promise<void> {
+        const normalized = normalizePath(path);
+        const parent = dirname(normalized);
+        if (parent) {
+            await this.ensureFolder(parent);
+        }
+        const existing = this.app.vault.getAbstractFileByPath(normalized);
+        if (existing instanceof TFile) {
+            await this.app.vault.modify(existing, content);
+            return;
+        }
+        if (existing) {
+            await this.app.fileManager.trashFile(existing);
+        }
+        await this.app.vault.create(normalized, content);
+    }
+
+    private async deletePath(path: string): Promise<void> {
+        const existing = this.app.vault.getAbstractFileByPath(normalizePath(path));
+        if (existing) {
+            await this.app.fileManager.trashFile(existing);
+        }
+        await this.stateStore.delete(path, existing instanceof TFolder);
+    }
+
+    private async renamePath(fromPath: string, toPath: string): Promise<void> {
+        const existing = this.app.vault.getAbstractFileByPath(normalizePath(fromPath));
+        if (!existing) {
+            return;
+        }
+        const parent = dirname(toPath);
+        if (parent) {
+            await this.ensureFolder(parent);
+        }
+        await this.app.vault.rename(existing, normalizePath(toPath));
+        await this.stateStore.rename(fromPath, toPath, existing instanceof TFolder);
+    }
+
+    private async applyYjsUpdate(path: string, update: Uint8Array): Promise<void> {
+        const normalized = normalizePath(path);
+        const openDoc = this.getDocSync(normalized);
+        let content: string;
+        let state: Uint8Array;
+        if (openDoc) {
+            content = openDoc.applyRemoteUpdate(update);
+            state = Y.encodeStateAsUpdateV2(openDoc.getYdoc());
+        } else {
+            const doc = new Y.Doc();
+            Y.applyUpdateV2(doc, await this.getOrSeedState(normalized));
+            Y.applyUpdateV2(doc, update);
+            content = doc.getText(MARKDOWN_FIELD).toJSON();
+            state = Y.encodeStateAsUpdateV2(doc);
+            doc.destroy();
+        }
+        await this.upsertFile(normalized, content);
+        await this.stateStore.put(normalized, state);
+    }
+
+    private async readVaultContent(path: string): Promise<string> {
+        const existing = this.app.vault.getAbstractFileByPath(path);
+        return existing instanceof TFile ? this.app.vault.read(existing) : "";
+    }
+
+    private async refreshYjsState(path: string, content: string, yjsState?: Uint8Array): Promise<void> {
+        if (!path.endsWith(".md")) {
+            return;
+        }
+        const state = yjsState ?? docStateFromContent(content, Y);
+        await this.stateStore.put(path, state);
+        const openDoc = this.getDocSync(normalizePath(path));
+        if (openDoc) {
+            await openDoc.replaceState(state);
+        }
+    }
+
+    private async getOrSeedState(path: string): Promise<Uint8Array> {
+        const existing = await this.stateStore.get(path);
+        if (existing) {
+            return existing;
+        }
+        const state = docStateFromContent(await this.readVaultContent(path), Y);
+        await this.stateStore.put(path, state);
+        return state;
+    }
+
+    private async resolveYdoc(path: string): Promise<{ doc: Y.Doc; destroy: () => void }> {
+        const normalized = normalizePath(path);
+        const openDoc = this.getDocSync(normalized);
+        if (openDoc) {
+            return {
+                doc: openDoc.getYdoc(),
+                destroy: () => {},
+            };
+        }
+        const doc = new Y.Doc();
+        const loadedState = await this.getOrSeedState(normalized);
+        Y.applyUpdateV2(doc, loadedState);
+        return { doc, destroy: () => doc.destroy() };
+    }
+
+    private encodeMutationsJsonl(mutations: SyncMutation[]): string {
+        if (mutations.length === 0) {
+            return "";
+        }
+        return mutations.map((row, index) => JSON.stringify({
+            ...row,
+            id: index + 1,
+            data: row.data ? bytesToBase64(row.data) : undefined,
+        })).join("\n") + "\n";
+    }
+
+    private async prepareSegmentJsonl(ws: WebSocket, segment: OutboxSegment): Promise<string> {
+        const rows = await this.outbox.readSegment(segment);
+        const yjsPaths = [...new Set(
+            rows
+                .filter(row => row.operation === "YjsUpdate")
+                .map(row => row.path),
+        )];
+
+        const coalesced = new Map<string, SyncMutation>();
+        if (yjsPaths.length > 0) {
+            const resolved: {
+                path: string;
+                doc: Y.Doc;
+                destroy: () => void;
+                stateVector: Uint8Array;
+                created: number;
+            }[] = [];
+
+            for (const path of yjsPaths) {
+                const pathRows = rows.filter(row => row.operation === "YjsUpdate" && row.path === path);
+                const { doc, destroy } = await this.resolveYdoc(path);
+                resolved.push({
+                    path,
+                    doc,
+                    destroy,
+                    stateVector: Y.encodeStateVector(doc),
+                    created: Math.max(...pathRows.map(row => row.created)),
+                });
+            }
+
+            try {
+                const ack = await this.requestDocSync(
+                    ws,
+                    resolved.map(entry => ({
+                        path: entry.path,
+                        stateVector: entry.stateVector,
+                        content: entry.doc.getText(MARKDOWN_FIELD).toJSON(),
+                    })),
+                );
+                for (const entry of resolved) {
+                    const syncResult = ack.paths.find(result => result.path === entry.path);
+                    if (!syncResult) {
+                        throw new Error(`DocSyncAck missing path ${entry.path}`);
+                    }
+                    let target = entry.doc.getText(MARKDOWN_FIELD).toJSON();
+                    if (shouldApplyDocSyncCatchUp(target, syncResult.yjsState, syncResult.data)) {
+                        Y.applyUpdateV2(entry.doc, syncResult.data);
+                        target = entry.doc.getText(MARKDOWN_FIELD).toJSON();
+                    }
+                    const { upload, state } = buildUploadFromSyncedDoc(
+                        entry.doc,
+                        syncResult.stateVector,
+                        syncResult.yjsState,
+                        target,
+                    );
+                    await this.stateStore.put(entry.path, state);
+                    const openDoc = this.getDocSync(entry.path);
+                    if (openDoc) {
+                        await openDoc.replaceState(state);
+                    }
+                    coalesced.set(entry.path, {
+                        mutationId: crypto.randomUUID(),
+                        operation: "YjsUpdate",
+                        path: entry.path,
+                        data: upload,
+                        created: entry.created,
+                    });
+                }
+            } finally {
+                for (const entry of resolved) {
+                    entry.destroy();
+                }
+            }
+        }
+
+        const pathsUploaded = new Set<string>();
+        const output: SyncMutation[] = [];
+        for (const row of rows) {
+            if (row.operation !== "YjsUpdate") {
+                output.push({
+                    mutationId: row.mutationId,
+                    operation: row.operation,
+                    path: row.path,
+                    toPath: row.toPath,
+                    content: row.content,
+                    data: row.data,
+                    isFolder: row.isFolder,
+                    isYjs: row.isYjs,
+                    created: row.created,
+                });
+                continue;
+            }
+            if (pathsUploaded.has(row.path)) {
+                continue;
+            }
+            pathsUploaded.add(row.path);
+            const merged = coalesced.get(row.path);
+            if (merged) {
+                output.push(merged);
+            }
+        }
+
+        return this.encodeMutationsJsonl(output);
+    }
+
+    private requestDocSync(
+        ws: WebSocket,
+        paths: { path: string; stateVector: Uint8Array; content?: string }[],
+    ): Promise<Extract<wsPacket, { type: opType.DocSyncAck }>> {
+        const response = withTimeout(
+            new Promise<Extract<wsPacket, { type: opType.DocSyncAck }>>((resolve, reject) => {
+                const onMessage = (event: MessageEvent) => {
+                    let msg: wsPacket;
+                    try {
+                        msg = decodePacket(readSocketMessage(event));
+                    } catch (error) {
+                        cleanup();
+                        reject(asError(error));
+                        return;
+                    }
+
+                    if (msg.type === opType.DocSyncAck) {
+                        cleanup();
+                        resolve(msg);
+                        return;
+                    }
+                    if (msg.type === opType.Deny) {
+                        cleanup();
+                        reject(new Error(msg.message));
+                    }
+                };
+                const onClose = () => {
+                    cleanup();
+                    reject(new Error("WebSocket closed before DocSync ack"));
+                };
+                const onError = () => {
+                    cleanup();
+                    reject(new Error("WebSocket errored before DocSync ack"));
+                };
+                const cleanup = () => {
+                    ws.removeEventListener("message", onMessage);
+                    ws.removeEventListener("close", onClose);
+                    ws.removeEventListener("error", onError);
+                };
+
+                ws.addEventListener("message", onMessage);
+                ws.addEventListener("close", onClose, { once: true });
+                ws.addEventListener("error", onError, { once: true });
+            }),
+            WS_WAIT_TIMEOUT_MS,
+            "Timed out waiting for DocSync ack",
+        );
+        ws.send(encodePacket({ type: opType.DocSync, paths }));
+        return response;
+    }
+
+    private async persistLastPulledRevision(revision: string): Promise<void> {
+        this.lastPulledRevision = revision;
+        await this.onLastPulledRevisionChanged(revision);
     }
 
     private async ensureAuthenticatedSocket(): Promise<WebSocket> {
@@ -185,11 +683,17 @@ export class SyncClient {
 
         const authPacket: wsPacket = {
             type: opType.Auth,
+            clientId: this.clientId,
             clientKey: this.clientKey,
             clientName: this.clientName,
             protocolVersion: PROTOCOL_VERSION,
+            lastPulledRevision: this.lastPulledRevision,
         };
-        const ack = this.waitForAuthAck(openWs);
+        const ack = withTimeout(
+            this.waitForAuthAck(openWs),
+            WS_WAIT_TIMEOUT_MS,
+            "Timed out waiting for auth ack",
+        );
         openWs.send(encodePacket(authPacket));
         const packet = await ack;
         if (!packet || packet.type !== opType.AuthAck) {
@@ -206,6 +710,16 @@ export class SyncClient {
 
         this.authenticated = true;
         return openWs;
+    }
+
+    private async pullSince(ws: WebSocket, revision: string): Promise<wsPacket> {
+        const response = withTimeout(
+            this.waitForPullResponse(ws),
+            WS_WAIT_TIMEOUT_MS,
+            "Timed out waiting for pull response",
+        );
+        ws.send(encodePacket({ type: opType.PullSince, revision }));
+        return response;
     }
 
     private async ensureSocket(): Promise<WebSocket> {
@@ -225,6 +739,7 @@ export class SyncClient {
             if (this.ws === nextWs) {
                 this.ws = null;
                 this.authenticated = false;
+                this.startupSynced = false;
             }
         });
 
@@ -262,7 +777,7 @@ export class SyncClient {
         });
     }
 
-    private waitForBatchAck(ws: WebSocket, segmentId: string): Promise<void> {
+    private waitForBatchAck(ws: WebSocket, segmentId: string): Promise<string> {
         return new Promise((resolve, reject) => {
             const onMessage = (event: MessageEvent) => {
                 let msg: wsPacket;
@@ -276,7 +791,7 @@ export class SyncClient {
 
                 if (msg.type === opType.BatchAck && msg.segmentId === segmentId) {
                     cleanup();
-                    resolve();
+                    resolve(msg.revision);
                     return;
                 }
                 if (msg.type === opType.Deny) {
@@ -291,6 +806,52 @@ export class SyncClient {
             const onError = () => {
                 cleanup();
                 reject(new Error("WebSocket errored before batch ack"));
+            };
+            const cleanup = () => {
+                ws.removeEventListener("message", onMessage);
+                ws.removeEventListener("close", onClose);
+                ws.removeEventListener("error", onError);
+            };
+
+            ws.addEventListener("message", onMessage);
+            ws.addEventListener("close", onClose, { once: true });
+            ws.addEventListener("error", onError, { once: true });
+        });
+    }
+
+    private waitForPullResponse(ws: WebSocket): Promise<wsPacket> {
+        return new Promise((resolve, reject) => {
+            const onMessage = (event: MessageEvent) => {
+                let msg: wsPacket;
+                try {
+                    msg = decodePacket(readSocketMessage(event));
+                } catch (error) {
+                    cleanup();
+                    reject(asError(error));
+                    return;
+                }
+
+                if (
+                    msg.type === opType.InitRequired ||
+                    msg.type === opType.ChangeBatch ||
+                    msg.type === opType.SnapshotReset
+                ) {
+                    cleanup();
+                    resolve(msg);
+                    return;
+                }
+                if (msg.type === opType.Deny) {
+                    cleanup();
+                    reject(new Error(msg.message));
+                }
+            };
+            const onClose = () => {
+                cleanup();
+                reject(new Error("WebSocket closed before pull response"));
+            };
+            const onError = () => {
+                cleanup();
+                reject(new Error("WebSocket errored before pull response"));
             };
             const cleanup = () => {
                 ws.removeEventListener("message", onMessage);
@@ -351,6 +912,7 @@ export class SyncClient {
     private closeSocket(): void {
         this.authenticated = false;
         this.authPromise = null;
+        this.startupSynced = false;
         if (this.ws && this.ws.readyState !== WebSocket.CLOSED) {
             this.ws.close();
         }

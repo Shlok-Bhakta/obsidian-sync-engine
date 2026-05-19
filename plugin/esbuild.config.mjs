@@ -1,6 +1,18 @@
 import esbuild from "esbuild";
 import process from "process";
-import { builtinModules } from 'node:module';
+import { createRequire } from "node:module";
+import { builtinModules } from "node:module";
+
+const require = createRequire(import.meta.url);
+const yjsEntry = require.resolve("yjs");
+
+/** One Yjs instance per bundle — shared/ has its own node_modules/yjs otherwise. */
+const yjsDedupePlugin = {
+	name: "yjs-dedupe",
+	setup(build) {
+		build.onResolve({ filter: /^yjs$/ }, () => ({ path: yjsEntry }));
+	},
+};
 
 const banner =
 `/*
@@ -39,6 +51,7 @@ const context = await esbuild.context({
 	treeShaking: true,
 	outfile: "main.js",
 	minify: prod,
+	plugins: [yjsDedupePlugin],
 });
 
 if (prod) {

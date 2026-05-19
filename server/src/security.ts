@@ -18,6 +18,8 @@ type ClientKeyCount = {
 export type ClientKeyRotationResult = {
     authenticated: boolean;
     clientKey?: string;
+    currentKeyId?: string;
+    previousKeyId?: string | null;
 };
 
 function isClientKeyShape(clientKey: string): boolean {
@@ -38,8 +40,12 @@ export async function rotateClientKey(clientKey: string): Promise<ClientKeyRotat
         const zerocheck = await tx<ClientKeyCount[]>`SELECT COUNT(valid) FROM client_keys`;
         const rowcount = parseInt(zerocheck[0]?.count ?? "0", 10);
         if(rowcount === 0){
-            await tx`INSERT INTO client_keys (client_key, previous_key_id, valid) VALUES (${clientKey}, NULL, TRUE);`;
-            return { authenticated: true, clientKey };
+            const inserted = await tx<ClientKeyRow[]>`
+                INSERT INTO client_keys (client_key, previous_key_id, valid)
+                VALUES (${clientKey}, NULL, TRUE)
+                RETURNING id, client_key AS "clientKey", valid;
+            `;
+            return { authenticated: true, clientKey, currentKeyId: inserted[0].id, previousKeyId: null };
         }
 
         const existing = await tx<ClientKeyRow[]>`
@@ -55,12 +61,13 @@ export async function rotateClientKey(clientKey: string): Promise<ClientKeyRotat
         const keyRow = existing[0];
         if(keyRow.valid){
             const key = generateClientKey();
-            await tx`
+            const inserted = await tx<ClientKeyRow[]>`
                 INSERT INTO client_keys (client_key, previous_key_id, valid)
-                VALUES (${key}, ${keyRow.id}, TRUE);
+                VALUES (${key}, ${keyRow.id}, TRUE)
+                RETURNING id, client_key AS "clientKey", valid;
             `;
             await tx`UPDATE client_keys SET valid = FALSE WHERE id = ${keyRow.id};`;
-            return { authenticated: true, clientKey: key };
+            return { authenticated: true, clientKey: key, currentKeyId: inserted[0].id, previousKeyId: keyRow.id };
         }
 
         const current = await tx<ClientKeyRow[]>`
@@ -85,7 +92,7 @@ export async function rotateClientKey(clientKey: string): Promise<ClientKeyRotat
             return { authenticated: false };
         }
 
-        return { authenticated: true, clientKey: current[0].clientKey };
+        return { authenticated: true, clientKey: current[0].clientKey, currentKeyId: current[0].id, previousKeyId: keyRow.id };
     });
 }
 
@@ -109,8 +116,6 @@ async function isClientKeyAccepted(clientKey: string): Promise<boolean> {
     if(result.length === 0){
         return false;
     }
-    console.log("result", result[0].valid);
-    // return result[0].valid;
     return result[0].valid;
 
 }

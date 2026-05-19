@@ -13,7 +13,8 @@ export default tseslint.config(
 				projectService: {
 					allowDefaultProject: [
 						'eslint.config.js',
-						'manifest.json'
+						'manifest.json',
+						'vitest.config.ts',
 					]
 				},
 				tsconfigRootDir: import.meta.dirname,
@@ -22,6 +23,13 @@ export default tseslint.config(
 		},
 	},
 	...obsidianmd.configs.recommended,
+	{
+		files: ["src/**/*.ts"],
+		rules: {
+			// @codemirror/* is provided by Obsidian at runtime (esbuild externals).
+			"import/no-extraneous-dependencies": "off",
+		},
+	},
 	globalIgnores([
 		"node_modules",
 		"dist",

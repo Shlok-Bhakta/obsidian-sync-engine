@@ -1,18 +1,41 @@
-// shared protocol between client and server that is used to communicate over websockets
-import { opType, outboxData, wsPacket } from "./types";
+import { DocSyncPath, DocSyncResult, opType, outboxData, ServerChange, SyncMutation, wsPacket } from "./types";
+import { validatePacket } from "./validate";
 
-export const PROTOCOL_VERSION: number = 2;
+export const PROTOCOL_VERSION: number = 4;
 
-type UpdateWsPacket = Extract<wsPacket, { type: opType.Update }>;
+type EncodedMutation = Omit<SyncMutation, "data"> & {
+    data?: string;
+};
+
+type EncodedServerChange = Omit<ServerChange, "data" | "yjsState"> & {
+    data?: string;
+    yjsState?: string;
+};
+
 type EncodedOutboxRow = Omit<outboxData, "data"> & {
     id: number;
+    data?: string;
+};
+
+type EncodedDocSyncPath = {
+    path: string;
+    stateVector: string;
+    content?: string;
+};
+
+type EncodedDocSyncResult = {
+    path: string;
     data: string;
+    stateVector: string;
+    yjsState: string;
 };
 
 export function bytesToBase64(bytes: Uint8Array): string {
     let binary = "";
-    for (const byte of bytes) {
-        binary += String.fromCharCode(byte);
+    const chunkSize = 0x8000;
+    for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+        const chunk = bytes.subarray(offset, offset + chunkSize);
+        binary += String.fromCharCode(...chunk);
     }
     return btoa(binary);
 }
@@ -28,6 +51,70 @@ export function base64ToBytes(base64: string): Uint8Array {
     return bytes;
 }
 
+function encodeMutation(mutation: SyncMutation): EncodedMutation {
+    return {
+        ...mutation,
+        data: mutation.data ? bytesToBase64(mutation.data) : undefined,
+    };
+}
+
+function decodeMutation(mutation: EncodedMutation): SyncMutation {
+    return {
+        ...mutation,
+        data: mutation.data ? base64ToBytes(mutation.data) : undefined,
+    };
+}
+
+function encodeServerChange(change: ServerChange): EncodedServerChange {
+    return {
+        ...change,
+        data: change.data ? bytesToBase64(change.data) : undefined,
+        yjsState: change.yjsState ? bytesToBase64(change.yjsState) : undefined,
+    };
+}
+
+function decodeServerChange(change: EncodedServerChange): ServerChange {
+    return {
+        ...change,
+        data: change.data ? base64ToBytes(change.data) : undefined,
+        yjsState: change.yjsState ? base64ToBytes(change.yjsState) : undefined,
+    };
+}
+
+function encodeDocSyncPath(entry: DocSyncPath): EncodedDocSyncPath {
+    return {
+        path: entry.path,
+        stateVector: bytesToBase64(entry.stateVector),
+        content: entry.content,
+    };
+}
+
+function decodeDocSyncPath(entry: EncodedDocSyncPath): DocSyncPath {
+    return {
+        path: entry.path,
+        stateVector: base64ToBytes(entry.stateVector),
+        content: entry.content,
+    };
+}
+
+function encodeDocSyncResult(entry: DocSyncResult): EncodedDocSyncResult {
+    return {
+        path: entry.path,
+        data: bytesToBase64(entry.data),
+        stateVector: bytesToBase64(entry.stateVector),
+        yjsState: bytesToBase64(entry.yjsState),
+    };
+}
+
+function decodeDocSyncResult(entry: EncodedDocSyncResult): DocSyncResult {
+    return {
+        path: entry.path,
+        data: base64ToBytes(entry.data),
+        stateVector: base64ToBytes(entry.stateVector),
+        yjsState: base64ToBytes(entry.yjsState),
+    };
+}
+
 export function encodePacket(packet: wsPacket): string {
     if (packet.type === opType.Update) {
         return JSON.stringify({
@@ -38,25 +125,102 @@ export function encodePacket(packet: wsPacket): string {
             updateTime: packet.updateTime,
         });
     }
+    if (packet.type === opType.InitUploadBatch) {
+        return JSON.stringify({
+            ...packet,
+            changes: packet.changes.map(encodeMutation),
+        });
+    }
+    if (packet.type === opType.ChangeBatch) {
+        return JSON.stringify({
+            ...packet,
+            changes: packet.changes.map(encodeServerChange),
+        });
+    }
+    if (packet.type === opType.SnapshotReset) {
+        return JSON.stringify({
+            ...packet,
+            files: packet.files.map(encodeServerChange),
+        });
+    }
+    if (packet.type === opType.DocSync) {
+        return JSON.stringify({
+            type: packet.type,
+            paths: packet.paths.map(encodeDocSyncPath),
+        });
+    }
+    if (packet.type === opType.DocSyncAck) {
+        return JSON.stringify({
+            type: packet.type,
+            paths: packet.paths.map(encodeDocSyncResult),
+        });
+    }
     return JSON.stringify(packet);
 }
 
 export function decodePacket(packet: string): wsPacket {
-    const data = JSON.parse(packet);
-    if (data.type === opType.Update) {
+    let data: unknown;
+    try {
+        data = JSON.parse(packet);
+    } catch {
+        throw new Error("Packet is not valid JSON");
+    }
+
+    if (!data || typeof data !== "object" || !("type" in data)) {
+        throw new Error("Packet is missing type");
+    }
+
+    const typed = data as { type: opType };
+    if (typed.type === opType.Update) {
+        const update = data as Extract<wsPacket, { type: opType.Update }>;
         return {
-            type: data.type,
-            id: data.id,
-            fileId: data.fileId,
-            data: base64ToBytes(data.data),
-            updateTime: data.updateTime,
+            type: update.type,
+            id: update.id,
+            fileId: update.fileId,
+            data: base64ToBytes(update.data as unknown as string),
+            updateTime: update.updateTime,
         };
     }
-    return data;
+    if (typed.type === opType.InitUploadBatch) {
+        const batch = data as { type: opType.InitUploadBatch; segmentId: string; changes: EncodedMutation[] };
+        return validatePacket({
+            ...batch,
+            changes: batch.changes.map(decodeMutation),
+        });
+    }
+    if (typed.type === opType.ChangeBatch) {
+        const batch = data as { type: opType.ChangeBatch; fromRevision: string; serverRevision: string; changes: EncodedServerChange[] };
+        return validatePacket({
+            ...batch,
+            changes: batch.changes.map(decodeServerChange),
+        });
+    }
+    if (typed.type === opType.SnapshotReset) {
+        const reset = data as { type: opType.SnapshotReset; targetRevision: string; files: EncodedServerChange[] };
+        return validatePacket({
+            ...reset,
+            files: reset.files.map(decodeServerChange),
+        });
+    }
+    if (typed.type === opType.DocSync) {
+        const docSync = data as { type: opType.DocSync; paths: EncodedDocSyncPath[] };
+        return validatePacket({
+            type: docSync.type,
+            paths: docSync.paths.map(decodeDocSyncPath),
+        });
+    }
+    if (typed.type === opType.DocSyncAck) {
+        const docSyncAck = data as { type: opType.DocSyncAck; paths: EncodedDocSyncResult[] };
+        return validatePacket({
+            type: docSyncAck.type,
+            paths: docSyncAck.paths.map(decodeDocSyncResult),
+        });
+    }
+    return validatePacket(data);
 }
 
-export function decodeUpdateBatchJsonl(jsonl: string): UpdateWsPacket[] {
-    const updates: UpdateWsPacket[] = [];
+export function decodeUpdateBatchJsonl(jsonl: string): SyncMutation[] {
+    const updates: SyncMutation[] = [];
 
     for (const line of jsonl.split("\n")) {
         if (!line.trim()) {
@@ -64,12 +228,19 @@ export function decodeUpdateBatchJsonl(jsonl: string): UpdateWsPacket[] {
         }
 
         const row = JSON.parse(line) as EncodedOutboxRow;
+        const path = row.path ?? row.fileId;
+        if (!path) {
+            throw new Error("Outbox row is missing path");
+        }
         updates.push({
-            type: opType.Update,
-            id: row.id,
-            fileId: row.fileId,
-            data: base64ToBytes(row.data),
-            updateTime: row.created,
+            mutationId: row.mutationId ?? String(row.id),
+            operation: row.operation ?? "YjsUpdate",
+            path,
+            toPath: row.toPath,
+            data: row.data ? base64ToBytes(row.data) : undefined,
+            isFolder: row.isFolder,
+            isYjs: row.isYjs,
+            created: row.created,
         });
     }
 

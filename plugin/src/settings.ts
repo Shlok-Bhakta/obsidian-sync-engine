@@ -3,14 +3,18 @@ import SyncEngine from "./main";
 
 export interface SyncEngineSettings {
 	backendUrl: string;
+	clientId: string;
 	clientKey: string;
 	clientName: string;
+	lastPulledRevision: string;
 }
 
 export const DEFAULT_SETTINGS: SyncEngineSettings = {
 	backendUrl: 'http://localhost:3000',
+	clientId: '',
 	clientKey: 'To Be Generated',
-	clientName: 'Obsidian'
+	clientName: 'Obsidian',
+	lastPulledRevision: '0',
 }
 
 export class SyncEngineSettingTab extends PluginSettingTab {
@@ -43,6 +47,8 @@ export class SyncEngineSettingTab extends PluginSettingTab {
 		let backendUrlWarningEl: HTMLElement | null = null;
 
 		const refresh = () => {
+			// clientId and lastPulledRevision are server/sync-managed; exclude from dirty check
+			// so background sync cannot make the tab look dirty or roll back on save.
 			this.hasUnsavedChanges =
 				this.pendingSettings.backendUrl !== this.plugin.settings.backendUrl ||
 				this.pendingSettings.clientKey !== this.plugin.settings.clientKey ||
@@ -90,6 +96,20 @@ export class SyncEngineSettingTab extends PluginSettingTab {
 				}));
 
 		new Setting(containerEl)
+			.setName("Client ID")
+			.setDesc("Stable identity for this vault on the sync server.")
+			.addText(text => text
+				.setValue(this.plugin.settings.clientId)
+				.setDisabled(true));
+
+		new Setting(containerEl)
+			.setName("Last pulled revision")
+			.setDesc("Last server revision applied locally.")
+			.addText(text => text
+				.setValue(this.plugin.settings.lastPulledRevision)
+				.setDisabled(true));
+
+		new Setting(containerEl)
 			.setName("Client key")
 			.setDesc("This is the key used to secure the connection.")
 			.addText(text => text
@@ -111,10 +131,15 @@ export class SyncEngineSettingTab extends PluginSettingTab {
 							return;
 						}
 
-						this.plugin.settings = {...this.pendingSettings};
+						this.plugin.settings = {
+							...this.pendingSettings,
+							clientId: this.plugin.settings.clientId,
+							lastPulledRevision: this.plugin.settings.lastPulledRevision,
+						};
 						await this.plugin.saveSettings();
 						this.plugin.updateSyncSettings();
 
+						this.pendingSettings = {...this.plugin.settings};
 						this.hasUnsavedChanges = false;
 						refresh();
 					});

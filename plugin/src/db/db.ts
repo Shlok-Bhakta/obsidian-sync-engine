@@ -1,4 +1,5 @@
 import { App, normalizePath, PluginManifest } from "obsidian";
+import { base64ToBytes, bytesToBase64 } from "../../../shared/protocol";
 import { outboxData } from "../../../shared/types";
 
 type OutboxMeta = {
@@ -8,7 +9,7 @@ type OutboxMeta = {
 
 type EncodedOutboxRow = Omit<outboxData, "data"> & {
     id: number;
-    data: string;
+    data?: string;
 };
 
 export type OutboxSegment = {
@@ -20,6 +21,7 @@ export interface OutboxStore {
     open(): Promise<void>;
     close(): Promise<void>;
     putInOutbox(row: outboxData): Promise<number>;
+    hasPendingChanges(): Promise<boolean>;
     claimNextSegment(sealActive: boolean): Promise<OutboxSegment | null>;
     readSegmentJsonl(segment: OutboxSegment): Promise<string>;
     readSegment(segment: OutboxSegment): Promise<outboxData[]>;
@@ -33,25 +35,6 @@ const DEFAULT_META: OutboxMeta = {
     nextRowId: 1,
     nextSegmentId: 1,
 };
-
-function bytesToBase64(bytes: Uint8Array): string {
-    let binary = "";
-    const chunkSize = 0x8000;
-    for (let offset = 0; offset < bytes.length; offset += chunkSize) {
-        const chunk = bytes.subarray(offset, offset + chunkSize);
-        binary += String.fromCharCode(...chunk);
-    }
-    return btoa(binary);
-}
-
-function base64ToBytes(base64: string): Uint8Array {
-    const binary = atob(base64);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) {
-        bytes[i] = binary.charCodeAt(i);
-    }
-    return bytes;
-}
 
 function pendingSegmentName(segmentId: number): string {
     return `${segmentId.toString().padStart(12, "0")}.pending.jsonl`;
@@ -106,7 +89,7 @@ export class JsonlOutboxStore implements OutboxStore {
             const storedRow: EncodedOutboxRow = {
                 ...row,
                 id,
-                data: bytesToBase64(row.data),
+                data: row.data ? bytesToBase64(row.data) : undefined,
             };
             const line = `${JSON.stringify(storedRow)}\n`;
             await this.app.vault.adapter.append(this.activePath, line);
@@ -119,6 +102,17 @@ export class JsonlOutboxStore implements OutboxStore {
             }
 
             return id;
+        });
+    }
+
+    async hasPendingChanges(): Promise<boolean> {
+        return this.runExclusive(async () => {
+            this.assertOpen();
+            if (this.activeRecords > 0) {
+                return true;
+            }
+            return (await this.listSegmentFiles())
+                .some(name => name.endsWith(".pending.jsonl") || name.endsWith(".sending.jsonl"));
         });
     }
 
@@ -147,16 +141,20 @@ export class JsonlOutboxStore implements OutboxStore {
         const raw = await this.readSegmentJsonl(segment);
         const rows: outboxData[] = [];
 
-        for (const line of raw.split("\n")) {
+        for (const [index, line] of raw.split("\n").entries()) {
             if (!line.trim()) {
                 continue;
             }
 
-            const encoded = JSON.parse(line) as EncodedOutboxRow;
-            rows.push({
-                ...encoded,
-                data: base64ToBytes(encoded.data),
-            });
+            try {
+                const encoded = JSON.parse(line) as EncodedOutboxRow;
+                rows.push({
+                    ...encoded,
+                    data: encoded.data ? base64ToBytes(encoded.data) : undefined,
+                });
+            } catch (error) {
+                console.error(`skipping corrupt outbox line ${index + 1} in ${segment.path}`, error);
+            }
         }
 
         return rows;
@@ -276,12 +274,16 @@ export class JsonlOutboxStore implements OutboxStore {
 
         const raw = await this.app.vault.adapter.read(path);
         let maxId = 0;
-        for (const line of raw.split("\n")) {
+        for (const [index, line] of raw.split("\n").entries()) {
             if (!line.trim()) {
                 continue;
             }
-            const row = JSON.parse(line) as Partial<EncodedOutboxRow>;
-            maxId = Math.max(maxId, row.id ?? 0);
+            try {
+                const row = JSON.parse(line) as Partial<EncodedOutboxRow>;
+                maxId = Math.max(maxId, row.id ?? 0);
+            } catch (error) {
+                console.error(`skipping corrupt outbox line ${index + 1} in ${path}`, error);
+            }
         }
         return maxId;
     }
