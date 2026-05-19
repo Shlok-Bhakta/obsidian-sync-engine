@@ -1,6 +1,8 @@
 import { App, normalizePath, PluginManifest } from "obsidian";
 import { base64ToBytes, bytesToBase64 } from "../../../shared/protocol";
 import { outboxData } from "../../../shared/types";
+import { errorContext } from "../../../shared/logger";
+import { log } from "../logger";
 
 type OutboxMeta = {
     nextRowId: number;
@@ -74,6 +76,13 @@ export class JsonlOutboxStore implements OutboxStore {
             await this.repairMetaFromDisk();
             await this.refreshActiveStats();
             this.isOpen = true;
+            log.info("outbox opened", {
+                dir: this.dir,
+                activeRecords: this.activeRecords,
+                activeBytes: this.activeBytes,
+                nextRowId: this.meta.nextRowId,
+                nextSegmentId: this.meta.nextSegmentId,
+            });
         });
     }
 
@@ -98,6 +107,13 @@ export class JsonlOutboxStore implements OutboxStore {
             this.activeRecords++;
             this.activeBytes += line.length;
             await this.writeMeta();
+            log.debug("outbox row appended", {
+                rowId: id,
+                operation: row.operation,
+                path: row.path,
+                activeRecords: this.activeRecords,
+                activeBytes: this.activeBytes,
+            });
 
             if (this.activeRecords >= MAX_ACTIVE_RECORDS || this.activeBytes >= MAX_ACTIVE_BYTES) {
                 await this.sealActiveSegment();
@@ -156,7 +172,7 @@ export class JsonlOutboxStore implements OutboxStore {
                     contentBytes: encoded.contentBytes ? base64ToBytes(encoded.contentBytes) : undefined,
                 });
             } catch (error) {
-                console.error(`skipping corrupt outbox line ${index + 1} in ${segment.path}`, error);
+                log.error("skipping corrupt outbox line", { line: index + 1, path: segment.path, ...errorContext(error) });
             }
         }
 
@@ -285,7 +301,7 @@ export class JsonlOutboxStore implements OutboxStore {
                 const row = JSON.parse(line) as Partial<EncodedOutboxRow>;
                 maxId = Math.max(maxId, row.id ?? 0);
             } catch (error) {
-                console.error(`skipping corrupt outbox line ${index + 1} in ${path}`, error);
+                log.error("skipping corrupt outbox line", { line: index + 1, path, ...errorContext(error) });
             }
         }
         return maxId;
@@ -316,6 +332,7 @@ export class JsonlOutboxStore implements OutboxStore {
         this.activeRecords = 0;
         this.activeBytes = 0;
         await this.writeMeta();
+        log.debug("outbox active segment sealed", { segmentId: String(segmentId), pendingPath });
     }
 
     private assertOpen(): void {

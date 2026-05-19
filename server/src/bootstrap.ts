@@ -5,6 +5,7 @@ import { sql } from "bun";
 import { ServerFileRow, compactMaterializedSyncEvents, getServerRevision } from "./sync/engine";
 import { readLargeObject } from "./db/largeObject";
 import { mintNewClientKey } from "./security";
+import { shouldSyncPath } from "../../shared/pathPolicy";
 
 const adjectives = [
   "brisk",
@@ -247,7 +248,7 @@ export async function buildBootstrapZip(request: BootstrapBuildRequest): Promise
   await mkdir(vaultRoot, { recursive: true });
 
   try {
-    const rows = await readBootstrapRows();
+    const rows = (await readBootstrapRows()).filter(row => shouldSyncPath(row.path, request.configDir, request.pluginId));
     for (const row of rows) {
       if (isVaultRootPath(row.path)) {
         continue;

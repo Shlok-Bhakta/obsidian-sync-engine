@@ -10,6 +10,8 @@ import { SyncEngineSettings } from "../settings";
 import { DocSync } from "../yjs/DocSync";
 import { YjsStateStore } from "../yjs/YjsStateStore";
 import { BlobClient } from "./BlobClient";
+import { errorContext, Logger } from "../../../shared/logger";
+import { log as rootLog } from "../logger";
 
 const EMPTY_BACKOFF_MS = 1000;
 const ERROR_BACKOFF_MS = 2000;
@@ -43,6 +45,20 @@ function asError(error: unknown): Error {
     return error instanceof Error ? error : new Error(String(error));
 }
 
+function summarizeMutations(mutations: SyncMutation[]): Record<string, number> {
+    return mutations.reduce<Record<string, number>>((summary, mutation) => {
+        summary[mutation.operation] = (summary[mutation.operation] ?? 0) + 1;
+        return summary;
+    }, {});
+}
+
+function summarizeServerChanges(changes: ServerChange[]): Record<string, number> {
+    return changes.reduce<Record<string, number>>((summary, change) => {
+        summary[change.operation] = (summary[change.operation] ?? 0) + 1;
+        return summary;
+    }, {});
+}
+
 function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
     return new Promise((resolve, reject) => {
         const timer = window.setTimeout(() => reject(new Error(message)), ms);
@@ -70,7 +86,7 @@ type SnapshotPath = {
 };
 
 function exactArrayBuffer(bytes: Uint8Array): ArrayBuffer {
-    return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+    return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
 }
 
 async function sha256Hex(bytes: Uint8Array): Promise<string> {
@@ -97,6 +113,8 @@ export class SyncClient {
     private failedConnectAttempts = 0;
     private nextConnectAt = 0;
     private blobClient: BlobClient;
+    private readonly log: Logger;
+    private livePushPromise: Promise<void> = Promise.resolve();
 
     constructor(
         private readonly app: App,
@@ -113,7 +131,11 @@ export class SyncClient {
         this.clientKey = settings.clientKey;
         this.clientName = settings.clientName;
         this.lastPulledRevision = settings.lastPulledRevision;
-        this.blobClient = new BlobClient(settings.backendUrl, settings.clientKey);
+        this.blobClient = new BlobClient(settings.backendUrl, settings.clientKey, () => this.refreshBlobAuth());
+        this.log = rootLog.child({
+            clientId: this.clientId.slice(0, 18),
+            clientName: this.clientName,
+        });
     }
 
     isApplyingRemoteChanges(): boolean {
@@ -123,6 +145,10 @@ export class SyncClient {
     start(): void {
         this.stopped = false;
         this.recordConnectionSuccess();
+        this.log.info("sync client starting", {
+            serverUrl: this.serverUrl,
+            lastPulledRevision: this.lastPulledRevision,
+        });
         this.connectSoon();
         this.pollInterval = window.setInterval(() => {
             this.connectSoon();
@@ -131,6 +157,7 @@ export class SyncClient {
 
     stop(): void {
         this.stopped = true;
+        this.log.info("sync client stopping");
         if (this.flushTimer !== null) {
             window.clearTimeout(this.flushTimer);
             this.flushTimer = null;
@@ -154,6 +181,11 @@ export class SyncClient {
         this.lastPulledRevision = settings.lastPulledRevision;
         this.blobClient.update(settings.backendUrl, settings.clientKey);
         if (nextUrl !== this.serverUrl || authChanged) {
+            this.log.info("sync settings changed; reconnecting", {
+                backendChanged: nextUrl !== this.serverUrl,
+                authChanged,
+                nextUrl,
+            });
             this.serverUrl = nextUrl;
             this.startupSyncPromise = null;
             this.startupSynced = false;
@@ -164,7 +196,9 @@ export class SyncClient {
     }
 
     async uploadBlob(path: string, bytes: Uint8Array): Promise<{ byteSize: number; contentSha256: string }> {
+        await this.ensureAuthenticatedSocket();
         const contentSha256 = await sha256Hex(bytes);
+        this.log.debug("uploading blob", { path, byteSize: bytes.byteLength, contentSha256 });
         await this.blobClient.upload(path, bytes, contentSha256);
         return { byteSize: bytes.byteLength, contentSha256 };
     }
@@ -173,6 +207,7 @@ export class SyncClient {
         await this.ensureStartupSynced();
         const openWs = await this.ensureAuthenticatedSocket();
         const backendUrl = this.httpBackendUrl();
+        this.log.info("creating bootstrap link", { vaultName, configDir, pluginId, backendUrl });
         openWs.send(encodePacket({
             type: opType.BootstrapCreate,
             vaultName,
@@ -220,6 +255,7 @@ export class SyncClient {
         }
 
         this.draining = true;
+        this.log.debug("outbox drain starting");
         try {
             let emptyCount = 0;
             while (!this.stopped) {
@@ -236,13 +272,19 @@ export class SyncClient {
                     }
 
                     emptyCount = 0;
+                    this.log.debug("claimed outbox segment", { segmentId: segment.id, segmentPath: segment.path });
                     await this.sendSegment(segment);
                     await this.outbox.completeSegment(segment);
+                    this.log.debug("completed outbox segment", { segmentId: segment.id });
                     await sleep(0);
                 } catch (error) {
-                    console.error("failed to drain outbox", error);
+                    this.log.error("failed to drain outbox", {
+                        segmentId: segment?.id,
+                        ...errorContext(error),
+                    });
                     if (segment) {
                         await this.outbox.releaseSegment(segment);
+                        this.log.warn("released outbox segment after failure", { segmentId: segment.id });
                     }
                     this.closeSocket();
                     await sleep(ERROR_BACKOFF_MS);
@@ -250,6 +292,7 @@ export class SyncClient {
             }
         } finally {
             this.draining = false;
+            this.log.debug("outbox drain stopped");
         }
     }
 
@@ -267,20 +310,33 @@ export class SyncClient {
     }
 
     private async runStartupSync(): Promise<void> {
+        this.log.info("startup sync beginning", { lastPulledRevision: this.lastPulledRevision });
         const openWs = await this.ensureAuthenticatedSocket();
         const pullResponse = await this.pullSince(openWs, this.lastPulledRevision);
 
         if (pullResponse.type === opType.InitRequired) {
+            this.log.info("server requires initial vault upload", { serverRevision: pullResponse.serverRevision });
             await this.uploadInitialSnapshot(openWs);
         } else if (pullResponse.type === opType.ChangeBatch) {
+            this.log.info("startup pull returned change batch", {
+                fromRevision: pullResponse.fromRevision,
+                serverRevision: pullResponse.serverRevision,
+                changes: pullResponse.changes.length,
+                operations: summarizeServerChanges(pullResponse.changes),
+            });
             await this.applyChangeBatch(pullResponse);
         } else if (pullResponse.type === opType.SnapshotReset) {
+            this.log.warn("startup pull returned snapshot reset", {
+                targetRevision: pullResponse.targetRevision,
+                files: pullResponse.files.length,
+            });
             await this.applySnapshotReset(pullResponse);
         } else {
             throw new Error(`Unexpected pull response: ${pullResponse.type}`);
         }
         this.startupSynced = true;
         this.recordConnectionSuccess();
+        this.log.info("startup sync complete", { lastPulledRevision: this.lastPulledRevision });
     }
 
     private recordConnectionFailure(error: unknown): void {
@@ -288,7 +344,11 @@ export class SyncClient {
         const exponent = Math.min(this.failedConnectAttempts - 1, 6);
         const delay = Math.min(CONNECT_BACKOFF_INITIAL_MS * (2 ** exponent), CONNECT_BACKOFF_MAX_MS);
         this.nextConnectAt = Date.now() + delay;
-        console.warn(`sync client connection failed; retrying in ${Math.round(delay / 1000)}s`, error);
+        this.log.warn("sync client connection failed; retrying", {
+            retryInMs: delay,
+            failedConnectAttempts: this.failedConnectAttempts,
+            ...errorContext(error),
+        });
     }
 
     private recordConnectionSuccess(): void {
@@ -297,8 +357,9 @@ export class SyncClient {
     }
 
     private async sendSegment(segment: OutboxSegment): Promise<void> {
-        const openWs = await this.ensureAuthenticatedSocket();
+        let openWs = await this.ensureAuthenticatedSocket();
         const jsonl = await this.prepareSegmentJsonl(openWs, segment);
+        openWs = await this.ensureAuthenticatedSocket();
         const packet: wsPacket = {
             type: opType.UpdateBatch,
             segmentId: segment.id,
@@ -309,9 +370,14 @@ export class SyncClient {
             WS_WAIT_TIMEOUT_MS,
             `Timed out waiting for batch ack (${segment.id})`,
         );
+        this.log.debug("sending outbox segment", {
+            segmentId: segment.id,
+            bytes: jsonl.length,
+        });
         openWs.send(encodePacket(packet));
         const revision = await ack;
         await this.persistLastPulledRevision(revision);
+        this.log.info("outbox segment acknowledged", { segmentId: segment.id, revision });
     }
 
     private async uploadInitialSnapshot(ws: WebSocket): Promise<void> {
@@ -320,6 +386,12 @@ export class SyncClient {
             segmentId: `init-${Date.now()}`,
             changes: await this.readVaultSnapshot(),
         };
+        this.log.info("uploading initial snapshot", {
+            segmentId: packet.segmentId,
+            changes: packet.changes.length,
+            operations: summarizeMutations(packet.changes),
+        });
+        ws = await this.ensureAuthenticatedSocket();
         const ack = withTimeout(
             this.waitForBatchAck(ws, packet.segmentId),
             WS_WAIT_TIMEOUT_MS,
@@ -328,12 +400,14 @@ export class SyncClient {
         ws.send(encodePacket(packet));
         const revision = await ack;
         await this.persistLastPulledRevision(revision);
+        this.log.info("initial snapshot acknowledged", { segmentId: packet.segmentId, revision });
     }
 
     private async readVaultSnapshot(): Promise<SyncMutation[]> {
         const created = Date.now();
         const changes: SyncMutation[] = [];
         const paths = await this.listSnapshotPaths();
+        this.log.debug("reading vault snapshot", { paths: paths.length });
 
         for (const entry of paths) {
             if (entry.isFolder) {
@@ -415,6 +489,7 @@ export class SyncClient {
                 isFolder: file instanceof TFolder,
             });
         }
+        await this.addAdapterPaths("", byPath);
         await this.addAdapterPaths(this.app.vault.configDir, byPath);
         return [...byPath.values()].sort((a, b) => {
             if (a.isFolder !== b.isFolder) {
@@ -425,7 +500,7 @@ export class SyncClient {
     }
 
     private async addAdapterPaths(dir: string, byPath: Map<string, SnapshotPath>): Promise<void> {
-        if (!(await this.app.vault.adapter.exists(dir))) {
+        if (dir && !(await this.app.vault.adapter.exists(dir))) {
             return;
         }
         const listed = await this.app.vault.adapter.list(dir);
@@ -443,6 +518,12 @@ export class SyncClient {
     }
 
     private async applyChangeBatch(packet: Extract<wsPacket, { type: opType.ChangeBatch }>): Promise<void> {
+        this.log.info("applying change batch", {
+            fromRevision: packet.fromRevision,
+            serverRevision: packet.serverRevision,
+            changes: packet.changes.length,
+            operations: summarizeServerChanges(packet.changes),
+        });
         await this.applyServerChanges(packet.changes);
         await this.persistLastPulledRevision(packet.serverRevision);
     }
@@ -452,6 +533,12 @@ export class SyncClient {
         const toDelete = [...this.app.vault.getFiles()]
             .filter(file => shouldSyncPath(file.path, this.app.vault.configDir) && !snapshotPaths.has(normalizePath(file.path)));
         const hasPendingChanges = await this.outbox.hasPendingChanges();
+        this.log.warn("applying snapshot reset", {
+            targetRevision: packet.targetRevision,
+            files: packet.files.length,
+            localFilesMissingFromSnapshot: toDelete.length,
+            hasPendingChanges,
+        });
         if (toDelete.length > 0 && hasPendingChanges) {
             new Notice(`Sync snapshot reset: preserving ${toDelete.length} local file(s) while pending changes upload`);
         } else if (toDelete.length > 0) {
@@ -466,6 +553,27 @@ export class SyncClient {
         this.applyingRemote = true;
         try {
             for (const change of changes) {
+                if (
+                    !shouldSyncPath(change.path, this.app.vault.configDir) ||
+                    (change.toPath && !shouldSyncPath(change.toPath, this.app.vault.configDir))
+                ) {
+                    this.log.warn("skipping ignored remote change", {
+                        revision: change.revision,
+                        operation: change.operation,
+                        path: change.path,
+                        toPath: change.toPath,
+                    });
+                    continue;
+                }
+                this.log.debug("applying remote change", {
+                    revision: change.revision,
+                    operation: change.operation,
+                    path: change.path,
+                    toPath: change.toPath,
+                    clientId: change.clientId,
+                    storageKind: change.storageKind,
+                    byteSize: change.byteSize,
+                });
                 if (change.operation === "CreateFolder") {
                     await this.ensureFolder(change.path);
                 } else if (change.operation === "UpsertFile") {
@@ -653,7 +761,26 @@ export class SyncClient {
     }
 
     private async prepareSegmentJsonl(ws: WebSocket, segment: OutboxSegment): Promise<string> {
-        const rows = await this.outbox.readSegment(segment);
+        const inputRows = await this.outbox.readSegment(segment);
+        const rows = inputRows.filter(row => {
+            const shouldKeep = shouldSyncPath(row.path, this.app.vault.configDir) &&
+                (!row.toPath || shouldSyncPath(row.toPath, this.app.vault.configDir));
+            if (!shouldKeep) {
+                this.log.warn("dropping ignored outbox row", {
+                    segmentId: segment.id,
+                    operation: row.operation,
+                    path: row.path,
+                    toPath: row.toPath,
+                });
+            }
+            return shouldKeep;
+        });
+        this.log.debug("preparing outbox segment", {
+            segmentId: segment.id,
+            rows: inputRows.length,
+            filteredRows: rows.length,
+            operations: summarizeMutations(rows),
+        });
         const yjsPaths = [...new Set(
             rows
                 .filter(row => row.operation === "YjsUpdate")
@@ -662,6 +789,10 @@ export class SyncClient {
 
         const coalesced = new Map<string, SyncMutation>();
         if (yjsPaths.length > 0) {
+            this.log.debug("coalescing Yjs updates before upload", {
+                segmentId: segment.id,
+                paths: yjsPaths,
+            });
             const resolved: {
                 path: string;
                 doc: Y.Doc;
@@ -691,6 +822,10 @@ export class SyncClient {
                         content: entry.doc.getText(MARKDOWN_FIELD).toJSON(),
                     })),
                 );
+                this.log.debug("received DocSync ack", {
+                    segmentId: segment.id,
+                    paths: ack.paths.map(path => path.path),
+                });
                 for (const entry of resolved) {
                     const syncResult = ack.paths.find(result => result.path === entry.path);
                     if (!syncResult) {
@@ -769,6 +904,12 @@ export class SyncClient {
             }
         }
 
+        this.log.debug("prepared outbox segment payload", {
+            segmentId: segment.id,
+            inputRows: rows.length,
+            outputRows: output.length,
+            operations: summarizeMutations(output),
+        });
         return this.encodeMutationsJsonl(output);
     }
 
@@ -819,11 +960,19 @@ export class SyncClient {
             WS_WAIT_TIMEOUT_MS,
             "Timed out waiting for DocSync ack",
         );
+        this.log.debug("requesting DocSync", { paths: paths.map(path => path.path) });
         ws.send(encodePacket({ type: opType.DocSync, paths }));
         return response;
     }
 
     private async persistLastPulledRevision(revision: string): Promise<void> {
+        if (BigInt(revision) <= BigInt(this.lastPulledRevision)) {
+            this.log.debug("skipping stale revision persist", {
+                revision,
+                lastPulledRevision: this.lastPulledRevision,
+            });
+            return;
+        }
         this.lastPulledRevision = revision;
         await this.onLastPulledRevisionChanged(revision);
     }
@@ -847,6 +996,7 @@ export class SyncClient {
             return openWs;
         }
 
+        this.log.debug("authenticating websocket", { lastPulledRevision: this.lastPulledRevision });
         const authPacket: wsPacket = {
             type: opType.Auth,
             clientId: this.clientId,
@@ -873,10 +1023,21 @@ export class SyncClient {
             await this.onClientKeyRotated(packet.newClientKey);
             this.clientKey = packet.newClientKey;
             this.blobClient.update(this.httpBackendUrl(), this.clientKey);
+            this.log.info("client key rotated");
         }
 
         this.authenticated = true;
+        this.log.info("websocket authenticated", { serverRevision: packet.serverRevision });
         return openWs;
+    }
+
+    private async refreshBlobAuth(): Promise<string> {
+        const wasStartupSynced = this.startupSynced;
+        this.log.warn("refreshing blob auth after unauthorized response");
+        this.closeSocket();
+        await this.ensureAuthenticatedSocket();
+        this.startupSynced = wasStartupSynced;
+        return this.clientKey;
     }
 
     private httpBackendUrl(): string {
@@ -909,6 +1070,7 @@ export class SyncClient {
         }
 
         this.closeSocket();
+        this.log.debug("opening websocket", { serverUrl: this.serverUrl });
         const nextWs = new WebSocket(this.serverUrl);
         this.ws = nextWs;
         nextWs.addEventListener("close", () => {
@@ -917,12 +1079,17 @@ export class SyncClient {
                 this.authenticated = false;
                 this.startupSynced = false;
             }
+            this.log.debug("websocket closed");
         });
         nextWs.addEventListener("message", event => {
             try {
                 const msg = decodePacket(readSocketMessage(event));
                 if (msg.type === opType.BootstrapStatus) {
                     this.onBootstrapStatus(msg);
+                    return;
+                }
+                if (msg.type === opType.ChangeBatch || msg.type === opType.SnapshotReset) {
+                    this.handleLivePush(msg);
                 }
             } catch {
                 // Request-specific listeners surface protocol errors.
@@ -930,7 +1097,48 @@ export class SyncClient {
         });
 
         await this.waitForOpen(nextWs);
+        this.log.debug("websocket opened");
         return nextWs;
+    }
+
+    private handleLivePush(packet: Extract<wsPacket, { type: opType.ChangeBatch | opType.SnapshotReset }>): void {
+        if (!this.startupSynced || this.stopped) {
+            return;
+        }
+
+        this.livePushPromise = this.livePushPromise
+            .catch(() => {})
+            .then(async () => {
+                if (!this.startupSynced || this.stopped) {
+                    return;
+                }
+                if (packet.type === opType.ChangeBatch) {
+                    if (BigInt(packet.serverRevision) <= BigInt(this.lastPulledRevision)) {
+                        return;
+                    }
+                    await this.applyChangeBatch(packet);
+                    this.log.info("applied live change batch", {
+                        fromRevision: packet.fromRevision,
+                        serverRevision: packet.serverRevision,
+                        changes: packet.changes.length,
+                    });
+                    return;
+                }
+
+                if (BigInt(packet.targetRevision) <= BigInt(this.lastPulledRevision)) {
+                    return;
+                }
+                await this.applySnapshotReset(packet);
+                this.log.info("applied live snapshot reset", {
+                    targetRevision: packet.targetRevision,
+                    files: packet.files.length,
+                });
+            })
+            .catch(error => {
+                this.log.error("failed to apply live server push", errorContext(error));
+                this.closeSocket();
+                this.connectSoon();
+            });
     }
 
     private waitForOpen(ws: WebSocket): Promise<void> {
@@ -1100,6 +1308,7 @@ export class SyncClient {
         this.authPromise = null;
         this.startupSynced = false;
         if (this.ws && this.ws.readyState !== WebSocket.CLOSED) {
+            this.log.debug("closing websocket", { readyState: this.ws.readyState });
             this.ws.close();
         }
         this.ws = null;

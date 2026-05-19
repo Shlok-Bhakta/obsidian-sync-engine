@@ -47,6 +47,9 @@ const context = await esbuild.context({
 	format: "cjs",
 	target: "es2018",
 	logLevel: "info",
+	define: {
+		__SYNC_LOG_LEVEL__: JSON.stringify(prod ? "warn" : "debug"),
+	},
 	sourcemap: prod ? false : "inline",
 	treeShaking: true,
 	outfile: "main.js",

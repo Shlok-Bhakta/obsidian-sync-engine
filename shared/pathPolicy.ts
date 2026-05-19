@@ -15,13 +15,11 @@ export function isPluginInternalPath(
     pluginId = DEFAULT_PLUGIN_ID,
 ): boolean {
     const prefix = pluginInternalPrefix(configDir, pluginId);
-    return (
-        path === `${prefix}/data.json` ||
-        path.startsWith(`${prefix}/outbox/`) ||
-        path === `${prefix}/outbox` ||
-        path.startsWith(`${prefix}/yjs-state/`) ||
-        path === `${prefix}/yjs-state`
-    );
+    return path === prefix || path.startsWith(`${prefix}/`);
+}
+
+export function isIgnoredVaultPath(path: string): boolean {
+    return path === ".trash" || path.startsWith(".trash/");
 }
 
 export function shouldSyncPath(
@@ -29,7 +27,7 @@ export function shouldSyncPath(
     configDir = DEFAULT_CONFIG_DIR,
     pluginId = DEFAULT_PLUGIN_ID,
 ): boolean {
-    return Boolean(path) && !isPluginInternalPath(path, configDir, pluginId);
+    return Boolean(path) && !isIgnoredVaultPath(path) && !isPluginInternalPath(path, configDir, pluginId);
 }
 
 export function shouldUseYjs(path: string, configDir = DEFAULT_CONFIG_DIR): boolean {

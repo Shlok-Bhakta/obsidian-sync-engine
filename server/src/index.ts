@@ -6,6 +6,8 @@ import { decodePacket, decodeUpdateBatchJsonl, encodePacket, PROTOCOL_VERSION } 
 import { buildBootstrapZip, BootstrapBuildResult } from "./bootstrap";
 import { bootstrapDB } from "./db/MigrationRunner";
 import { rotateClientKey, validateClientKey } from "./security";
+import { errorContext } from "../../shared/logger";
+import { log } from "./logger";
 import {
   acceptMutations,
   getBlobMetadata,
@@ -21,6 +23,16 @@ await bootstrapDB();
 
 const app = new Hono();
 app.use("/*", cors());
+app.use("/*", async (c, next) => {
+  const startedAt = Date.now();
+  await next();
+  log.info("http request", {
+    method: c.req.method,
+    path: new URL(c.req.url).pathname,
+    status: c.res.status,
+    durationMs: Date.now() - startedAt,
+  });
+});
 
 app.get("/", c => c.text("Hello Hono!"));
 app.get("/health", c => c.text("OK"));
@@ -60,9 +72,10 @@ function publishBootstrapStatus(status: Omit<BootstrapStatus, "type" | "remainin
     try {
       ws.send(encoded);
     } catch (error) {
-      console.error("failed to broadcast bootstrap status:", error);
+      log.error("failed to broadcast bootstrap status", errorContext(error));
     }
   }
+  log.info("bootstrap status published", latestBootstrapStatus);
 }
 
 function stopCountdown(): void {
@@ -98,7 +111,7 @@ async function expireBootstrapLink(token: string): Promise<void> {
   clearTimeout(link.timeout);
   stopCountdown();
   await link.cleanup().catch(error => {
-    console.error("failed to clean expired bootstrap zip:", error);
+    log.error("failed to clean expired bootstrap zip", errorContext(error));
   });
   publishBootstrapStatus({
     status: "expired",
@@ -236,6 +249,7 @@ async function requireBlobAuth(request: Request): Promise<Response | null> {
 app.put("/v1/blobs/:path", async c => {
   const denied = await requireBlobAuth(c.req.raw);
   if (denied) {
+    log.warn("blob upload denied", { status: denied.status });
     return denied;
   }
   const path = blobPath(c.req.param("path"));
@@ -244,6 +258,12 @@ app.put("/v1/blobs/:path", async c => {
     return c.text("Blob body is required", 400);
   }
   const metadata = await putBlobFile(path, body, c.req.header("X-Content-Sha256") ?? null);
+  log.info("blob uploaded", {
+    path,
+    byteSize: metadata.byteSize,
+    contentSha256: metadata.contentSha256,
+    revision: metadata.revision,
+  });
   return c.json({
     path: metadata.path,
     byteSize: metadata.byteSize,
@@ -255,12 +275,20 @@ app.put("/v1/blobs/:path", async c => {
 app.get("/v1/blobs/:path", async c => {
   const denied = await requireBlobAuth(c.req.raw);
   if (denied) {
+    log.warn("blob download denied", { status: denied.status });
     return denied;
   }
   const metadata = await getBlobMetadata(blobPath(c.req.param("path")));
   if (!metadata) {
+    log.warn("blob download missing", { path: blobPath(c.req.param("path")) });
     return c.text("Blob not found", 404);
   }
+  log.info("blob download streaming", {
+    path: metadata.path,
+    byteSize: metadata.byteSize,
+    contentSha256: metadata.contentSha256,
+    revision: metadata.revision,
+  });
   return new Response(streamBlobFile(metadata), {
     headers: {
       "Content-Type": "application/octet-stream",
@@ -303,9 +331,9 @@ app.get("/v1/bootstrap/:token", async c => {
     });
   } catch (error) {
     await link.cleanup().catch(cleanupError => {
-      console.error("failed to clean bootstrap zip after failed download:", cleanupError);
+      log.error("failed to clean bootstrap zip after failed download", errorContext(cleanupError));
     });
-    console.error("bootstrap download failed:", error);
+    log.error("bootstrap download failed", errorContext(error));
     return c.text("Bootstrap download failed", 500);
   }
 });
@@ -347,8 +375,54 @@ type Client = {
   isAuthenticated: boolean;
   clientId: string;
   clientName: string;
+  lastPulledRevision: string;
   socket: AuthenticatedSocket | null;
 };
+
+const authenticatedClients = new Set<Client>();
+
+function revisionFromServerPacket(packet: wsPacket): string | null {
+  if (packet.type === opType.ChangeBatch) {
+    return packet.serverRevision;
+  }
+  if (packet.type === opType.SnapshotReset) {
+    return packet.targetRevision;
+  }
+  return null;
+}
+
+async function pushChangesToOtherClients(sender: Client, revision: string): Promise<void> {
+  const pushes: Promise<void>[] = [];
+  for (const target of authenticatedClients) {
+    if (target === sender || !target.socket || !target.isAuthenticated) {
+      continue;
+    }
+    pushes.push((async () => {
+      try {
+        const fromRevision = target.lastPulledRevision;
+        const packet = await handlePull({ type: opType.PullSince, revision: fromRevision });
+        target.socket!.send(encodePacket(packet));
+        target.lastPulledRevision = revisionFromServerPacket(packet) ?? revision;
+        log.info("pushed changes to websocket client", {
+          senderClientId: sender.clientId,
+          targetClientId: target.clientId,
+          targetClientName: target.clientName,
+          fromRevision,
+          acceptedRevision: revision,
+          packetType: packet.type,
+        });
+      } catch (error) {
+        log.error("failed to push changes to websocket client", {
+          senderClientId: sender.clientId,
+          targetClientId: target.clientId,
+          targetClientName: target.clientName,
+          ...errorContext(error),
+        });
+      }
+    })());
+  }
+  await Promise.all(pushes);
+}
 
 app.get(
   "/worker",
@@ -357,6 +431,7 @@ app.get(
       isAuthenticated: false,
       clientId: "",
       clientName: "",
+      lastPulledRevision: "0",
       socket: null,
     };
     return {
@@ -371,9 +446,16 @@ app.get(
         }
 
         const data: wsPacket = decodePacket(raw);
+        log.debug("websocket packet received", {
+          type: data.type,
+          authenticated: client.isAuthenticated,
+          clientId: client.clientId,
+          clientName: client.clientName,
+        });
 
         if (!client.isAuthenticated) {
           if (data.type !== opType.Auth) {
+            log.warn("websocket rejected unauthenticated packet", { type: data.type });
             const deny: wsPacket = { type: opType.Deny, message: "Client is not authenticated" };
             ws.send(encodePacket(deny));
             ws.close(1008, "Authenticate first");
@@ -387,6 +469,10 @@ app.get(
               message: `Client is on a ${direction} protocol version than the server (update the ${target} or rollback)`,
             };
             ws.send(encodePacket(deny));
+            log.warn("websocket protocol mismatch", {
+              clientProtocolVersion: data.protocolVersion,
+              serverProtocolVersion: PROTOCOL_VERSION,
+            });
             return;
           }
 
@@ -394,6 +480,7 @@ app.get(
           if (!auth.authenticated || !auth.clientKey) {
             const deny: wsPacket = { type: opType.Deny, message: "Client key is invalid" };
             ws.send(encodePacket(deny));
+            log.warn("websocket auth denied", { clientId: data.clientId, clientName: data.clientName });
             return;
           }
 
@@ -407,8 +494,16 @@ app.get(
           client.isAuthenticated = true;
           client.clientId = data.clientId;
           client.clientName = data.clientName;
+          client.lastPulledRevision = data.lastPulledRevision;
           client.socket = ws;
+          authenticatedClients.add(client);
           authenticatedSockets.add(client.socket);
+          log.info("websocket authenticated", {
+            clientId: client.clientId,
+            clientName: client.clientName,
+            lastPulledRevision: data.lastPulledRevision,
+            rotatedKey: auth.clientKey !== data.clientKey,
+          });
 
           const ack: wsPacket = {
             type: opType.AuthAck,
@@ -426,6 +521,12 @@ app.get(
         }
 
         if (data.type === opType.BootstrapCreate) {
+          log.info("bootstrap create requested", {
+            clientId: client.clientId,
+            clientName: client.clientName,
+            vaultName: data.vaultName,
+            configDir: data.configDir,
+          });
           publishBootstrapStatus({
             status: "building",
             vaultName: data.vaultName,
@@ -443,7 +544,7 @@ app.get(
               await registerBootstrapLink(new Request(data.backendUrl), token, data.vaultName, build);
             } catch (error) {
               await build.cleanup().catch(cleanupError => {
-                console.error("failed to clean bootstrap zip after registration failure:", cleanupError);
+                log.error("failed to clean bootstrap zip after registration failure", errorContext(cleanupError));
               });
               throw error;
             }
@@ -459,26 +560,63 @@ app.get(
         }
 
         if (data.type === opType.PullSince) {
-          ws.send(encodePacket(await handlePull(data)));
+          log.info("pull requested", {
+            clientId: client.clientId,
+            clientName: client.clientName,
+            revision: data.revision,
+          });
+          const packet = await handlePull(data);
+          ws.send(encodePacket(packet));
+          client.lastPulledRevision = revisionFromServerPacket(packet) ?? client.lastPulledRevision;
           return;
         }
 
         if (data.type === opType.DocSync) {
+          log.debug("DocSync requested", {
+            clientId: client.clientId,
+            paths: data.paths.map(path => path.path),
+          });
           ws.send(encodePacket(await handleDocSync(data.paths)));
           return;
         }
 
         if (data.type === opType.UpdateBatch) {
+          log.info("update batch received", {
+            clientId: client.clientId,
+            clientName: client.clientName,
+            segmentId: data.segmentId,
+            bytes: data.jsonl.length,
+          });
           const revision = await acceptMutations(client.clientId, decodeUpdateBatchJsonl(data.jsonl));
           const ack: wsPacket = { type: opType.BatchAck, segmentId: data.segmentId, revision };
           ws.send(encodePacket(ack));
+          client.lastPulledRevision = revision;
+          log.info("update batch acknowledged", {
+            clientId: client.clientId,
+            segmentId: data.segmentId,
+            revision,
+          });
+          await pushChangesToOtherClients(client, revision);
           return;
         }
 
         if (data.type === opType.InitUploadBatch) {
+          log.info("initial upload batch received", {
+            clientId: client.clientId,
+            clientName: client.clientName,
+            segmentId: data.segmentId,
+            changes: data.changes.length,
+          });
           const revision = await acceptMutations(client.clientId, data.changes);
           const ack: wsPacket = { type: opType.BatchAck, segmentId: data.segmentId, revision };
           ws.send(encodePacket(ack));
+          client.lastPulledRevision = revision;
+          log.info("initial upload batch acknowledged", {
+            clientId: client.clientId,
+            segmentId: data.segmentId,
+            revision,
+          });
+          await pushChangesToOtherClients(client, revision);
           return;
         }
 
@@ -492,7 +630,11 @@ app.get(
         }
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
-          console.error("websocket handler error:", error);
+          log.error("websocket handler error", {
+            clientId: client.clientId,
+            clientName: client.clientName,
+            ...errorContext(error),
+          });
           const deny: wsPacket = { type: opType.Deny, message };
           ws.send(encodePacket(deny));
           if (!client.isAuthenticated) {
@@ -504,6 +646,12 @@ app.get(
         if (client.socket) {
           authenticatedSockets.delete(client.socket);
         }
+        authenticatedClients.delete(client);
+        log.info("websocket closed", {
+          clientId: client.clientId,
+          clientName: client.clientName,
+          authenticated: client.isAuthenticated,
+        });
       },
     };
   }),

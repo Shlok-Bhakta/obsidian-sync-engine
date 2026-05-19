@@ -11,9 +11,12 @@ import { YjsStateStore } from 'yjs/YjsStateStore';
 import { VaultYjsIndexer } from 'yjs/VaultYjsIndexer';
 import { docStateFromContent } from "../../shared/yjsSeed";
 import { isPluginInternalPath, shouldSyncPath, shouldUseYjs } from "../../shared/pathPolicy";
+import { errorContext } from "../../shared/logger";
+import { log } from "./logger";
 
 const INLINE_BYTES_LIMIT = 64 * 1024;
 const CONFIG_DIR_POLL_MS = 2000;
+type ConfigDirScanMode = "baseline" | "enqueue";
 
 function generateClientId(): string {
 	return "obs_client_" + crypto.randomUUID();
@@ -38,6 +41,13 @@ export default class SyncEngine extends Plugin {
 	private configDirStats: Map<Path, string> = new Map();
 	async onload() {
 		await this.loadSettings();
+		log.info("plugin loading", {
+			vaultName: this.app.vault.getName(),
+			configDir: this.app.vault.configDir,
+			clientId: this.settings.clientId.slice(0, 18),
+			clientName: this.settings.clientName,
+			lastPulledRevision: this.settings.lastPulledRevision,
+		});
 		this.db = new JsonlOutboxStore(this.app, this.manifest);
 		this.yjsStateStore = new YjsStateStore(this.app, this.manifest);
 		this.docs = new Map<Path, DocSync>();
@@ -78,8 +88,10 @@ export default class SyncEngine extends Plugin {
 			},
 		);
 		this.app.workspace.onLayoutReady(() => {
+			log.info("workspace ready; starting Yjs indexer");
 			this.yjsIndexer.start();
 			void this.yjsIndexer.waitForInitialScan().finally(() => {
+				log.info("initial Yjs index complete; starting sync client");
 				this.syncClient.start();
 				this.startConfigDirPoller();
 			});
@@ -89,21 +101,27 @@ export default class SyncEngine extends Plugin {
 			void this.pruneClosedDocs();
 		}));
 		this.registerEvent(this.app.vault.on("create", file => {
+			log.debug("vault create event", { path: file.path, type: file instanceof TFolder ? "folder" : "file" });
 			void this.yjsIndexer.ensureFile(file);
 			void this.queueNonMarkdownUpsert(file);
 		}));
 		this.registerEvent(this.app.vault.on("modify", file => {
+			log.debug("vault modify event", { path: file.path, type: file instanceof TFolder ? "folder" : "file" });
 			void this.yjsIndexer.ensureFile(file);
 			void this.queueNonMarkdownUpsert(file);
 		}));
 		this.registerEvent(this.app.vault.on("delete", file => {
+			log.info("vault delete event", { path: file.path, type: file instanceof TFolder ? "folder" : "file" });
 			void this.enqueueLocalDelete(file).catch(error => {
+				log.error("failed to enqueue local delete", { path: file.path, ...errorContext(error) });
 				new Notice(`Sync outbox write failed: ${errorMessage(error)}`);
 			});
 			void this.yjsIndexer.delete(file);
 		}));
 		this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
+			log.info("vault rename event", { oldPath, path: file.path, type: file instanceof TFolder ? "folder" : "file" });
 			void this.enqueueLocalRename(file, oldPath).catch(error => {
+				log.error("failed to enqueue local rename", { oldPath, path: file.path, ...errorContext(error) });
 				new Notice(`Sync outbox write failed: ${errorMessage(error)}`);
 			});
 			void this.yjsIndexer.rename(file, oldPath);
@@ -143,8 +161,10 @@ export default class SyncEngine extends Plugin {
 			created: Date.now(),
 		};
 		doc.applyChanges(update.changes, row, (error) => {
+			log.error("failed to enqueue editor Yjs update", { path: pathID, mutationId: row.mutationId, ...errorContext(error) });
 			new Notice(`Sync outbox write failed: ${error.message}`);
 		});
+		log.debug("queued editor Yjs update", { path: pathID, mutationId: row.mutationId });
 		this.syncClient.wakeSoon();
 	}
 
@@ -169,9 +189,11 @@ export default class SyncEngine extends Plugin {
 		if (!initialState) {
 			initialState = docStateFromContent(initialContent, Y);
 			await this.yjsStateStore.put(pathID, initialState);
+			log.debug("seeded Yjs state for open document", { path: pathID, chars: initialContent.length });
 		}
 		const dsync = new DocSync(this.db, this.yjsStateStore, pathID, initialState);
 		this.docs.set(pathID, dsync);
+		log.debug("created DocSync", { path: pathID });
 		return dsync;
 	}
 
@@ -186,6 +208,7 @@ export default class SyncEngine extends Plugin {
 			isFolder: file instanceof TFolder,
 			created: Date.now(),
 		});
+		log.info("queued local delete", { path: file.path, isFolder: file instanceof TFolder });
 		this.syncClient.wakeSoon();
 	}
 
@@ -205,17 +228,18 @@ export default class SyncEngine extends Plugin {
 			isFolder: file instanceof TFolder,
 			created: Date.now(),
 		});
+		log.info("queued local rename", { oldPath, path: file.path, isFolder: file instanceof TFolder });
 		this.syncClient.wakeSoon();
 	}
 
 	private startConfigDirPoller(): void {
-		void this.scanConfigDirForChanges(true);
+		void this.scanConfigDirForChanges("baseline");
 		this.registerInterval(window.setInterval(() => {
-			void this.scanConfigDirForChanges(false);
+			void this.scanConfigDirForChanges("enqueue");
 		}, CONFIG_DIR_POLL_MS));
 	}
 
-	private async scanConfigDirForChanges(enqueueCurrent: boolean): Promise<void> {
+	private async scanConfigDirForChanges(mode: ConfigDirScanMode): Promise<void> {
 		if (this.syncClient?.isApplyingRemoteChanges()) {
 			return;
 		}
@@ -234,11 +258,7 @@ export default class SyncEngine extends Plugin {
 				continue;
 			}
 			this.configDirStats.set(path, fingerprint);
-			if (enqueueCurrent) {
-				void this.queuePathUpsert(path).catch(error => {
-					new Notice(`Sync outbox write failed: ${errorMessage(error)}`);
-				});
-			} else {
+			if (mode === "enqueue") {
 				this.queuePathUpsertDebounced(path);
 			}
 		}
@@ -248,8 +268,9 @@ export default class SyncEngine extends Plugin {
 				continue;
 			}
 			this.configDirStats.delete(path);
-			if (shouldSyncPath(path, this.app.vault.configDir, this.manifest.id)) {
+			if (mode === "enqueue" && shouldSyncPath(path, this.app.vault.configDir, this.manifest.id)) {
 				void this.enqueueLocalPathDelete(path).catch(error => {
+					log.error("failed to enqueue config dir delete", { path, ...errorContext(error) });
 					new Notice(`Sync outbox write failed: ${errorMessage(error)}`);
 				});
 			}
@@ -279,6 +300,7 @@ export default class SyncEngine extends Plugin {
 			isFolder: false,
 			created: Date.now(),
 		});
+		log.info("queued local path delete", { path });
 		this.syncClient.wakeSoon();
 	}
 
@@ -306,7 +328,7 @@ export default class SyncEngine extends Plugin {
 		try {
 			await doc.persistState();
 		} catch (error) {
-			console.error("failed to persist closed Yjs doc", error);
+			log.error("failed to persist closed Yjs doc", { path, ...errorContext(error) });
 			return;
 		}
 		if (this.docs.get(path) !== doc || this.isMarkdownPathOpen(path)) {
@@ -314,6 +336,7 @@ export default class SyncEngine extends Plugin {
 		}
 		doc.destroy();
 		this.docs.delete(path);
+		log.debug("pruned closed DocSync", { path });
 	}
 
 	private isMarkdownPathOpen(path: Path): boolean {
@@ -330,6 +353,7 @@ export default class SyncEngine extends Plugin {
 		if (
 			this.syncClient?.isApplyingRemoteChanges() ||
 			!(file instanceof TFile) ||
+			this.isConfigDirPath(file.path) ||
 			shouldUseYjs(file.path, this.app.vault.configDir) ||
 			!shouldSyncPath(file.path, this.app.vault.configDir, this.manifest.id)
 		) {
@@ -346,6 +370,7 @@ export default class SyncEngine extends Plugin {
 		const timer = window.setTimeout(() => {
 			this.pendingFileTimers.delete(path);
 			void this.queuePathUpsert(path).catch(error => {
+				log.error("failed to enqueue file upsert", { path, ...errorContext(error) });
 				new Notice(`Sync outbox write failed: ${errorMessage(error)}`);
 			});
 		}, 500);
@@ -370,6 +395,7 @@ export default class SyncEngine extends Plugin {
 				contentSha256: metadata.contentSha256,
 				created: Date.now(),
 			});
+			log.info("queued large file upsert", { path, byteSize: metadata.byteSize, contentSha256: metadata.contentSha256 });
 			this.syncClient.wakeSoon();
 			return;
 		}
@@ -384,6 +410,7 @@ export default class SyncEngine extends Plugin {
 			byteSize: bytes.byteLength,
 			created: Date.now(),
 		});
+		log.info("queued file upsert", { path, byteSize: bytes.byteLength });
 		this.syncClient.wakeSoon();
 	}
 
@@ -391,7 +418,13 @@ export default class SyncEngine extends Plugin {
 		return isPluginInternalPath(path, this.app.vault.configDir, this.manifest.id);
 	}
 
+	private isConfigDirPath(path: string): boolean {
+		const configDir = this.app.vault.configDir.replace(/^\/+|\/+$/g, "");
+		return path === configDir || path.startsWith(`${configDir}/`);
+	}
+
 	onunload() {
+		log.info("plugin unloading");
 		for (const timer of this.pendingFileTimers.values()) {
 			window.clearTimeout(timer);
 		}
@@ -399,7 +432,7 @@ export default class SyncEngine extends Plugin {
 		this.syncClient?.stop();
 		this.yjsIndexer?.stop();
 		void this.db.close().catch(error => {
-			console.error("failed to close outbox store", error);
+			log.error("failed to close outbox store", errorContext(error));
 		});
 	}
 

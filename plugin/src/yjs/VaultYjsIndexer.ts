@@ -3,6 +3,8 @@ import * as Y from "yjs";
 import { docStateFromContent } from "../../../shared/yjsSeed";
 import { MARKDOWN_FIELD } from "../../../shared/yjsSeed";
 import { YjsStateStore } from "./YjsStateStore";
+import { errorContext } from "../../../shared/logger";
+import { log } from "../logger";
 
 const BATCH_SIZE = 25;
 
@@ -22,13 +24,15 @@ export class VaultYjsIndexer {
 
     start(): void {
         this.stopped = false;
+        log.info("Yjs indexer starting");
         this.scanPromise = this.scanVault().catch(error => {
-            console.error("failed to index Yjs state", error);
+            log.error("failed to index Yjs state", errorContext(error));
         });
     }
 
     stop(): void {
         this.stopped = true;
+        log.info("Yjs indexer stopping");
     }
 
     async waitForInitialScan(): Promise<void> {
@@ -45,6 +49,7 @@ export class VaultYjsIndexer {
             return;
         }
         await this.store.put(file.path, docStateFromContent(content, Y));
+        log.debug("indexed Yjs state", { path: file.path, chars: content.length });
     }
 
     async delete(file: TAbstractFile): Promise<void> {
@@ -61,9 +66,11 @@ export class VaultYjsIndexer {
             .filter(file => !this.shouldIgnorePath(file.path))
             .sort((a, b) => a.path.localeCompare(b.path));
         let processed = 0;
+        log.info("Yjs vault scan started", { files: files.length });
 
         for (const file of files) {
             if (this.stopped) {
+                log.warn("Yjs vault scan stopped early", { processed, files: files.length });
                 return;
             }
             await this.ensureFile(file);
@@ -72,6 +79,7 @@ export class VaultYjsIndexer {
                 await sleep(0);
             }
         }
+        log.info("Yjs vault scan complete", { processed });
     }
 
     private contentFromState(state: Uint8Array): string {

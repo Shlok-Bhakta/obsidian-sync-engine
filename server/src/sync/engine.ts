@@ -1,6 +1,6 @@
 import { sql } from "bun";
 import { DocSyncPath, opType, ServerChange, SyncMutation, wsPacket } from "../../../shared/types";
-import { isPluginInternalPath, shouldUseYjs } from "../../../shared/pathPolicy";
+import { isPluginInternalPath, shouldSyncPath, shouldUseYjs } from "../../../shared/pathPolicy";
 import { folderDescendantLike } from "../sqlUtils";
 import * as Y from "yjs";
 import {
@@ -10,6 +10,7 @@ import {
   replayYjsPayloads,
 } from "../yjs/apply";
 import { createLargeObject, readLargeObject, readLargeObjectRange, unlinkLargeObject } from "../db/largeObject";
+import { log } from "../logger";
 
 export type CompactionConfig = {
   count: number;
@@ -79,6 +80,13 @@ type CompactionCandidate = {
 
 function latestRevisionFromRows(rows: RevisionRow[]): string {
   return rows[0]?.revision ?? "0";
+}
+
+function summarizeMutations(mutations: SyncMutation[]): Record<string, number> {
+  return mutations.reduce<Record<string, number>>((summary, mutation) => {
+    summary[mutation.operation] = (summary[mutation.operation] ?? 0) + 1;
+    return summary;
+  }, {});
 }
 
 export async function getServerRevision(): Promise<string> {
@@ -241,7 +249,7 @@ export async function snapshotPacket(): Promise<Extract<wsPacket, { type: opType
   return {
     type: opType.SnapshotReset,
     targetRevision: await getServerRevision(),
-    files: files.map(rowToSnapshotChange),
+    files: files.filter(row => shouldSyncPath(row.path)).map(rowToSnapshotChange),
   };
 }
 
@@ -313,6 +321,9 @@ async function applyMutation(tx: typeof sql, clientId: string, mutation: SyncMut
   if (isPluginInternalPath(mutation.path) || (mutation.toPath && isPluginInternalPath(mutation.toPath))) {
     throw new Error(`Refusing to sync plugin-internal path: ${mutation.toPath ?? mutation.path}`);
   }
+  if (!shouldSyncPath(mutation.path) || (mutation.toPath && !shouldSyncPath(mutation.toPath))) {
+    throw new Error(`Refusing to sync ignored path: ${mutation.toPath ?? mutation.path}`);
+  }
 
   const existing = await tx<RevisionRow[]>`
     SELECT revision::TEXT AS revision
@@ -321,6 +332,13 @@ async function applyMutation(tx: typeof sql, clientId: string, mutation: SyncMut
       AND mutation_id = ${mutation.mutationId};
   `;
   if (existing[0]) {
+    log.debug("mutation already accepted", {
+      clientId,
+      mutationId: mutation.mutationId,
+      revision: existing[0].revision,
+      operation: mutation.operation,
+      path: mutation.path,
+    });
     return existing[0].revision;
   }
 
@@ -358,6 +376,16 @@ async function applyMutation(tx: typeof sql, clientId: string, mutation: SyncMut
     RETURNING revision::TEXT AS revision;
   `;
   const revision = inserted[0].revision;
+  log.debug("applying mutation", {
+    clientId,
+    mutationId: mutation.mutationId,
+    revision,
+    operation: mutation.operation,
+    path: mutation.path,
+    toPath: mutation.toPath,
+    storageKind: mutation.storageKind,
+    byteSize: mutation.byteSize ?? mutation.contentBytes?.byteLength ?? mutation.data?.byteLength,
+  });
 
   if (mutation.operation === "CreateFolder") {
     const rows = await tx<{ contentOid: number | null }[]>`
@@ -581,6 +609,9 @@ export async function putBlobFile(
   if (isPluginInternalPath(path)) {
     throw new Error(`Refusing to sync plugin-internal path: ${path}`);
   }
+  if (!shouldSyncPath(path)) {
+    throw new Error(`Refusing to sync ignored path: ${path}`);
+  }
   return sql.begin(async tx => {
     const existing = await tx<{ contentOid: number | null }[]>`
       SELECT content_oid AS "contentOid"
@@ -622,6 +653,12 @@ export async function putBlobFile(
         updated_at = NOW()
       RETURNING path, content_oid AS "contentOid", byte_size::TEXT AS "byteSize", content_sha256 AS "contentSha256", revision::TEXT AS revision;
     `;
+    log.debug("blob metadata stored", {
+      path,
+      byteSize: written.byteSize,
+      contentSha256,
+      revision: rows[0]?.revision,
+    });
     return rowToBlobMetadata(rows[0]!);
   });
 }
@@ -676,9 +713,15 @@ export async function readBlobFile(path: string): Promise<{ bytes: Uint8Array; m
 
 export async function acceptMutations(clientId: string, mutations: SyncMutation[]): Promise<string> {
   if (mutations.length === 0) {
+    log.debug("empty mutation batch accepted", { clientId });
     return getServerRevision();
   }
 
+  log.info("accepting mutation batch", {
+    clientId,
+    mutations: mutations.length,
+    operations: summarizeMutations(mutations),
+  });
   const revision = await sql.begin(async tx => {
     let latest = "0";
     for (const mutation of mutations) {
@@ -694,6 +737,7 @@ export async function acceptMutations(clientId: string, mutations: SyncMutation[
   });
 
   await compactYjsEvents();
+  log.info("mutation batch accepted", { clientId, revision });
   return revision;
 }
 
@@ -755,6 +799,12 @@ export async function compactYjsEvents(): Promise<void> {
   `;
 
   for (const candidate of candidates) {
+    log.info("compacting Yjs events", {
+      path: candidate.path,
+      updates: candidate.updates,
+      bytes: candidate.bytes,
+      maxRevision: candidate.maxRevision,
+    });
     await sql.begin(async tx => {
       await flushFileBeforeCompaction(tx, candidate.path, candidate.maxRevision);
       await tx`
@@ -804,6 +854,7 @@ export async function compactMaterializedSyncEvents(): Promise<string> {
 export async function handlePull(packet: Extract<wsPacket, { type: opType.PullSince }>): Promise<wsPacket> {
   const hasState = await serverHasAnyState();
   if (!hasState) {
+    log.info("pull requires initial upload", { revision: packet.revision });
     return {
       type: opType.InitRequired,
       serverRevision: "0",
@@ -812,10 +863,23 @@ export async function handlePull(packet: Extract<wsPacket, { type: opType.PullSi
 
   const compactedRevision = await getCompactedRevision();
   if (BigInt(packet.revision) < BigInt(compactedRevision) || packet.revision === "0") {
-    return snapshotPacket();
+    const snapshot = await snapshotPacket();
+    log.info("pull returning snapshot reset", {
+      requestedRevision: packet.revision,
+      compactedRevision,
+      targetRevision: snapshot.targetRevision,
+      files: snapshot.files.length,
+    });
+    return snapshot;
   }
 
-  return changeBatchPacket(packet.revision);
+  const batch = await changeBatchPacket(packet.revision);
+  log.info("pull returning change batch", {
+    requestedRevision: packet.revision,
+    serverRevision: batch.serverRevision,
+    changes: batch.changes.length,
+  });
+  return batch;
 }
 
 export async function handleDocSync(paths: DocSyncPath[]): Promise<Extract<wsPacket, { type: opType.DocSyncAck }>> {
@@ -838,6 +902,12 @@ export async function handleDocSync(paths: DocSyncPath[]): Promise<Extract<wsPac
     const yjsState = Y.encodeStateAsUpdateV2(serverDoc);
     serverDoc.destroy();
     results.push({ path: entry.path, data, stateVector: serverStateVector, yjsState });
+    log.debug("DocSync path resolved", {
+      path: entry.path,
+      responseBytes: data.byteLength,
+      serverStateVectorBytes: serverStateVector.byteLength,
+      serverStateBytes: yjsState.byteLength,
+    });
   }
 
   return { type: opType.DocSyncAck, paths: results };

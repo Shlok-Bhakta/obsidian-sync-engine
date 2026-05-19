@@ -1,7 +1,7 @@
 {
   "name": "server",
   "scripts": {
-    "dev": "bun run --hot src/index.ts",
+    "dev": "SYNC_LOG_LEVEL=debug bun run --hot src/index.ts",
     "test": "bun test",
     "test:unit": "bun test src/yjs src/sqlUtils",
     "test:integration": "bun test src/sync/engine.integration.test.ts",

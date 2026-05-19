@@ -4,6 +4,8 @@ import { ChangeSet } from "@codemirror/state";
 import { outboxData } from "../../../shared/types";
 import { MARKDOWN_FIELD } from "../../../shared/yjsSeed";
 import { YjsStateStore } from "./YjsStateStore";
+import { errorContext } from "../../../shared/logger";
+import { log } from "../logger";
 
 // one stop shop for all the document syncing needs
 
@@ -79,7 +81,7 @@ export class DocSync {
             this.persistState(),
         ]).catch(error => {
             const err = error instanceof Error ? error : new Error(String(error));
-            console.error("failed to write update to outbox", err);
+            log.error("failed to write update to outbox", { path: this.path, mutationId: row.mutationId, ...errorContext(err) });
             onError?.(err);
         });
     }
@@ -87,7 +89,7 @@ export class DocSync {
     public applyRemoteUpdate(update: Uint8Array): string {
         Y.applyUpdateV2(this.ydoc, update);
         void this.persistState().catch(error => {
-            console.error("failed to persist remote Yjs state", error);
+            log.error("failed to persist remote Yjs state", { path: this.path, ...errorContext(error) });
         });
         return this.ytext.toJSON();
     }

@@ -1,6 +1,7 @@
 import { sql } from "bun";
 import migration0001 from "./migrations/0001_init.sql" with { type: "file" };
 import migration0002 from "./migrations/0002_blob_storage.sql" with { type: "file" };
+import { log } from "../logger";
 
 const migrationsManifest = [
     {
@@ -15,7 +16,7 @@ const migrationsManifest = [
 
 
 export async function bootstrapDB() {
-    console.log("bootstrapping db");
+    log.info("bootstrapping db");
     // if this boi runs then the db is ok to run;
     await canConnect();
     // check and create our migrations table
@@ -30,7 +31,7 @@ async function canConnect() {
     let result = await sql`SELECT 1;`.values();
     // console.log(result[0][0]);
     if (result[0][0] === 1) {
-        console.log("db is ready");
+        log.info("db is ready");
     } else {
         throw new Error("something somewhere is goofed up. Could not run SELECT 1; on the db");
     }
@@ -40,7 +41,7 @@ async function canConnect() {
 async function setupDB() {
     const migrationsTableName = "migrations";
     // check to see if migrations table exists
-    console.log("checking if migrations table exists");
+    log.debug("checking if migrations table exists");
     let exists = false;
     try {
     await sql.unsafe(`SELECT * FROM ${migrationsTableName};`).values();
@@ -49,10 +50,10 @@ async function setupDB() {
         exists = false;
     }
     if (exists) {
-        console.log("migrations table exists");
+        log.debug("migrations table exists");
         return;
     }else{
-        console.log("migrations table does not exist, either this is the first time running or something is wrong");
+        log.info("migrations table missing; creating");
         await sql.unsafe(`CREATE TABLE ${migrationsTableName} (
             id SERIAL PRIMARY KEY, 
             name VARCHAR(255) NOT NULL,
@@ -63,24 +64,24 @@ async function setupDB() {
 
 type MigrationRow = { name: string };
 async function applyMigrations() {
-    console.log("applying migrations");
+    log.info("checking migrations");
 
     // get all migrations that have already been run
     let migrations = await sql<MigrationRow[]>`SELECT name FROM migrations;`;
     let migrationsNames: string[] = migrations.map(m => m.name);
-    console.log("migrations", migrationsNames);
+    log.debug("applied migrations loaded", { migrations: migrationsNames });
 
     for (const migration of migrationsManifest) {
         // first check to see if the migration has already been applied
         if (migrations.find(m => m.name === migration.name)) {
-            console.log("migration already applied");
+            log.debug("migration already applied", { migration: migration.name });
             continue;
         }
-        console.log("applying migration", migration.name);
+        log.info("applying migration", { migration: migration.name });
         await sql.unsafe(await Bun.file(migration.sql).text());
-        console.log("applied migration", migration.name);
+        log.info("applied migration", { migration: migration.name });
         await sql`INSERT INTO migrations (name, created_at) VALUES (${migration.name}, NOW());`;
-        console.log("inserted migration", migration.name);
+        log.debug("inserted migration row", { migration: migration.name });
     }
 }
 // export function isMigrationsSetup(db: sql.Database, migrations: string[]) {
