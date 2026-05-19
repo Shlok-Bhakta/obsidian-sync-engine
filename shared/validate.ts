@@ -64,6 +64,24 @@ const snapshotResetPacketSchema = z.object({
     files: z.array(z.record(z.unknown())),
 });
 
+const bootstrapCreatePacketSchema = z.object({
+    type: z.literal(opType.BootstrapCreate),
+    vaultName: z.string().min(1),
+    backendUrl: z.string().min(1),
+    configDir: z.string().min(1),
+    pluginId: z.string().min(1),
+});
+
+const bootstrapStatusPacketSchema = z.object({
+    type: z.literal(opType.BootstrapStatus),
+    status: z.enum(["building", "ready", "downloaded", "expired", "failed"]),
+    vaultName: z.string(),
+    downloadUrl: z.string().optional(),
+    expiresAt: z.number().optional(),
+    remainingMs: z.number().optional(),
+    message: z.string().optional(),
+});
+
 const docSyncPathSchema = z.object({
     path: z.string().min(1),
     stateVector: z.instanceof(Uint8Array),
@@ -96,6 +114,8 @@ const packetSchemas: Record<string, z.ZodType<unknown>> = {
     [opType.InitRequired]: initRequiredPacketSchema,
     [opType.ChangeBatch]: changeBatchPacketSchema,
     [opType.SnapshotReset]: snapshotResetPacketSchema,
+    [opType.BootstrapCreate]: bootstrapCreatePacketSchema,
+    [opType.BootstrapStatus]: bootstrapStatusPacketSchema,
     [opType.DocSync]: docSyncPacketSchema,
     [opType.DocSyncAck]: docSyncAckPacketSchema,
 };

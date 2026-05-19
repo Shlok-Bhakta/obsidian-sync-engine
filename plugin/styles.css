@@ -6,3 +6,51 @@ available in the app when your plugin is enabled.
 If your plugin does not need CSS, delete this file.
 
 */
+
+.sync-engine-bootstrap-status,
+.sync-engine-bootstrap-link {
+	margin-top: 12px;
+	padding: 12px;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 8px;
+	background: var(--background-secondary);
+	color: var(--text-normal);
+}
+
+.sync-engine-bootstrap-status--success {
+	border-color: var(--text-success);
+}
+
+.sync-engine-bootstrap-status--error {
+	border-color: var(--text-error);
+	color: var(--text-error);
+}
+
+.sync-engine-bootstrap-link__meta {
+	margin-bottom: 8px;
+	color: var(--text-muted);
+	font-size: var(--font-ui-small);
+}
+
+.sync-engine-bootstrap-link__row {
+	display: flex;
+	gap: 8px;
+	align-items: center;
+}
+
+.sync-engine-bootstrap-link__row input {
+	flex: 1 1 auto;
+	min-width: 0;
+	font-family: var(--font-monospace);
+	font-size: var(--font-ui-smaller);
+}
+
+.sync-engine-bootstrap-link__row button {
+	flex: 0 0 auto;
+}
+
+.sync-engine-bootstrap-link__open {
+	display: inline-block;
+	margin-top: 8px;
+	font-size: var(--font-ui-small);
+}

@@ -21,6 +21,7 @@ export class SyncEngineSettingTab extends PluginSettingTab {
 	plugin: SyncEngine;
 	private pendingSettings: SyncEngineSettings;
 	private hasUnsavedChanges = false;
+	private unsubscribeBootstrapStatus: (() => void) | null = null;
 
 	constructor(app: App, plugin: SyncEngine) {
 		super(app, plugin);
@@ -37,6 +38,8 @@ export class SyncEngineSettingTab extends PluginSettingTab {
 	display(): void {
 		const {containerEl} = this;
 
+		this.unsubscribeBootstrapStatus?.();
+		this.unsubscribeBootstrapStatus = null;
 		containerEl.empty();
 
 		if (!this.hasUnsavedChanges) {
@@ -145,10 +148,98 @@ export class SyncEngineSettingTab extends PluginSettingTab {
 					});
 			});
 
+		const bootstrapStatusEl = containerEl.createEl("div");
+		bootstrapStatusEl.setCssStyles({
+			marginTop: "12px",
+			color: "var(--text-muted)",
+		});
+
+		const renderBootstrapStatus = () => {
+			const status = this.plugin.bootstrapStatus;
+			bootstrapStatusEl.empty();
+			if (!status) {
+				return;
+			}
+			if (status.status === "building") {
+				bootstrapStatusEl.createDiv({
+					cls: "sync-engine-bootstrap-status",
+					text: status.message ?? "Building vault zip...",
+				});
+			} else if (status.status === "ready" && status.downloadUrl) {
+				const seconds = Math.max(0, Math.ceil((status.remainingMs ?? 0) / 1000));
+				const panel = bootstrapStatusEl.createDiv({ cls: "sync-engine-bootstrap-link" });
+				panel.createDiv({
+					cls: "sync-engine-bootstrap-link__meta",
+					text: `Vault link ready. Expires in ${seconds}s.`,
+				});
+				const row = panel.createDiv({ cls: "sync-engine-bootstrap-link__row" });
+				const input = row.createEl("input", {
+					type: "text",
+					value: status.downloadUrl,
+				});
+				input.readOnly = true;
+				input.addEventListener("focus", () => input.select());
+				const copyButton = row.createEl("button", {
+					cls: "mod-cta",
+					text: "Copy",
+				});
+				copyButton.addEventListener("click", async () => {
+					try {
+						await navigator.clipboard.writeText(status.downloadUrl!);
+						new Notice("Vault link copied");
+					} catch (error) {
+						input.select();
+						new Notice("Could not copy automatically. Link selected.");
+					}
+				});
+				panel.createEl("a", {
+					cls: "sync-engine-bootstrap-link__open",
+					text: "Open download link",
+					href: status.downloadUrl,
+				});
+			} else if (status.status === "downloaded") {
+				bootstrapStatusEl.createDiv({
+					cls: "sync-engine-bootstrap-status sync-engine-bootstrap-status--success",
+					text: "Vault link downloaded.",
+				});
+			} else if (status.status === "expired") {
+				bootstrapStatusEl.createDiv({
+					cls: "sync-engine-bootstrap-status",
+					text: "Vault link expired.",
+				});
+			} else if (status.status === "failed") {
+				bootstrapStatusEl.createDiv({
+					cls: "sync-engine-bootstrap-status sync-engine-bootstrap-status--error",
+					text: `Vault link failed: ${status.message ?? "Unknown error"}`,
+				});
+			}
+		};
+
+		new Setting(containerEl)
+			.setName("Bootstrap vault")
+			.setDesc("Generate a one-time zip link for setting up another device.")
+			.addButton(button => {
+				button
+					.setButtonText("Generate vault link")
+					.setTooltip("Generate vault link")
+					.onClick(async () => {
+						try {
+							await this.plugin.generateVaultLink();
+						} catch (error) {
+							const message = error instanceof Error ? error.message : String(error);
+							new Notice(`Vault link failed: ${message}`);
+						}
+					});
+			});
+		this.unsubscribeBootstrapStatus = this.plugin.subscribeBootstrapStatus(renderBootstrapStatus);
+		renderBootstrapStatus();
+
 		refresh();
 	}
 
 	hide(): void {
+		this.unsubscribeBootstrapStatus?.();
+		this.unsubscribeBootstrapStatus = null;
 		if (this.hasUnsavedChanges) {
 			new Notice("Make sure to save");
 		}

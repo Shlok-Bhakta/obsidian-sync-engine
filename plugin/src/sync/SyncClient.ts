@@ -1,13 +1,15 @@
 import { App, Notice, TFile, TFolder, normalizePath } from "obsidian";
 import * as Y from "yjs";
 import { OutboxSegment, OutboxStore } from "db/db";
-import { opType, ServerChange, SyncMutation, wsPacket } from "../../../shared/types";
+import { BootstrapStatus, opType, ServerChange, SyncMutation, wsPacket } from "../../../shared/types";
 import { bytesToBase64, decodePacket, encodePacket, PROTOCOL_VERSION } from "../../../shared/protocol";
 import { docStateFromContent, MARKDOWN_FIELD } from "../../../shared/yjsSeed";
 import { buildUploadFromSyncedDoc, shouldApplyDocSyncCatchUp } from "../../../shared/yjsUpload";
+import { shouldSyncPath, shouldUseYjs } from "../../../shared/pathPolicy";
 import { SyncEngineSettings } from "../settings";
 import { DocSync } from "../yjs/DocSync";
 import { YjsStateStore } from "../yjs/YjsStateStore";
+import { BlobClient } from "./BlobClient";
 
 const EMPTY_BACKOFF_MS = 1000;
 const ERROR_BACKOFF_MS = 2000;
@@ -15,6 +17,7 @@ const IDLE_EMPTY_SEGMENTS = 3;
 const CONNECT_BACKOFF_INITIAL_MS = 5000;
 const CONNECT_BACKOFF_MAX_MS = 60000;
 const WS_WAIT_TIMEOUT_MS = 60_000;
+const INLINE_BYTES_LIMIT = 64 * 1024;
 
 function sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
@@ -61,6 +64,20 @@ function dirname(path: string): string {
     return index === -1 ? "" : path.slice(0, index);
 }
 
+type SnapshotPath = {
+    path: string;
+    isFolder: boolean;
+};
+
+function exactArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+    return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+}
+
+async function sha256Hex(bytes: Uint8Array): Promise<string> {
+    const hash = await crypto.subtle.digest("SHA-256", exactArrayBuffer(bytes));
+    return [...new Uint8Array(hash)].map(byte => byte.toString(16).padStart(2, "0")).join("");
+}
+
 export class SyncClient {
     private ws: WebSocket | null = null;
     private serverUrl: string;
@@ -79,6 +96,7 @@ export class SyncClient {
     private applyingRemote = false;
     private failedConnectAttempts = 0;
     private nextConnectAt = 0;
+    private blobClient: BlobClient;
 
     constructor(
         private readonly app: App,
@@ -88,12 +106,14 @@ export class SyncClient {
         private readonly onClientKeyRotated: (clientKey: string) => Promise<void> = async () => {},
         private readonly onLastPulledRevisionChanged: (revision: string) => Promise<void> = async () => {},
         private readonly getDocSync: (path: string) => DocSync | undefined = () => undefined,
+        private readonly onBootstrapStatus: (status: BootstrapStatus) => void = () => {},
     ) {
         this.serverUrl = toWebSocketUrl(settings.backendUrl);
         this.clientId = settings.clientId;
         this.clientKey = settings.clientKey;
         this.clientName = settings.clientName;
         this.lastPulledRevision = settings.lastPulledRevision;
+        this.blobClient = new BlobClient(settings.backendUrl, settings.clientKey);
     }
 
     isApplyingRemoteChanges(): boolean {
@@ -132,6 +152,7 @@ export class SyncClient {
         this.clientKey = settings.clientKey;
         this.clientName = settings.clientName;
         this.lastPulledRevision = settings.lastPulledRevision;
+        this.blobClient.update(settings.backendUrl, settings.clientKey);
         if (nextUrl !== this.serverUrl || authChanged) {
             this.serverUrl = nextUrl;
             this.startupSyncPromise = null;
@@ -140,6 +161,24 @@ export class SyncClient {
             this.closeSocket();
         }
         this.connectSoon();
+    }
+
+    async uploadBlob(path: string, bytes: Uint8Array): Promise<{ byteSize: number; contentSha256: string }> {
+        const contentSha256 = await sha256Hex(bytes);
+        await this.blobClient.upload(path, bytes, contentSha256);
+        return { byteSize: bytes.byteLength, contentSha256 };
+    }
+
+    async generateBootstrapLink(vaultName: string, configDir: string, pluginId: string): Promise<void> {
+        const openWs = await this.ensureAuthenticatedSocket();
+        const backendUrl = this.httpBackendUrl();
+        openWs.send(encodePacket({
+            type: opType.BootstrapCreate,
+            vaultName,
+            backendUrl,
+            configDir,
+            pluginId,
+        }));
     }
 
     connectSoon(): void {
@@ -280,38 +319,106 @@ export class SyncClient {
     private async readVaultSnapshot(): Promise<SyncMutation[]> {
         const created = Date.now();
         const changes: SyncMutation[] = [];
-        const configPrefix = `${this.app.vault.configDir}/`;
-        const loaded = this.app.vault.getAllLoadedFiles()
-            .filter(file => file.path && !file.path.startsWith(configPrefix))
-            .sort((a, b) => a.path.localeCompare(b.path));
+        const paths = await this.listSnapshotPaths();
 
-        for (const file of loaded) {
-            if (file instanceof TFolder) {
+        for (const entry of paths) {
+            if (entry.isFolder) {
                 changes.push({
                     mutationId: crypto.randomUUID(),
                     operation: "CreateFolder",
-                    path: file.path,
+                    path: entry.path,
                     isFolder: true,
                     created,
                 });
             }
         }
 
-        for (const file of loaded) {
-            if (file instanceof TFile) {
-                changes.push({
+        for (const entry of paths) {
+            if (!entry.isFolder) {
+                const isYjs = shouldUseYjs(entry.path, this.app.vault.configDir);
+                if (isYjs) {
+                    const loaded = this.app.vault.getAbstractFileByPath(entry.path);
+                    changes.push({
+                        mutationId: crypto.randomUUID(),
+                        operation: "UpsertFile",
+                        path: entry.path,
+                        content: loaded instanceof TFile
+                            ? await this.app.vault.read(loaded)
+                            : await this.app.vault.adapter.read(entry.path),
+                        isFolder: false,
+                        isYjs: true,
+                        storageKind: "text",
+                        created,
+                    });
+                    continue;
+                }
+
+                const contentBytes = new Uint8Array(await this.app.vault.adapter.readBinary(entry.path));
+                const base: SyncMutation = {
                     mutationId: crypto.randomUUID(),
                     operation: "UpsertFile",
-                    path: file.path,
-                    content: await this.app.vault.read(file),
+                    path: entry.path,
                     isFolder: false,
-                    isYjs: file.extension === "md",
+                    isYjs: false,
+                    byteSize: contentBytes.byteLength,
+                    contentSha256: await sha256Hex(contentBytes),
                     created,
-                });
+                };
+                if (contentBytes.byteLength > INLINE_BYTES_LIMIT) {
+                    await this.blobClient.upload(entry.path, contentBytes, base.contentSha256!);
+                    changes.push({
+                        ...base,
+                        storageKind: "lo",
+                    });
+                } else {
+                    changes.push({
+                        ...base,
+                        storageKind: "bytea",
+                        contentBytes,
+                    });
+                }
             }
         }
 
         return changes;
+    }
+
+    private async listSnapshotPaths(): Promise<SnapshotPath[]> {
+        const byPath = new Map<string, SnapshotPath>();
+        for (const file of this.app.vault.getAllLoadedFiles()) {
+            if (!shouldSyncPath(file.path, this.app.vault.configDir)) {
+                continue;
+            }
+            byPath.set(file.path, {
+                path: file.path,
+                isFolder: file instanceof TFolder,
+            });
+        }
+        await this.addAdapterPaths(this.app.vault.configDir, byPath);
+        return [...byPath.values()].sort((a, b) => {
+            if (a.isFolder !== b.isFolder) {
+                return a.isFolder ? -1 : 1;
+            }
+            return a.path.localeCompare(b.path);
+        });
+    }
+
+    private async addAdapterPaths(dir: string, byPath: Map<string, SnapshotPath>): Promise<void> {
+        if (!(await this.app.vault.adapter.exists(dir))) {
+            return;
+        }
+        const listed = await this.app.vault.adapter.list(dir);
+        for (const folder of listed.folders) {
+            if (shouldSyncPath(folder, this.app.vault.configDir)) {
+                byPath.set(folder, { path: folder, isFolder: true });
+                await this.addAdapterPaths(folder, byPath);
+            }
+        }
+        for (const file of listed.files) {
+            if (shouldSyncPath(file, this.app.vault.configDir)) {
+                byPath.set(file, { path: file, isFolder: false });
+            }
+        }
     }
 
     private async applyChangeBatch(packet: Extract<wsPacket, { type: opType.ChangeBatch }>): Promise<void> {
@@ -322,7 +429,7 @@ export class SyncClient {
     private async applySnapshotReset(packet: Extract<wsPacket, { type: opType.SnapshotReset }>): Promise<void> {
         const snapshotPaths = new Set(packet.files.map(file => normalizePath(file.path)));
         const toDelete = [...this.app.vault.getFiles()]
-            .filter(file => !file.path.startsWith(`${this.app.vault.configDir}/`) && !snapshotPaths.has(normalizePath(file.path)));
+            .filter(file => shouldSyncPath(file.path, this.app.vault.configDir) && !snapshotPaths.has(normalizePath(file.path)));
         const hasPendingChanges = await this.outbox.hasPendingChanges();
         if (toDelete.length > 0 && hasPendingChanges) {
             new Notice(`Sync snapshot reset: preserving ${toDelete.length} local file(s) while pending changes upload`);
@@ -341,8 +448,14 @@ export class SyncClient {
                 if (change.operation === "CreateFolder") {
                     await this.ensureFolder(change.path);
                 } else if (change.operation === "UpsertFile") {
-                    await this.upsertFile(change.path, change.content ?? "");
-                    await this.refreshYjsState(change.path, change.content ?? "", change.yjsState);
+                    if (change.storageKind === "lo") {
+                        await this.upsertBinaryFile(change.path, await this.blobClient.download(change.path));
+                    } else if (change.contentBytes) {
+                        await this.upsertBinaryFile(change.path, change.contentBytes);
+                    } else {
+                        await this.upsertTextFile(change.path, change.content ?? "");
+                        await this.refreshYjsState(change.path, change.content ?? "", change.yjsState);
+                    }
                 } else if (change.operation === "Delete") {
                     await this.deletePath(change.path);
                 } else if (change.operation === "Rename" && change.toPath) {
@@ -359,9 +472,8 @@ export class SyncClient {
     private async deletePathsMissingFromSnapshot(paths: Set<string>): Promise<void> {
         this.applyingRemote = true;
         try {
-            const configPrefix = `${this.app.vault.configDir}/`;
             const files = [...this.app.vault.getFiles()]
-                .filter(file => !file.path.startsWith(configPrefix) && !paths.has(normalizePath(file.path)))
+                .filter(file => shouldSyncPath(file.path, this.app.vault.configDir) && !paths.has(normalizePath(file.path)))
                 .sort((a, b) => b.path.length - a.path.length);
             for (const file of files) {
                 await this.app.fileManager.trashFile(file);
@@ -390,7 +502,7 @@ export class SyncClient {
         }
     }
 
-    private async upsertFile(path: string, content: string): Promise<void> {
+    private async upsertTextFile(path: string, content: string): Promise<void> {
         const normalized = normalizePath(path);
         const parent = dirname(normalized);
         if (parent) {
@@ -405,6 +517,23 @@ export class SyncClient {
             await this.app.fileManager.trashFile(existing);
         }
         await this.app.vault.create(normalized, content);
+    }
+
+    private async upsertBinaryFile(path: string, bytes: Uint8Array): Promise<void> {
+        const normalized = normalizePath(path);
+        const parent = dirname(normalized);
+        if (parent) {
+            await this.ensureFolder(parent);
+        }
+        const existing = this.app.vault.getAbstractFileByPath(normalized);
+        if (existing instanceof TFile) {
+            await this.app.vault.adapter.writeBinary(normalized, exactArrayBuffer(bytes));
+            return;
+        }
+        if (existing) {
+            await this.app.fileManager.trashFile(existing);
+        }
+        await this.app.vault.adapter.writeBinary(normalized, exactArrayBuffer(bytes));
     }
 
     private async deletePath(path: string): Promise<void> {
@@ -444,7 +573,7 @@ export class SyncClient {
             state = Y.encodeStateAsUpdateV2(doc);
             doc.destroy();
         }
-        await this.upsertFile(normalized, content);
+        await this.upsertTextFile(normalized, content);
         await this.stateStore.put(normalized, state);
     }
 
@@ -454,7 +583,7 @@ export class SyncClient {
     }
 
     private async refreshYjsState(path: string, content: string, yjsState?: Uint8Array): Promise<void> {
-        if (!path.endsWith(".md")) {
+        if (!shouldUseYjs(path, this.app.vault.configDir)) {
             return;
         }
         const state = yjsState ?? docStateFromContent(content, Y);
@@ -498,6 +627,7 @@ export class SyncClient {
             ...row,
             id: index + 1,
             data: row.data ? bytesToBase64(row.data) : undefined,
+            contentBytes: row.contentBytes ? bytesToBase64(row.contentBytes) : undefined,
         })).join("\n") + "\n";
     }
 
@@ -580,15 +710,30 @@ export class SyncClient {
         const output: SyncMutation[] = [];
         for (const row of rows) {
             if (row.operation !== "YjsUpdate") {
+                let contentBytes = row.contentBytes;
+                let storageKind = row.storageKind;
+                let contentSha256 = row.contentSha256;
+                let byteSize = row.byteSize;
+                if (row.operation === "UpsertFile" && contentBytes && contentBytes.byteLength > INLINE_BYTES_LIMIT) {
+                    contentSha256 = contentSha256 ?? await sha256Hex(contentBytes);
+                    await this.blobClient.upload(row.path, contentBytes, contentSha256);
+                    byteSize = contentBytes.byteLength;
+                    contentBytes = undefined;
+                    storageKind = "lo";
+                }
                 output.push({
                     mutationId: row.mutationId,
                     operation: row.operation,
                     path: row.path,
                     toPath: row.toPath,
                     content: row.content,
+                    contentBytes,
                     data: row.data,
                     isFolder: row.isFolder,
                     isYjs: row.isYjs,
+                    storageKind,
+                    byteSize,
+                    contentSha256,
                     created: row.created,
                 });
                 continue;
@@ -706,10 +851,20 @@ export class SyncClient {
         if (packet.newClientKey !== this.clientKey) {
             await this.onClientKeyRotated(packet.newClientKey);
             this.clientKey = packet.newClientKey;
+            this.blobClient.update(this.httpBackendUrl(), this.clientKey);
         }
 
         this.authenticated = true;
         return openWs;
+    }
+
+    private httpBackendUrl(): string {
+        const url = new URL(this.serverUrl);
+        url.protocol = url.protocol === "wss:" ? "https:" : "http:";
+        url.pathname = "";
+        url.search = "";
+        url.hash = "";
+        return url.toString().replace(/\/$/, "");
     }
 
     private async pullSince(ws: WebSocket, revision: string): Promise<wsPacket> {
@@ -740,6 +895,16 @@ export class SyncClient {
                 this.ws = null;
                 this.authenticated = false;
                 this.startupSynced = false;
+            }
+        });
+        nextWs.addEventListener("message", event => {
+            try {
+                const msg = decodePacket(readSocketMessage(event));
+                if (msg.type === opType.BootstrapStatus) {
+                    this.onBootstrapStatus(msg);
+                }
+            } catch {
+                // Request-specific listeners surface protocol errors.
             }
         });
 

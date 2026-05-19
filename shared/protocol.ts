@@ -1,20 +1,23 @@
 import { DocSyncPath, DocSyncResult, opType, outboxData, ServerChange, SyncMutation, wsPacket } from "./types";
 import { validatePacket } from "./validate";
 
-export const PROTOCOL_VERSION: number = 4;
+export const PROTOCOL_VERSION: number = 6;
 
-type EncodedMutation = Omit<SyncMutation, "data"> & {
+type EncodedMutation = Omit<SyncMutation, "data" | "contentBytes"> & {
     data?: string;
+    contentBytes?: string;
 };
 
-type EncodedServerChange = Omit<ServerChange, "data" | "yjsState"> & {
+type EncodedServerChange = Omit<ServerChange, "data" | "contentBytes" | "yjsState"> & {
     data?: string;
+    contentBytes?: string;
     yjsState?: string;
 };
 
-type EncodedOutboxRow = Omit<outboxData, "data"> & {
+type EncodedOutboxRow = Omit<outboxData, "data" | "contentBytes"> & {
     id: number;
     data?: string;
+    contentBytes?: string;
 };
 
 type EncodedDocSyncPath = {
@@ -55,6 +58,7 @@ function encodeMutation(mutation: SyncMutation): EncodedMutation {
     return {
         ...mutation,
         data: mutation.data ? bytesToBase64(mutation.data) : undefined,
+        contentBytes: mutation.contentBytes ? bytesToBase64(mutation.contentBytes) : undefined,
     };
 }
 
@@ -62,6 +66,7 @@ function decodeMutation(mutation: EncodedMutation): SyncMutation {
     return {
         ...mutation,
         data: mutation.data ? base64ToBytes(mutation.data) : undefined,
+        contentBytes: mutation.contentBytes ? base64ToBytes(mutation.contentBytes) : undefined,
     };
 }
 
@@ -69,6 +74,7 @@ function encodeServerChange(change: ServerChange): EncodedServerChange {
     return {
         ...change,
         data: change.data ? bytesToBase64(change.data) : undefined,
+        contentBytes: change.contentBytes ? bytesToBase64(change.contentBytes) : undefined,
         yjsState: change.yjsState ? bytesToBase64(change.yjsState) : undefined,
     };
 }
@@ -77,6 +83,7 @@ function decodeServerChange(change: EncodedServerChange): ServerChange {
     return {
         ...change,
         data: change.data ? base64ToBytes(change.data) : undefined,
+        contentBytes: change.contentBytes ? base64ToBytes(change.contentBytes) : undefined,
         yjsState: change.yjsState ? base64ToBytes(change.yjsState) : undefined,
     };
 }
@@ -238,8 +245,12 @@ export function decodeUpdateBatchJsonl(jsonl: string): SyncMutation[] {
             path,
             toPath: row.toPath,
             data: row.data ? base64ToBytes(row.data) : undefined,
+            contentBytes: row.contentBytes ? base64ToBytes(row.contentBytes) : undefined,
             isFolder: row.isFolder,
             isYjs: row.isYjs,
+            storageKind: row.storageKind,
+            byteSize: row.byteSize,
+            contentSha256: row.contentSha256,
             created: row.created,
         });
     }

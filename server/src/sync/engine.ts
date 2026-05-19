@@ -1,5 +1,6 @@
 import { sql } from "bun";
 import { DocSyncPath, opType, ServerChange, SyncMutation, wsPacket } from "../../../shared/types";
+import { isPluginInternalPath, shouldUseYjs } from "../../../shared/pathPolicy";
 import { folderDescendantLike } from "../sqlUtils";
 import * as Y from "yjs";
 import {
@@ -8,6 +9,7 @@ import {
   encodeMissingUpdate,
   replayYjsPayloads,
 } from "../yjs/apply";
+import { createLargeObject, readLargeObject, readLargeObjectRange, unlinkLargeObject } from "../db/largeObject";
 
 export type CompactionConfig = {
   count: number;
@@ -36,6 +38,11 @@ type RevisionRow = {
 export type ServerFileRow = {
   path: string;
   content: string | null;
+  contentBytes: Uint8Array | null;
+  contentOid: number | null;
+  storageKind: "text" | "bytea" | "lo";
+  byteSize: string | null;
+  contentSha256: string | null;
   yjsState: Uint8Array | null;
   isFolder: boolean;
   isYjs: boolean;
@@ -52,6 +59,10 @@ export type EventRow = {
   path: string;
   toPath: string | null;
   content: string | null;
+  contentBytes: Uint8Array | null;
+  storageKind: "text" | "bytea" | "lo" | null;
+  byteSize: string | null;
+  contentSha256: string | null;
   payload: Uint8Array | null;
   compacted: boolean;
   isFolder: boolean | null;
@@ -103,6 +114,11 @@ export async function getFile(path: string): Promise<ServerFileRow | null> {
     SELECT
       path,
       content,
+      content_bytes AS "contentBytes",
+      content_oid AS "contentOid",
+      storage_kind AS "storageKind",
+      byte_size::TEXT AS "byteSize",
+      content_sha256 AS "contentSha256",
       yjs_state AS "yjsState",
       is_folder AS "isFolder",
       is_yjs AS "isYjs",
@@ -125,6 +141,10 @@ export async function listSyncEvents(path: string): Promise<EventRow[]> {
       path,
       to_path AS "toPath",
       content,
+      content_bytes AS "contentBytes",
+      storage_kind AS "storageKind",
+      byte_size::TEXT AS "byteSize",
+      content_sha256 AS "contentSha256",
       payload,
       compacted,
       is_folder AS "isFolder",
@@ -167,9 +187,13 @@ function rowToSnapshotChange(row: ServerFileRow): ServerChange {
     operation: row.deleted ? "Delete" : row.isFolder ? "CreateFolder" : "UpsertFile",
     path: row.path,
     content: row.content ?? undefined,
+    contentBytes: row.storageKind === "bytea" ? row.contentBytes ?? undefined : undefined,
     yjsState: row.isYjs && !row.deleted && row.yjsState ? row.yjsState : undefined,
     isFolder: row.isFolder,
     isYjs: row.isYjs,
+    storageKind: row.storageKind,
+    byteSize: row.byteSize ? Number.parseInt(row.byteSize, 10) : undefined,
+    contentSha256: row.contentSha256 ?? undefined,
     created: new Date(row.createdAt).getTime(),
   };
 }
@@ -183,9 +207,13 @@ function rowToChange(row: EventRow): ServerChange {
     path: row.path,
     toPath: row.toPath ?? undefined,
     content: row.content ?? undefined,
+    contentBytes: row.storageKind === "bytea" ? row.contentBytes ?? undefined : undefined,
     data: row.payload ?? undefined,
     isFolder: row.isFolder ?? undefined,
     isYjs: row.isYjs ?? undefined,
+    storageKind: row.storageKind ?? undefined,
+    byteSize: row.byteSize ? Number.parseInt(row.byteSize, 10) : undefined,
+    contentSha256: row.contentSha256 ?? undefined,
     created: new Date(row.createdAt).getTime(),
   };
 }
@@ -195,6 +223,11 @@ export async function snapshotPacket(): Promise<Extract<wsPacket, { type: opType
     SELECT
       path,
       content,
+      content_bytes AS "contentBytes",
+      content_oid AS "contentOid",
+      storage_kind AS "storageKind",
+      byte_size::TEXT AS "byteSize",
+      content_sha256 AS "contentSha256",
       yjs_state AS "yjsState",
       is_folder AS "isFolder",
       is_yjs AS "isYjs",
@@ -222,6 +255,10 @@ export async function changeBatchPacket(fromRevision: string): Promise<Extract<w
       path,
       to_path AS "toPath",
       content,
+      content_bytes AS "contentBytes",
+      storage_kind AS "storageKind",
+      byte_size::TEXT AS "byteSize",
+      content_sha256 AS "contentSha256",
       payload,
       compacted,
       is_folder AS "isFolder",
@@ -273,6 +310,10 @@ export async function registerClient(
 }
 
 async function applyMutation(tx: typeof sql, clientId: string, mutation: SyncMutation): Promise<string> {
+  if (isPluginInternalPath(mutation.path) || (mutation.toPath && isPluginInternalPath(mutation.toPath))) {
+    throw new Error(`Refusing to sync plugin-internal path: ${mutation.toPath ?? mutation.path}`);
+  }
+
   const existing = await tx<RevisionRow[]>`
     SELECT revision::TEXT AS revision
     FROM sync_events
@@ -291,7 +332,11 @@ async function applyMutation(tx: typeof sql, clientId: string, mutation: SyncMut
       path,
       to_path,
       content,
+      content_bytes,
       payload,
+      storage_kind,
+      byte_size,
+      content_sha256,
       is_folder,
       is_yjs
     )
@@ -302,7 +347,11 @@ async function applyMutation(tx: typeof sql, clientId: string, mutation: SyncMut
       ${mutation.path},
       ${mutation.toPath ?? null},
       ${mutation.operation === "YjsUpdate" ? null : mutation.content ?? null},
+      ${mutation.operation === "UpsertFile" ? mutation.contentBytes ?? null : null},
       ${mutation.data ?? null},
+      ${mutation.storageKind ?? null},
+      ${mutation.byteSize ?? null},
+      ${mutation.contentSha256 ?? null},
       ${mutation.isFolder ?? null},
       ${mutation.isYjs ?? null}
     )
@@ -311,11 +360,23 @@ async function applyMutation(tx: typeof sql, clientId: string, mutation: SyncMut
   const revision = inserted[0].revision;
 
   if (mutation.operation === "CreateFolder") {
+    const rows = await tx<{ contentOid: number | null }[]>`
+      SELECT content_oid AS "contentOid"
+      FROM files
+      WHERE path = ${mutation.path}
+      FOR UPDATE;
+    `;
+    await unlinkLargeObject(rows[0]?.contentOid, tx);
     await tx`
       INSERT INTO files (path, content, yjs_state, is_folder, is_yjs, deleted, revision, updated_at)
       VALUES (${mutation.path}, NULL, NULL, TRUE, FALSE, FALSE, ${revision}, NOW())
       ON CONFLICT (path) DO UPDATE SET
         content = NULL,
+        content_bytes = NULL,
+        content_oid = NULL,
+        storage_kind = 'text',
+        byte_size = NULL,
+        content_sha256 = NULL,
         yjs_state = NULL,
         is_folder = TRUE,
         is_yjs = FALSE,
@@ -324,13 +385,63 @@ async function applyMutation(tx: typeof sql, clientId: string, mutation: SyncMut
         updated_at = NOW();
     `;
   } else if (mutation.operation === "UpsertFile") {
-    const isYjs = mutation.isYjs ?? mutation.path.endsWith(".md");
+    const isYjs = mutation.isYjs ?? shouldUseYjs(mutation.path);
+    const storageKind = mutation.storageKind ?? (isYjs ? "text" : mutation.contentBytes ? "bytea" : "text");
     const yjsState = isYjs ? docStateFromContent(mutation.content ?? "") : null;
+    const existingFile = await tx<{ contentOid: number | null }[]>`
+      SELECT content_oid AS "contentOid"
+      FROM files
+      WHERE path = ${mutation.path}
+      FOR UPDATE;
+    `;
+    const previousOid = existingFile[0]?.contentOid ?? null;
+    const contentOid = storageKind === "lo" && mutation.contentBytes
+      ? (await createLargeObject(mutation.contentBytes, tx)).oid
+      : null;
+    if (previousOid && (storageKind !== "lo" || contentOid)) {
+      await unlinkLargeObject(previousOid, tx);
+    }
     await tx`
-      INSERT INTO files (path, content, yjs_state, is_folder, is_yjs, deleted, revision, updated_at)
-      VALUES (${mutation.path}, ${mutation.content ?? ""}, ${yjsState}, FALSE, ${isYjs}, FALSE, ${revision}, NOW())
+      INSERT INTO files (
+        path,
+        content,
+        content_bytes,
+        content_oid,
+        storage_kind,
+        byte_size,
+        content_sha256,
+        yjs_state,
+        is_folder,
+        is_yjs,
+        deleted,
+        revision,
+        updated_at
+      )
+      VALUES (
+        ${mutation.path},
+        ${storageKind === "text" ? mutation.content ?? "" : null},
+        ${storageKind === "bytea" ? mutation.contentBytes ?? null : null},
+        ${contentOid},
+        ${storageKind},
+        ${mutation.byteSize ?? (mutation.contentBytes?.byteLength ?? (mutation.content ? new TextEncoder().encode(mutation.content).byteLength : null))},
+        ${mutation.contentSha256 ?? null},
+        ${yjsState},
+        FALSE,
+        ${isYjs},
+        FALSE,
+        ${revision},
+        NOW()
+      )
       ON CONFLICT (path) DO UPDATE SET
         content = EXCLUDED.content,
+        content_bytes = EXCLUDED.content_bytes,
+        content_oid = CASE
+          WHEN EXCLUDED.storage_kind = 'lo' AND EXCLUDED.content_oid IS NULL THEN files.content_oid
+          ELSE EXCLUDED.content_oid
+        END,
+        storage_kind = EXCLUDED.storage_kind,
+        byte_size = EXCLUDED.byte_size,
+        content_sha256 = EXCLUDED.content_sha256,
         yjs_state = EXCLUDED.yjs_state,
         is_folder = FALSE,
         is_yjs = EXCLUDED.is_yjs,
@@ -342,18 +453,24 @@ async function applyMutation(tx: typeof sql, clientId: string, mutation: SyncMut
     if (!mutation.data) {
       throw new Error(`Yjs update for ${mutation.path} is missing payload`);
     }
-    const current = await tx<{ yjsState: Uint8Array | null }[]>`
-      SELECT yjs_state AS "yjsState"
+    const current = await tx<{ yjsState: Uint8Array | null; contentOid: number | null }[]>`
+      SELECT yjs_state AS "yjsState", content_oid AS "contentOid"
       FROM files
       WHERE path = ${mutation.path}
       FOR UPDATE;
     `;
+    await unlinkLargeObject(current[0]?.contentOid, tx);
     const next = applyYjsPayload(current[0]?.yjsState ?? null, mutation.data);
     await tx`
       INSERT INTO files (path, content, yjs_state, is_folder, is_yjs, deleted, revision, updated_at)
       VALUES (${mutation.path}, ${next.content}, ${next.state}, FALSE, TRUE, FALSE, ${revision}, NOW())
       ON CONFLICT (path) DO UPDATE SET
         content = EXCLUDED.content,
+        content_bytes = NULL,
+        content_oid = NULL,
+        storage_kind = 'text',
+        byte_size = OCTET_LENGTH(EXCLUDED.content),
+        content_sha256 = NULL,
         yjs_state = EXCLUDED.yjs_state,
         is_folder = FALSE,
         is_yjs = TRUE,
@@ -363,19 +480,44 @@ async function applyMutation(tx: typeof sql, clientId: string, mutation: SyncMut
     `;
   } else if (mutation.operation === "Delete") {
     if (mutation.isFolder) {
+      const rows = await tx<{ contentOid: number | null }[]>`
+        SELECT content_oid AS "contentOid"
+        FROM files
+        WHERE path = ${mutation.path}
+           OR path LIKE ${folderDescendantLike(mutation.path)} ESCAPE '\\'
+        FOR UPDATE;
+      `;
+      for (const row of rows) {
+        await unlinkLargeObject(row.contentOid, tx);
+      }
       await tx`
         UPDATE files
         SET deleted = TRUE,
+            content = NULL,
+            content_bytes = NULL,
+            content_oid = NULL,
+            content_sha256 = NULL,
             revision = ${revision},
             updated_at = NOW()
         WHERE path = ${mutation.path}
            OR path LIKE ${folderDescendantLike(mutation.path)} ESCAPE '\\';
       `;
     } else {
+      const rows = await tx<{ contentOid: number | null }[]>`
+        SELECT content_oid AS "contentOid"
+        FROM files
+        WHERE path = ${mutation.path}
+        FOR UPDATE;
+      `;
+      await unlinkLargeObject(rows[0]?.contentOid, tx);
       await tx`
         INSERT INTO files (path, content, yjs_state, is_folder, is_yjs, deleted, revision, updated_at)
         VALUES (${mutation.path}, NULL, NULL, FALSE, FALSE, TRUE, ${revision}, NOW())
         ON CONFLICT (path) DO UPDATE SET
+          content = NULL,
+          content_bytes = NULL,
+          content_oid = NULL,
+          content_sha256 = NULL,
           deleted = TRUE,
           revision = EXCLUDED.revision,
           updated_at = NOW();
@@ -410,6 +552,126 @@ async function applyMutation(tx: typeof sql, clientId: string, mutation: SyncMut
   }
 
   return revision;
+}
+
+export type BlobMetadata = {
+  path: string;
+  contentOid: number | null;
+  byteSize: number | null;
+  contentSha256: string | null;
+  revision: string;
+};
+
+type BlobMetadataRow = Omit<BlobMetadata, "byteSize"> & {
+  byteSize: string | null;
+};
+
+function rowToBlobMetadata(row: BlobMetadataRow): BlobMetadata {
+  return {
+    ...row,
+    byteSize: row.byteSize ? Number.parseInt(row.byteSize, 10) : null,
+  };
+}
+
+export async function putBlobFile(
+  path: string,
+  data: Uint8Array | ReadableStream<Uint8Array>,
+  contentSha256: string | null,
+): Promise<BlobMetadata> {
+  if (isPluginInternalPath(path)) {
+    throw new Error(`Refusing to sync plugin-internal path: ${path}`);
+  }
+  return sql.begin(async tx => {
+    const existing = await tx<{ contentOid: number | null }[]>`
+      SELECT content_oid AS "contentOid"
+      FROM files
+      WHERE path = ${path}
+      FOR UPDATE;
+    `;
+    await unlinkLargeObject(existing[0]?.contentOid, tx);
+    const written = await createLargeObject(data, tx);
+    const revision = await getServerRevision();
+    const rows = await tx<BlobMetadataRow[]>`
+      INSERT INTO files (
+        path,
+        content,
+        content_bytes,
+        content_oid,
+        storage_kind,
+        byte_size,
+        content_sha256,
+        yjs_state,
+        is_folder,
+        is_yjs,
+        deleted,
+        revision,
+        updated_at
+      )
+      VALUES (${path}, NULL, NULL, ${written.oid}, 'lo', ${written.byteSize}, ${contentSha256}, NULL, FALSE, FALSE, FALSE, ${revision}, NOW())
+      ON CONFLICT (path) DO UPDATE SET
+        content = NULL,
+        content_bytes = NULL,
+        content_oid = EXCLUDED.content_oid,
+        storage_kind = 'lo',
+        byte_size = EXCLUDED.byte_size,
+        content_sha256 = EXCLUDED.content_sha256,
+        yjs_state = NULL,
+        is_folder = FALSE,
+        is_yjs = FALSE,
+        deleted = FALSE,
+        updated_at = NOW()
+      RETURNING path, content_oid AS "contentOid", byte_size::TEXT AS "byteSize", content_sha256 AS "contentSha256", revision::TEXT AS revision;
+    `;
+    return rowToBlobMetadata(rows[0]!);
+  });
+}
+
+export function streamBlobFile(metadata: BlobMetadata): ReadableStream<Uint8Array> {
+  const oid = metadata.contentOid;
+  if (!oid) {
+    throw new Error("Blob metadata is missing content OID");
+  }
+  const total = metadata.byteSize ?? 0;
+  const chunkSize = 1024 * 1024;
+  let offset = 0;
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (offset >= total) {
+        controller.close();
+        return;
+      }
+      const length = Math.min(chunkSize, total - offset);
+      const chunk = await readLargeObjectRange(oid, offset, length);
+      offset += chunk.byteLength;
+      if (chunk.byteLength === 0) {
+        controller.close();
+        return;
+      }
+      controller.enqueue(chunk);
+    },
+  });
+}
+
+export async function getBlobMetadata(path: string): Promise<BlobMetadata | null> {
+  const rows = await sql<BlobMetadataRow[]>`
+    SELECT path, content_oid AS "contentOid", byte_size::TEXT AS "byteSize", content_sha256 AS "contentSha256", revision::TEXT AS revision
+    FROM files
+    WHERE path = ${path}
+      AND deleted = FALSE
+      AND storage_kind = 'lo';
+  `;
+  return rows[0] ? rowToBlobMetadata(rows[0]) : null;
+}
+
+export async function readBlobFile(path: string): Promise<{ bytes: Uint8Array; metadata: BlobMetadata } | null> {
+  const metadata = await getBlobMetadata(path);
+  if (!metadata?.contentOid) {
+    return null;
+  }
+  return {
+    metadata,
+    bytes: await readLargeObject(metadata.contentOid),
+  };
 }
 
 export async function acceptMutations(clientId: string, mutations: SyncMutation[]): Promise<string> {
@@ -516,6 +778,27 @@ export async function compactYjsEvents(): Promise<void> {
       `;
     });
   }
+}
+
+export async function compactMaterializedSyncEvents(): Promise<string> {
+  return sql.begin(async tx => {
+    const rows = await tx<RevisionRow[]>`
+      SELECT COALESCE(MAX(revision), 0)::TEXT AS revision
+      FROM sync_events;
+    `;
+    const revision = latestRevisionFromRows(rows);
+    if (revision === "0") {
+      return await getCompactedRevision();
+    }
+
+    await tx`
+      UPDATE server_meta
+      SET compacted_revision = GREATEST(compacted_revision, ${revision}::BIGINT)
+      WHERE id = 1;
+    `;
+    await tx`DELETE FROM sync_events WHERE revision <= ${revision}::BIGINT;`;
+    return revision;
+  });
 }
 
 export async function handlePull(packet: Extract<wsPacket, { type: opType.PullSince }>): Promise<wsPacket> {

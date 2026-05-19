@@ -4,7 +4,8 @@
     "dev": "bun run --hot src/index.ts",
     "test": "bun test",
     "test:unit": "bun test src/yjs src/sqlUtils",
-    "test:integration": "bun test src/sync/engine.integration.test.ts"
+    "test:integration": "bun test src/sync/engine.integration.test.ts",
+    "test:integration:docker": "bash ./test_integration_docker.sh"
   },
   "dependencies": {
     "hono": "^4.12.15",

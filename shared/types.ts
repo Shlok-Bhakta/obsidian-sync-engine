@@ -15,9 +15,13 @@ export type SyncMutation = {
     path: Path;
     toPath?: Path;
     content?: string;
+    contentBytes?: Uint8Array;
     data?: Uint8Array;
     isFolder?: boolean;
     isYjs?: boolean;
+    storageKind?: "text" | "bytea" | "lo";
+    byteSize?: number;
+    contentSha256?: string;
     created: number;
 };
 
@@ -49,6 +53,23 @@ export type DocSyncResult = {
     yjsState: Uint8Array;
 };
 
+export type BootstrapStatusValue =
+    | "building"
+    | "ready"
+    | "downloaded"
+    | "expired"
+    | "failed";
+
+export type BootstrapStatus = {
+    type: opType.BootstrapStatus;
+    status: BootstrapStatusValue;
+    vaultName: string;
+    downloadUrl?: string;
+    expiresAt?: number;
+    remainingMs?: number;
+    message?: string;
+};
+
 export enum opType {
     Ack = "Ack",
     BatchAck = "BatchAck",
@@ -61,6 +82,8 @@ export enum opType {
     InitRequired = "InitRequired",
     ChangeBatch = "ChangeBatch",
     SnapshotReset = "SnapshotReset",
+    BootstrapCreate = "BootstrapCreate",
+    BootstrapStatus = "BootstrapStatus",
     Auth = "Auth",
     AuthAck = "AuthAck",
     Deny = "Deny",
@@ -112,6 +135,14 @@ export type wsPacket =
         targetRevision: Revision;
         files: ServerChange[];
     }
+    | {
+        type: opType.BootstrapCreate;
+        vaultName: string;
+        backendUrl: string;
+        configDir: string;
+        pluginId: string;
+    }
+    | BootstrapStatus
     | {
         type: opType.Auth;
         clientId: string;

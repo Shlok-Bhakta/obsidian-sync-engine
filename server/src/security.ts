@@ -31,21 +31,22 @@ export async function validateClientKey(clientKey: string): Promise<boolean> {
 }
 
 export async function rotateClientKey(clientKey: string): Promise<ClientKeyRotationResult> {
-    if(!isClientKeyShape(clientKey)){
-        return { authenticated: false };
-    }
-
     return sql.begin(async tx => {
         await tx`SELECT pg_advisory_xact_lock(918342781);`;
         const zerocheck = await tx<ClientKeyCount[]>`SELECT COUNT(valid) FROM client_keys`;
         const rowcount = parseInt(zerocheck[0]?.count ?? "0", 10);
         if(rowcount === 0){
+            const key = generateClientKey();
             const inserted = await tx<ClientKeyRow[]>`
                 INSERT INTO client_keys (client_key, previous_key_id, valid)
-                VALUES (${clientKey}, NULL, TRUE)
+                VALUES (${key}, NULL, TRUE)
                 RETURNING id, client_key AS "clientKey", valid;
             `;
-            return { authenticated: true, clientKey, currentKeyId: inserted[0].id, previousKeyId: null };
+            return { authenticated: true, clientKey: key, currentKeyId: inserted[0].id, previousKeyId: null };
+        }
+
+        if(!isClientKeyShape(clientKey)){
+            return { authenticated: false };
         }
 
         const existing = await tx<ClientKeyRow[]>`

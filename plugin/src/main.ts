@@ -1,19 +1,19 @@
-import { MarkdownView, Notice, Plugin, TAbstractFile, TFolder } from 'obsidian';
+import { MarkdownView, Notice, Plugin, TAbstractFile, TFile, TFolder } from 'obsidian';
 import * as Y from 'yjs';
 import {DEFAULT_SETTINGS, SyncEngineSettings, SyncEngineSettingTab} from "./settings";
 import { JsonlOutboxStore, OutboxStore } from 'db/db';
 import { EditorView, ViewUpdate } from "@codemirror/view";
-import { outboxData, Path } from "../../shared/types";
+import { BootstrapStatus, outboxData, Path } from "../../shared/types";
 import { DocSync } from 'yjs/DocSync';
 import { SyncClient } from 'sync/SyncClient';
 import { fileForEditorView } from 'utils/editorFile';
 import { YjsStateStore } from 'yjs/YjsStateStore';
 import { VaultYjsIndexer } from 'yjs/VaultYjsIndexer';
 import { docStateFromContent } from "../../shared/yjsSeed";
+import { isPluginInternalPath, shouldSyncPath, shouldUseYjs } from "../../shared/pathPolicy";
 
-function generateClientKey(): string {
-	return "obs_sync_" + crypto.randomUUID();
-}
+const INLINE_BYTES_LIMIT = 64 * 1024;
+const CONFIG_DIR_POLL_MS = 2000;
 
 function generateClientId(): string {
 	return "obs_client_" + crypto.randomUUID();
@@ -32,6 +32,10 @@ export default class SyncEngine extends Plugin {
 	yjsStateStore: YjsStateStore;
 	yjsIndexer: VaultYjsIndexer;
 	syncClient: SyncClient;
+	bootstrapStatus: BootstrapStatus | null = null;
+	private bootstrapStatusListeners: Set<() => void> = new Set();
+	private pendingFileTimers: Map<Path, number> = new Map();
+	private configDirStats: Map<Path, string> = new Map();
 	async onload() {
 		await this.loadSettings();
 		this.db = new JsonlOutboxStore(this.app, this.manifest);
@@ -44,7 +48,7 @@ export default class SyncEngine extends Plugin {
 		this.yjsIndexer = new VaultYjsIndexer(
 			this.app,
 			this.yjsStateStore,
-			(path) => this.isPluginPrivatePath(path),
+			(path) => !shouldUseYjs(path, this.app.vault.configDir) || this.isPluginInternalPath(path),
 		);
 		this.syncClient = new SyncClient(
 			this.app,
@@ -66,11 +70,18 @@ export default class SyncEngine extends Plugin {
 				await this.saveSettings();
 			},
 			(path) => this.docs.get(path),
+			(status) => {
+				this.bootstrapStatus = status;
+				for (const listener of this.bootstrapStatusListeners) {
+					listener();
+				}
+			},
 		);
 		this.app.workspace.onLayoutReady(() => {
 			this.yjsIndexer.start();
 			void this.yjsIndexer.waitForInitialScan().finally(() => {
 				this.syncClient.start();
+				this.startConfigDirPoller();
 			});
 		});
 
@@ -79,9 +90,11 @@ export default class SyncEngine extends Plugin {
 		}));
 		this.registerEvent(this.app.vault.on("create", file => {
 			void this.yjsIndexer.ensureFile(file);
+			void this.queueNonMarkdownUpsert(file);
 		}));
 		this.registerEvent(this.app.vault.on("modify", file => {
 			void this.yjsIndexer.ensureFile(file);
+			void this.queueNonMarkdownUpsert(file);
 		}));
 		this.registerEvent(this.app.vault.on("delete", file => {
 			void this.enqueueLocalDelete(file).catch(error => {
@@ -113,6 +126,9 @@ export default class SyncEngine extends Plugin {
 				return;
 			}
 			const pathID = file.path;
+			if (!shouldUseYjs(pathID, this.app.vault.configDir)) {
+				return;
+			}
 			void this.handleEditorChange(update, pathID);
 		});
 	}
@@ -160,7 +176,7 @@ export default class SyncEngine extends Plugin {
 	}
 
 	private async enqueueLocalDelete(file: TAbstractFile): Promise<void> {
-		if (this.syncClient?.isApplyingRemoteChanges() || this.isPluginPrivatePath(file.path)) {
+		if (this.syncClient?.isApplyingRemoteChanges() || !shouldSyncPath(file.path, this.app.vault.configDir, this.manifest.id)) {
 			return;
 		}
 		await this.db.putInOutbox({
@@ -174,7 +190,11 @@ export default class SyncEngine extends Plugin {
 	}
 
 	private async enqueueLocalRename(file: TAbstractFile, oldPath: string): Promise<void> {
-		if (this.syncClient?.isApplyingRemoteChanges() || this.isPluginPrivatePath(oldPath) || this.isPluginPrivatePath(file.path)) {
+		if (
+			this.syncClient?.isApplyingRemoteChanges() ||
+			!shouldSyncPath(oldPath, this.app.vault.configDir, this.manifest.id) ||
+			!shouldSyncPath(file.path, this.app.vault.configDir, this.manifest.id)
+		) {
 			return;
 		}
 		await this.db.putInOutbox({
@@ -183,6 +203,80 @@ export default class SyncEngine extends Plugin {
 			path: oldPath,
 			toPath: file.path,
 			isFolder: file instanceof TFolder,
+			created: Date.now(),
+		});
+		this.syncClient.wakeSoon();
+	}
+
+	private startConfigDirPoller(): void {
+		void this.scanConfigDirForChanges(true);
+		this.registerInterval(window.setInterval(() => {
+			void this.scanConfigDirForChanges(false);
+		}, CONFIG_DIR_POLL_MS));
+	}
+
+	private async scanConfigDirForChanges(enqueueCurrent: boolean): Promise<void> {
+		if (this.syncClient?.isApplyingRemoteChanges()) {
+			return;
+		}
+		const seen = new Set<string>();
+		for (const path of await this.listConfigDirFiles(this.app.vault.configDir)) {
+			if (!shouldSyncPath(path, this.app.vault.configDir, this.manifest.id) || shouldUseYjs(path, this.app.vault.configDir)) {
+				continue;
+			}
+			const stat = await this.app.vault.adapter.stat(path);
+			if (!stat || stat.type !== "file") {
+				continue;
+			}
+			seen.add(path);
+			const fingerprint = `${stat.mtime}:${stat.size}`;
+			if (this.configDirStats.get(path) === fingerprint) {
+				continue;
+			}
+			this.configDirStats.set(path, fingerprint);
+			if (enqueueCurrent) {
+				void this.queuePathUpsert(path).catch(error => {
+					new Notice(`Sync outbox write failed: ${errorMessage(error)}`);
+				});
+			} else {
+				this.queuePathUpsertDebounced(path);
+			}
+		}
+
+		for (const path of [...this.configDirStats.keys()]) {
+			if (seen.has(path)) {
+				continue;
+			}
+			this.configDirStats.delete(path);
+			if (shouldSyncPath(path, this.app.vault.configDir, this.manifest.id)) {
+				void this.enqueueLocalPathDelete(path).catch(error => {
+					new Notice(`Sync outbox write failed: ${errorMessage(error)}`);
+				});
+			}
+		}
+	}
+
+	private async listConfigDirFiles(dir: string): Promise<string[]> {
+		if (!(await this.app.vault.adapter.exists(dir))) {
+			return [];
+		}
+		const listed = await this.app.vault.adapter.list(dir);
+		const files = [...listed.files];
+		for (const folder of listed.folders) {
+			files.push(...await this.listConfigDirFiles(folder));
+		}
+		return files;
+	}
+
+	private async enqueueLocalPathDelete(path: string): Promise<void> {
+		if (this.syncClient?.isApplyingRemoteChanges() || !shouldSyncPath(path, this.app.vault.configDir, this.manifest.id)) {
+			return;
+		}
+		await this.db.putInOutbox({
+			mutationId: crypto.randomUUID(),
+			operation: "Delete",
+			path,
+			isFolder: false,
 			created: Date.now(),
 		});
 		this.syncClient.wakeSoon();
@@ -232,11 +326,76 @@ export default class SyncEngine extends Plugin {
 		return false;
 	}
 
-	private isPluginPrivatePath(path: string): boolean {
-		return path.startsWith(`${this.app.vault.configDir}/`);
+	private queueNonMarkdownUpsert(file: TAbstractFile): void {
+		if (
+			this.syncClient?.isApplyingRemoteChanges() ||
+			!(file instanceof TFile) ||
+			shouldUseYjs(file.path, this.app.vault.configDir) ||
+			!shouldSyncPath(file.path, this.app.vault.configDir, this.manifest.id)
+		) {
+			return;
+		}
+		this.queuePathUpsertDebounced(file.path);
+	}
+
+	private queuePathUpsertDebounced(path: string): void {
+		const existing = this.pendingFileTimers.get(path);
+		if (existing !== undefined) {
+			window.clearTimeout(existing);
+		}
+		const timer = window.setTimeout(() => {
+			this.pendingFileTimers.delete(path);
+			void this.queuePathUpsert(path).catch(error => {
+				new Notice(`Sync outbox write failed: ${errorMessage(error)}`);
+			});
+		}, 500);
+		this.pendingFileTimers.set(path, timer);
+	}
+
+	private async queuePathUpsert(path: string): Promise<void> {
+		if (this.syncClient?.isApplyingRemoteChanges() || !shouldSyncPath(path, this.app.vault.configDir, this.manifest.id)) {
+			return;
+		}
+		const bytes = new Uint8Array(await this.app.vault.adapter.readBinary(path));
+		if (bytes.byteLength > INLINE_BYTES_LIMIT) {
+			const metadata = await this.syncClient.uploadBlob(path, bytes);
+			await this.db.putInOutbox({
+				mutationId: crypto.randomUUID(),
+				operation: "UpsertFile",
+				path,
+				isFolder: false,
+				isYjs: false,
+				storageKind: "lo",
+				byteSize: metadata.byteSize,
+				contentSha256: metadata.contentSha256,
+				created: Date.now(),
+			});
+			this.syncClient.wakeSoon();
+			return;
+		}
+		await this.db.putInOutbox({
+			mutationId: crypto.randomUUID(),
+			operation: "UpsertFile",
+			path,
+			contentBytes: bytes,
+			isFolder: false,
+			isYjs: false,
+			storageKind: "bytea",
+			byteSize: bytes.byteLength,
+			created: Date.now(),
+		});
+		this.syncClient.wakeSoon();
+	}
+
+	private isPluginInternalPath(path: string): boolean {
+		return isPluginInternalPath(path, this.app.vault.configDir, this.manifest.id);
 	}
 
 	onunload() {
+		for (const timer of this.pendingFileTimers.values()) {
+			window.clearTimeout(timer);
+		}
+		this.pendingFileTimers.clear();
 		this.syncClient?.stop();
 		this.yjsIndexer?.stop();
 		void this.db.close().catch(error => {
@@ -246,13 +405,6 @@ export default class SyncEngine extends Plugin {
 
 	async loadSettings() {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData() as Partial<SyncEngineSettings>);
-		if (!this.settings.clientKey.trim() || this.settings.clientKey === DEFAULT_SETTINGS.clientKey) {
-			this.settings = {
-				...this.settings,
-				clientKey: generateClientKey(),
-			};
-			await this.saveSettings();
-		}
 		if (!this.settings.clientId.trim()) {
 			this.settings = {
 				...this.settings,
@@ -275,5 +427,18 @@ export default class SyncEngine extends Plugin {
 
 	updateSyncSettings() {
 		this.syncClient?.updateSettings(this.settings);
+	}
+
+	subscribeBootstrapStatus(listener: () => void): () => void {
+		this.bootstrapStatusListeners.add(listener);
+		return () => this.bootstrapStatusListeners.delete(listener);
+	}
+
+	async generateVaultLink(): Promise<void> {
+		await this.syncClient.generateBootstrapLink(
+			this.app.vault.getName(),
+			this.app.vault.configDir,
+			this.manifest.id,
+		);
 	}
 }

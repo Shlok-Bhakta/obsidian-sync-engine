@@ -83,6 +83,52 @@ describe("encodePacket / decodePacket", () => {
         expect(decodePacket(encodePacket(packet))).toEqual(packet);
     });
 
+    it("round-trips BootstrapCreate and BootstrapStatus", () => {
+        const create = {
+            type: opType.BootstrapCreate as const,
+            vaultName: "Work Vault",
+            backendUrl: "https://sync.example.com",
+            configDir: ".obsidian",
+            pluginId: "obsidian-sync-engine",
+        };
+        const status = {
+            type: opType.BootstrapStatus as const,
+            status: "ready" as const,
+            vaultName: "Work Vault",
+            downloadUrl: "https://sync.example.com/v1/bootstrap/token",
+            expiresAt: 1_700_000_000_000,
+            remainingMs: 600_000,
+        };
+
+        expect(decodePacket(encodePacket(create))).toEqual(create);
+        expect(decodePacket(encodePacket(status))).toEqual(status);
+    });
+
+    it("round-trips BYTEA file bodies", () => {
+        const contentBytes = new Uint8Array([123, 34, 97, 34, 58, 49, 125]);
+        const packet = {
+            type: opType.ChangeBatch as const,
+            fromRevision: "1",
+            serverRevision: "2",
+            changes: [{
+                revision: "2",
+                clientId: "client",
+                mutationId: "m-1",
+                operation: "UpsertFile" as const,
+                path: ".obsidian/workspace.json",
+                contentBytes,
+                storageKind: "bytea" as const,
+                byteSize: contentBytes.byteLength,
+                contentSha256: "sha",
+                isFolder: false,
+                isYjs: false,
+                created: 1,
+            }],
+        };
+
+        expect(decodePacket(encodePacket(packet))).toEqual(packet);
+    });
+
     it("rejects invalid JSON", () => {
         expect(() => decodePacket("{not json")).toThrow("not valid JSON");
     });
@@ -114,6 +160,23 @@ describe("decodeUpdateBatchJsonl", () => {
         expect(mutations[0]?.path).toBe("notes/a.md");
         expect(mutations[0]?.data).toEqual(new Uint8Array([9, 8, 7]));
         expect(mutations[0]?.content).toBeUndefined();
+    });
+
+    it("parses BYTEA UpsertFile rows", () => {
+        const contentBytes = bytesToBase64(new Uint8Array([1, 2, 3]));
+        const jsonl = JSON.stringify({
+            id: 1,
+            mutationId: "m-1",
+            operation: "UpsertFile",
+            path: "asset.bin",
+            contentBytes,
+            storageKind: "bytea",
+            byteSize: 3,
+            created: 1,
+        });
+        const mutations = decodeUpdateBatchJsonl(jsonl);
+        expect(mutations[0]?.contentBytes).toEqual(new Uint8Array([1, 2, 3]));
+        expect(mutations[0]?.storageKind).toBe("bytea");
     });
 
     it("throws when path is missing", () => {
