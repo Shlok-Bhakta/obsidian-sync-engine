@@ -163,6 +163,80 @@ function serverPacketPaths(packet: wsPacket): string[] {
   throw new Error(`Expected server changes, got ${packet.type}`);
 }
 
+function docFromState(state: Uint8Array): Y.Doc {
+  const doc = new Y.Doc();
+  Y.applyUpdateV2(doc, state);
+  return doc;
+}
+
+async function currentServerDoc(path: string): Promise<Y.Doc> {
+  const file = await getFile(path);
+  expect(file?.yjsState).toBeInstanceOf(Uint8Array);
+  return docFromState(file!.yjsState!);
+}
+
+async function catchUpClientDoc(path: string, doc: Y.Doc): Promise<void> {
+  const ack = await handleDocSync([{
+    path,
+    stateVector: Y.encodeStateVector(doc),
+    content: readDoc(doc),
+  }]);
+  const syncResult = ack.paths.find(entry => entry.path === path);
+  expect(syncResult).toBeDefined();
+  if (syncResult!.data.length > 0) {
+    Y.applyUpdateV2(doc, syncResult!.data);
+  }
+}
+
+function expectMarkerOnce(content: string, marker: string): void {
+  expect(content.includes(marker)).toBe(true);
+  expect(content.indexOf(marker)).toBe(content.lastIndexOf(marker));
+}
+
+function percentile(values: number[], rank: number): number {
+  if (values.length === 0) {
+    return 0;
+  }
+  const sorted = [...values].sort((a, b) => a - b);
+  const index = Math.min(sorted.length - 1, Math.max(0, Math.ceil((rank / 100) * sorted.length) - 1));
+  return sorted[index]!;
+}
+
+function sum(values: number[]): number {
+  return values.reduce((total, value) => total + value, 0);
+}
+
+function formatMs(value: number): string {
+  return `${value.toFixed(2)}ms`;
+}
+
+function logLatencySummary(
+  label: string,
+  measurements: Record<string, number[]>,
+  counters: Record<string, number | string> = {},
+): void {
+  const rows = Object.entries(measurements).map(([name, values]) => ({
+    name,
+    count: values.length,
+    total: formatMs(sum(values)),
+    avg: formatMs(sum(values) / Math.max(values.length, 1)),
+    p50: formatMs(percentile(values, 50)),
+    p95: formatMs(percentile(values, 95)),
+    max: formatMs(Math.max(0, ...values)),
+  }));
+  console.info(`${label} counters`, counters);
+  console.table(rows);
+}
+
+async function measure<T>(bucket: number[], work: () => Promise<T>): Promise<T> {
+  const started = performance.now();
+  try {
+    return await work();
+  } finally {
+    bucket.push(performance.now() - started);
+  }
+}
+
 function readUint16(bytes: Uint8Array, offset: number): number {
   return bytes[offset] | (bytes[offset + 1] << 8);
 }
@@ -655,6 +729,99 @@ describeIntegration("sync engine postgres integration", () => {
     expect(fileAfterB?.content).toContain("hello");
     expect(fileAfterB?.content).toContain("from A");
     expect(fileAfterB?.content).toContain("from B");
+  });
+
+  it("many online edits converge after a heavily edited offline client reconnects", async () => {
+    setCompactionConfig({ count: 10000, bytes: 100 * 1024 * 1024 });
+    await seedMarkdownFile(CLIENT_A, NOTE_PATH, "seed\n");
+
+    const seeded = await getFile(NOTE_PATH);
+    expect(seeded?.yjsState).toBeInstanceOf(Uint8Array);
+
+    const offlineDoc = docFromState(seeded!.yjsState!);
+    const onlineClients = Array.from({ length: 5 }, (_, index) => ({
+      clientId: `integration-online-${index}`,
+      doc: docFromState(seeded!.yjsState!),
+      markers: [] as string[],
+    }));
+    const offlineMarkers: string[] = [];
+    const latencies = {
+      offlineLocalEdit: [] as number[],
+      onlineCatchUp: [] as number[],
+      onlineUpload: [] as number[],
+      offlineReconnectUpload: [] as number[],
+      finalCatchUp: [] as number[],
+      serverMaterializeRead: [] as number[],
+    };
+    for (const client of onlineClients) {
+      await ensureIntegrationClient(client.clientId);
+    }
+    await ensureIntegrationClient("integration-offline");
+
+    try {
+      for (let index = 0; index < 250; index++) {
+        const marker = `[offline-${index}]`;
+        const started = performance.now();
+        appendToDoc(offlineDoc, `${marker}\n`);
+        latencies.offlineLocalEdit.push(performance.now() - started);
+        offlineMarkers.push(marker);
+      }
+
+      for (let index = 0; index < 400; index++) {
+        const client = onlineClients[index % onlineClients.length]!;
+        await measure(latencies.onlineCatchUp, () => catchUpClientDoc(NOTE_PATH, client.doc));
+        const marker = `[${client.clientId}-${index}]`;
+        appendToDoc(client.doc, `${marker}\n`);
+        client.markers.push(marker);
+        await measure(
+          latencies.onlineUpload,
+          () => uploadYjsEdit(client.clientId, NOTE_PATH, client.doc, crypto.randomUUID()),
+        );
+      }
+
+      await measure(
+        latencies.offlineReconnectUpload,
+        () => uploadYjsEdit("integration-offline", NOTE_PATH, offlineDoc, crypto.randomUUID()),
+      );
+
+      const serverDoc = await measure(latencies.serverMaterializeRead, () => currentServerDoc(NOTE_PATH));
+      try {
+        const serverContent = readDoc(serverDoc);
+        expect((await getFile(NOTE_PATH))?.content).toBe(serverContent);
+
+        for (const marker of offlineMarkers) {
+          expectMarkerOnce(serverContent, marker);
+        }
+        for (const client of onlineClients) {
+          for (const marker of client.markers) {
+            expectMarkerOnce(serverContent, marker);
+          }
+        }
+
+        await measure(latencies.finalCatchUp, () => catchUpClientDoc(NOTE_PATH, offlineDoc));
+        expect(readDoc(offlineDoc)).toBe(serverContent);
+
+        for (const client of onlineClients) {
+          await measure(latencies.finalCatchUp, () => catchUpClientDoc(NOTE_PATH, client.doc));
+          expect(readDoc(client.doc)).toBe(serverContent);
+        }
+
+        logLatencySummary("offline reconnect convergence stress", latencies, {
+          onlineClients: onlineClients.length,
+          onlineEdits: onlineClients.reduce((count, client) => count + client.markers.length, 0),
+          offlineEdits: offlineMarkers.length,
+          finalContentBytes: new TextEncoder().encode(serverContent).byteLength,
+          finalContentChars: serverContent.length,
+        });
+      } finally {
+        serverDoc.destroy();
+      }
+    } finally {
+      offlineDoc.destroy();
+      for (const client of onlineClients) {
+        client.doc.destroy();
+      }
+    }
   });
 
   it("DocSync returns catch-up bytes for a client behind the server", async () => {
