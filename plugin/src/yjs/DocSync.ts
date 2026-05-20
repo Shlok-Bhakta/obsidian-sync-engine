@@ -15,6 +15,7 @@ export class DocSync {
     private ytext = this.ydoc.getText(MARKDOWN_FIELD);
     private openedTime = Date.now();
     private localRevision = 0;
+    private localEditRevision = 0;
 
 
     constructor(
@@ -42,6 +43,10 @@ export class DocSync {
         return this.localRevision;
     }
 
+    public hasLocalEdits(): boolean {
+        return this.localEditRevision > 0;
+    }
+
     public async persistState(): Promise<void> {
         await this.stateStore.put(this.path, Y.encodeStateAsUpdateV2(this.ydoc));
     }
@@ -52,6 +57,7 @@ export class DocSync {
         Y.applyUpdateV2(this.ydoc, state);
         this.ytext = this.ydoc.getText(MARKDOWN_FIELD);
         this.localRevision++;
+        this.localEditRevision = 0;
         await this.persistState();
     }
 
@@ -75,7 +81,9 @@ export class DocSync {
         changeset: ChangeSet,
         row: outboxData,
         onError?: (error: Error) => void,
-    ): void {
+        expectedBefore?: string,
+        expectedAfter?: string,
+    ): Promise<void> {
         const before = Y.encodeStateVector(this.ydoc);
         const changes: {
             fromA: number;
@@ -86,6 +94,19 @@ export class DocSync {
             changes.push({ fromA, toA, insertText: inserted.toString() });
         });
         this.ydoc.transact(() => {
+            if (expectedBefore !== undefined && this.ytext.toString() !== expectedBefore) {
+                log.warn("repairing Yjs/editor mismatch before applying local edit", {
+                    path: this.path,
+                    yjsChars: this.ytext.length,
+                    editorChars: expectedBefore.length,
+                });
+                if (this.ytext.length > 0) {
+                    this.ytext.delete(0, this.ytext.length);
+                }
+                if (expectedBefore.length > 0) {
+                    this.ytext.insert(0, expectedBefore);
+                }
+            }
             for (const { fromA, toA, insertText } of changes.reverse()) {
                 const deletelen = toA - fromA;
                 if (deletelen > 0) {
@@ -95,16 +116,31 @@ export class DocSync {
                     this.ytext.insert(fromA, insertText);
                 }
             }
+            if (expectedAfter !== undefined && this.ytext.toString() !== expectedAfter) {
+                log.warn("repairing Yjs/editor mismatch after applying local edit", {
+                    path: this.path,
+                    yjsChars: this.ytext.length,
+                    editorChars: expectedAfter.length,
+                });
+                if (this.ytext.length > 0) {
+                    this.ytext.delete(0, this.ytext.length);
+                }
+                if (expectedAfter.length > 0) {
+                    this.ytext.insert(0, expectedAfter);
+                }
+            }
         }, "user changes");
         this.localRevision++;
+        this.localEditRevision++;
         row.data = Y.encodeStateAsUpdateV2(this.ydoc, before);
-        void Promise.all([
+        return Promise.all([
             this.db.putInOutbox(row),
             this.persistState(),
-        ]).catch(error => {
+        ]).then(() => undefined).catch(error => {
             const err = error instanceof Error ? error : new Error(String(error));
             log.error("failed to write update to outbox", { path: this.path, mutationId: row.mutationId, ...errorContext(err) });
             onError?.(err);
+            throw err;
         });
     }
 

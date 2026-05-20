@@ -128,6 +128,47 @@ describe("DocSync editor typing", () => {
         expect(decodeContent(stateStore.states.get(PATH)!)).toBe("hello");
     });
 
+    it("keeps up with a fast 1000 character input burst", async () => {
+        const { docSync, outbox, stateStore } = setup("");
+        let editorDoc = "";
+        const input = "asdf".repeat(250);
+
+        for (const char of input) {
+            const update = editorChange(editorDoc, { from: editorDoc.length, insert: char });
+            const before = editorDoc;
+            editorDoc = update.nextDoc;
+            await docSync.applyChanges(update.changes, {
+                mutationId: crypto.randomUUID(),
+                operation: "YjsUpdate",
+                path: PATH,
+                data: new Uint8Array(),
+                created: Date.now(),
+            }, undefined, before, editorDoc);
+        }
+
+        expect(editorDoc).toHaveLength(1000);
+        expect(outbox.rows).toHaveLength(1000);
+        expect(docSync.getYdoc().getText(MARKDOWN_FIELD).toString()).toBe(input);
+        expect(decodeContent(stateStore.states.get(PATH)!)).toBe(input);
+    });
+
+    it("repairs stale local Yjs text before applying an editor changeset", async () => {
+        const { docSync, stateStore } = setup("asdf");
+        const update = editorChange("asdfasdf", { from: 8, insert: "asdf" });
+
+        await docSync.applyChanges(update.changes, {
+            mutationId: crypto.randomUUID(),
+            operation: "YjsUpdate",
+            path: PATH,
+            data: new Uint8Array(),
+            created: Date.now(),
+        }, undefined, "asdfasdf", update.nextDoc);
+
+        expect(update.nextDoc).toBe("asdfasdfasdf");
+        expect(docSync.getYdoc().getText(MARKDOWN_FIELD).toString()).toBe(update.nextDoc);
+        expect(decodeContent(stateStore.states.get(PATH)!)).toBe(update.nextDoc);
+    });
+
     it("applies a paste transaction as one coalesced update", async () => {
         const { docSync, outbox, stateStore } = setup("title");
         const update = editorChange("title", { from: 5, insert: "\n\nbody line 1\nbody line 2" });

@@ -1,7 +1,7 @@
 import { App, Editor, MarkdownView, TFile } from "obsidian";
 import { EditorView } from "@codemirror/view";
 
-function editorViewFor(editor: Editor): EditorView | null {
+export function editorViewFor(editor: Editor): EditorView | null {
 	const cm = (editor as Editor & { cm?: EditorView }).cm;
 	return cm ?? null;
 }

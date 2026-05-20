@@ -13,9 +13,10 @@ import { BlobClient } from "./BlobClient";
 import { errorContext, Logger } from "../../../shared/logger";
 import { log as rootLog } from "../logger";
 
-const EMPTY_BACKOFF_MS = 1000;
+const FLUSH_DELAY_MS = 25;
+const EMPTY_BACKOFF_MS = 25;
 const ERROR_BACKOFF_MS = 2000;
-const IDLE_EMPTY_SEGMENTS = 3;
+const IDLE_EMPTY_SEGMENTS = 40;
 const CONNECT_BACKOFF_INITIAL_MS = 5000;
 const CONNECT_BACKOFF_MAX_MS = 60000;
 const WS_WAIT_TIMEOUT_MS = 60_000;
@@ -89,6 +90,14 @@ function exactArrayBuffer(bytes: Uint8Array): ArrayBuffer {
     return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
 }
 
+function yjsContentFromState(state: Uint8Array): string {
+    const doc = new Y.Doc();
+    Y.applyUpdateV2(doc, state);
+    const content = doc.getText(MARKDOWN_FIELD).toJSON();
+    doc.destroy();
+    return content;
+}
+
 async function sha256Hex(bytes: Uint8Array): Promise<string> {
     const hash = await crypto.subtle.digest("SHA-256", exactArrayBuffer(bytes));
     return [...new Uint8Array(hash)].map(byte => byte.toString(16).padStart(2, "0")).join("");
@@ -132,6 +141,8 @@ export class SyncClient {
         private readonly onBootstrapStatus: (status: BootstrapStatus) => void = () => {},
         private readonly onStartupSynced: () => void = () => {},
         private readonly onRemoteConfigApplied: (path: string, bytes: Uint8Array) => void = () => {},
+        private readonly onOpenYjsContent: (path: string, content: string) => Promise<boolean> = async () => false,
+        private readonly flushOpenYjsChanges: (path: string) => Promise<void> = async () => {},
         private readonly pluginId = "obsidian-sync-engine",
     ) {
         this.serverUrl = toWebSocketUrl(settings.backendUrl);
@@ -277,7 +288,7 @@ export class SyncClient {
         this.flushTimer = window.setTimeout(() => {
             this.flushTimer = null;
             void this.drainOutbox();
-        }, 500);
+        }, FLUSH_DELAY_MS);
     }
 
     async drainOutbox(): Promise<void> {
@@ -353,6 +364,7 @@ export class SyncClient {
     private async runStartupSync(): Promise<void> {
         this.log.info("startup sync beginning", { lastPulledRevision: this.lastPulledRevision });
         const openWs = await this.ensureAuthenticatedSocket();
+        await this.flushPendingOutboxForStartup();
         const pullResponse = await this.pullSince(openWs, this.lastPulledRevision);
 
         if (pullResponse.type === opType.InitRequired) {
@@ -390,6 +402,26 @@ export class SyncClient {
         await this.catchUpToServer(openWs);
         this.log.info("startup sync complete", { lastPulledRevision: this.lastPulledRevision });
         this.onStartupSynced();
+    }
+
+    private async flushPendingOutboxForStartup(): Promise<void> {
+        if (!(await this.outbox.hasPendingChanges())) {
+            return;
+        }
+        this.log.info("flushing pending outbox before startup pull");
+        while (!this.stopped && await this.outbox.hasPendingChanges()) {
+            const segment = await this.outbox.claimNextSegment(true);
+            if (!segment) {
+                return;
+            }
+            try {
+                await this.sendSegment(segment);
+                await this.outbox.completeSegment(segment);
+            } catch (error) {
+                await this.outbox.releaseSegment(segment);
+                throw error;
+            }
+        }
     }
 
     private async catchUpToServer(openWs?: WebSocket): Promise<void> {
@@ -475,7 +507,6 @@ export class SyncClient {
         openWs.send(encodePacket(packet));
         const revision = await ack;
         this.recordUploadAckRevision(revision);
-        await this.catchUpToServer(openWs);
         this.log.info("outbox segment acknowledged", { segmentId: segment.id, revision });
     }
 
@@ -710,11 +741,13 @@ export class SyncClient {
                     } else if (change.contentBytes) {
                         appliedBytes = change.contentBytes;
                         await this.upsertBinaryFile(change.path, change.contentBytes);
+                    } else if (change.isYjs) {
+                        const content = change.content ?? "";
+                        await this.applyYjsState(change.path, change.yjsState ?? docStateFromContent(content, Y));
                     } else {
                         const content = change.content ?? "";
                         appliedBytes = new TextEncoder().encode(content);
                         await this.upsertTextFile(change.path, content);
-                        await this.refreshYjsState(change.path, content, change.yjsState);
                     }
                     if (appliedBytes && this.isSyncableConfigPath(change.path)) {
                         this.onRemoteConfigApplied(change.path, appliedBytes);
@@ -838,6 +871,7 @@ export class SyncClient {
 
     private async applyYjsUpdate(path: string, update: Uint8Array): Promise<void> {
         const normalized = normalizePath(path);
+        await this.flushOpenYjsChanges(normalized);
         const openDoc = this.getDocSync(normalized);
         let content: string;
         let state: Uint8Array;
@@ -852,24 +886,32 @@ export class SyncClient {
             state = Y.encodeStateAsUpdateV2(doc);
             doc.destroy();
         }
-        await this.upsertTextFile(normalized, content);
+        await this.upsertYjsTextFile(normalized, content);
         await this.stateStore.put(normalized, state);
     }
 
     private async applyYjsState(path: string, state: Uint8Array): Promise<void> {
         const normalized = normalizePath(path);
-        const doc = new Y.Doc();
-        Y.applyUpdateV2(doc, state);
-        const content = doc.getText(MARKDOWN_FIELD).toJSON();
-        doc.destroy();
-
-        await this.upsertTextFile(normalized, content);
-        await this.stateStore.put(normalized, state);
-
+        await this.flushOpenYjsChanges(normalized);
         const openDoc = this.getDocSync(normalized);
         if (openDoc) {
+            if (openDoc.hasLocalEdits()) {
+                const content = openDoc.applyRemoteUpdate(state);
+                await this.upsertYjsTextFile(normalized, content);
+                await this.stateStore.put(normalized, Y.encodeStateAsUpdateV2(openDoc.getYdoc()));
+                return;
+            }
+
+            const content = yjsContentFromState(state);
+            await this.upsertYjsTextFile(normalized, content);
+            await this.stateStore.put(normalized, state);
             await openDoc.replaceState(state);
+            return;
         }
+
+        const content = yjsContentFromState(state);
+        await this.upsertYjsTextFile(normalized, content);
+        await this.stateStore.put(normalized, state);
     }
 
     private async readVaultContent(path: string): Promise<string> {
@@ -887,6 +929,14 @@ export class SyncClient {
         if (openDoc) {
             await openDoc.replaceState(state);
         }
+    }
+
+    private async upsertYjsTextFile(path: string, content: string): Promise<void> {
+        const normalized = normalizePath(path);
+        if (this.getDocSync(normalized) && await this.onOpenYjsContent(normalized, content)) {
+            return;
+        }
+        await this.upsertTextFile(normalized, content);
     }
 
     private async getOrSeedState(path: string): Promise<Uint8Array> {

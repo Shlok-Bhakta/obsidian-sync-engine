@@ -1,10 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
+import { EditorState } from "@codemirror/state";
 import { TFile, TFolder } from "obsidian";
 import { docStateFromContent, MARKDOWN_FIELD } from "../../../shared/yjsSeed";
 import { opType, outboxData } from "../../../shared/types";
 import { encodePacket } from "../../../shared/protocol";
 import { SyncClient } from "./SyncClient";
+import { DocSync } from "../yjs/DocSync";
 import { YjsStateStore } from "../yjs/YjsStateStore";
 import { OutboxSegment, OutboxStore } from "../db/db";
 
@@ -38,6 +40,10 @@ class QueueOutboxStore extends MemoryOutboxStore {
         }
         this.claimed++;
         return next.segment;
+    }
+
+    async hasPendingChanges(): Promise<boolean> {
+        return this.segments.length > 0;
     }
 
     async readSegment(segment: OutboxSegment): Promise<outboxData[]> {
@@ -101,10 +107,26 @@ function readYjsContent(state: Uint8Array): string {
     return content;
 }
 
+async function applyEditorInsert(doc: DocSync, path: string, before: string, from: number, insert: string): Promise<void> {
+    const transaction = EditorState.create({ doc: before }).update({ changes: { from, insert } });
+    await doc.applyChanges(transaction.changes, {
+        mutationId: crypto.randomUUID(),
+        operation: "YjsUpdate",
+        path,
+        data: new Uint8Array(),
+        created: Date.now(),
+    });
+}
+
 async function makeClient(
     files: Record<string, string | Uint8Array>,
     stateStore = new MemoryYjsStateStore(),
     outbox = new MemoryOutboxStore(),
+    options: {
+        getDocSync?: (path: string) => DocSync | undefined;
+        onOpenYjsContent?: (path: string, content: string) => Promise<boolean>;
+        flushOpenYjsChanges?: (path: string) => Promise<void>;
+    } = {},
 ): Promise<{
     client: SyncClient;
     stateStore: MemoryYjsStateStore;
@@ -224,6 +246,14 @@ async function makeClient(
             clientName: "Client",
             lastPulledRevision: "0",
         },
+        undefined,
+        undefined,
+        options.getDocSync,
+        undefined,
+        undefined,
+        undefined,
+        options.onOpenYjsContent,
+        options.flushOpenYjsChanges,
     );
     return { client, stateStore };
 }
@@ -447,6 +477,171 @@ describe("SyncClient initial snapshot", () => {
         expect(files["notes/existing.md"]).toBe("server materialized");
         expect(readYjsContent(stateStore.states.get("notes/existing.md")!)).toBe("server materialized");
         expect(testClient.lastPulledRevision).toBe("2");
+    });
+
+    it("applies remote Yjs content through the open editor callback instead of rewriting the active file", async () => {
+        const files = { "notes/existing.md": "stale local" };
+        const stateStore = new MemoryYjsStateStore();
+        const initialState = docStateFromContent("stale local", Y);
+        await stateStore.put("notes/existing.md", initialState);
+        const openDoc = new DocSync(
+            new MemoryOutboxStore(),
+            stateStore as unknown as YjsStateStore,
+            "notes/existing.md",
+            initialState,
+        );
+        const applied: string[] = [];
+        const { client } = await makeClient(files, stateStore, new MemoryOutboxStore(), {
+            getDocSync: path => path === "notes/existing.md" ? openDoc : undefined,
+            onOpenYjsContent: async (_path, content) => {
+                applied.push(content);
+                return true;
+            },
+        });
+        const yjsState = docStateFromContent("server materialized", Y);
+        const testClient = client as unknown as {
+            lastPulledRevision: string;
+            applyChangeBatch: (packet: unknown) => Promise<void>;
+        };
+        testClient.lastPulledRevision = "1";
+
+        await testClient.applyChangeBatch({
+            type: opType.ChangeBatch,
+            fromRevision: "1",
+            serverRevision: "2",
+            changes: [{
+                mutationId: "remote-yjs",
+                operation: "YjsUpdate",
+                path: "notes/existing.md",
+                yjsState,
+                created: Date.now(),
+                revision: "2",
+                clientId: "other-client",
+            }],
+        });
+
+        expect(applied).toEqual(["server materialized"]);
+        expect(files["notes/existing.md"]).toBe("stale local");
+        expect(openDoc.getYdoc().getText(MARKDOWN_FIELD).toString()).toBe("server materialized");
+        expect(readYjsContent(stateStore.states.get("notes/existing.md")!)).toBe("server materialized");
+    });
+
+    it("merges a full remote Yjs state into an open document with pending local edits", async () => {
+        const files = { "notes/existing.md": "base" };
+        const stateStore = new MemoryYjsStateStore();
+        const initialState = docStateFromContent("base", Y);
+        await stateStore.put("notes/existing.md", initialState);
+        const openDoc = new DocSync(
+            new MemoryOutboxStore(),
+            stateStore as unknown as YjsStateStore,
+            "notes/existing.md",
+            initialState,
+        );
+        await applyEditorInsert(openDoc, "notes/existing.md", "base", 4, " local");
+
+        const serverDoc = new Y.Doc();
+        Y.applyUpdateV2(serverDoc, initialState);
+        serverDoc.getText(MARKDOWN_FIELD).insert(4, " remote");
+        const yjsState = Y.encodeStateAsUpdateV2(serverDoc);
+        serverDoc.destroy();
+
+        const applied: string[] = [];
+        const { client } = await makeClient(files, stateStore, new MemoryOutboxStore(), {
+            getDocSync: path => path === "notes/existing.md" ? openDoc : undefined,
+            onOpenYjsContent: async (_path, content) => {
+                applied.push(content);
+                return true;
+            },
+        });
+        const testClient = client as unknown as {
+            lastPulledRevision: string;
+            applyChangeBatch: (packet: unknown) => Promise<void>;
+        };
+        testClient.lastPulledRevision = "1";
+
+        await testClient.applyChangeBatch({
+            type: opType.ChangeBatch,
+            fromRevision: "1",
+            serverRevision: "2",
+            changes: [{
+                mutationId: "remote-yjs",
+                operation: "YjsUpdate",
+                path: "notes/existing.md",
+                yjsState,
+                created: Date.now(),
+                revision: "2",
+                clientId: "other-client",
+            }],
+        });
+
+        const merged = openDoc.getYdoc().getText(MARKDOWN_FIELD).toString();
+        expect(merged).toContain("base");
+        expect(merged).toContain("local");
+        expect(merged).toContain("remote");
+        expect(applied).toEqual([merged]);
+        expect(readYjsContent(stateStore.states.get("notes/existing.md")!)).toBe(merged);
+    });
+
+    it("flushes queued editor changes before applying a full remote Yjs state to an open document", async () => {
+        const files = { "notes/existing.md": "base" };
+        const stateStore = new MemoryYjsStateStore();
+        const initialState = docStateFromContent("base", Y);
+        await stateStore.put("notes/existing.md", initialState);
+        const openDoc = new DocSync(
+            new MemoryOutboxStore(),
+            stateStore as unknown as YjsStateStore,
+            "notes/existing.md",
+            initialState,
+        );
+
+        const serverDoc = new Y.Doc();
+        Y.applyUpdateV2(serverDoc, initialState);
+        serverDoc.getText(MARKDOWN_FIELD).insert(4, " remote");
+        const yjsState = Y.encodeStateAsUpdateV2(serverDoc);
+        serverDoc.destroy();
+
+        const applied: string[] = [];
+        let flushed = false;
+        const { client } = await makeClient(files, stateStore, new MemoryOutboxStore(), {
+            getDocSync: path => path === "notes/existing.md" ? openDoc : undefined,
+            onOpenYjsContent: async (_path, content) => {
+                applied.push(content);
+                return true;
+            },
+            flushOpenYjsChanges: async path => {
+                expect(path).toBe("notes/existing.md");
+                flushed = true;
+                await applyEditorInsert(openDoc, path, "base", 4, " local");
+            },
+        });
+        const testClient = client as unknown as {
+            lastPulledRevision: string;
+            applyChangeBatch: (packet: unknown) => Promise<void>;
+        };
+        testClient.lastPulledRevision = "1";
+
+        await testClient.applyChangeBatch({
+            type: opType.ChangeBatch,
+            fromRevision: "1",
+            serverRevision: "2",
+            changes: [{
+                mutationId: "remote-yjs",
+                operation: "YjsUpdate",
+                path: "notes/existing.md",
+                yjsState,
+                created: Date.now(),
+                revision: "2",
+                clientId: "other-client",
+            }],
+        });
+
+        const merged = openDoc.getYdoc().getText(MARKDOWN_FIELD).toString();
+        expect(flushed).toBe(true);
+        expect(merged).toContain("base");
+        expect(merged).toContain("local");
+        expect(merged).toContain("remote");
+        expect(applied).toEqual([merged]);
+        expect(readYjsContent(stateStore.states.get("notes/existing.md")!)).toBe(merged);
     });
 
     it("snapshot upsert overwrites an adapter-existing text file that is not loaded", async () => {
@@ -711,6 +906,41 @@ describe("SyncClient initial snapshot", () => {
 
         expect(testClient.lastPulledRevision).toBe("5");
         expect(persisted).toEqual([]);
+    });
+
+    it("flushes pending local outbox before startup pull can snapshot reset", async () => {
+        const order: string[] = [];
+        const { client } = await makeClient({ "notes/existing.md": "local" });
+        const ws = new FakeWebSocket();
+        const testClient = client as unknown as {
+            runStartupSync: () => Promise<void>;
+            ensureAuthenticatedSocket: () => Promise<FakeWebSocket>;
+            flushPendingOutboxForStartup: () => Promise<void>;
+            pullSince: (_ws: FakeWebSocket, _revision: string) => Promise<unknown>;
+            catchUpToServer: (_ws?: FakeWebSocket) => Promise<void>;
+            livePushPromise: Promise<void>;
+            startupSynced: boolean;
+        };
+        testClient.ensureAuthenticatedSocket = async () => ws;
+        testClient.flushPendingOutboxForStartup = async () => {
+            order.push("flush");
+        };
+        testClient.pullSince = async () => {
+            order.push("pull");
+            return {
+                type: opType.ChangeBatch,
+                fromRevision: "0",
+                serverRevision: "0",
+                changes: [],
+            };
+        };
+        testClient.catchUpToServer = async () => {};
+        testClient.livePushPromise = Promise.resolve();
+
+        await testClient.runStartupSync();
+
+        expect(order).toEqual(["flush", "pull"]);
+        expect(testClient.startupSynced).toBe(true);
     });
 
     it("drainOutbox waits for in-flight live push before claiming a segment", async () => {

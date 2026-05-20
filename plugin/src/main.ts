@@ -3,10 +3,11 @@ import * as Y from 'yjs';
 import {DEFAULT_SETTINGS, SyncEngineSettings, SyncEngineSettingTab} from "./settings";
 import { JsonlOutboxStore, OutboxStore } from 'db/db';
 import { EditorView, ViewUpdate } from "@codemirror/view";
+import { EditorSelection } from "@codemirror/state";
 import { BootstrapStatus, outboxData, Path } from "../../shared/types";
 import { DocSync } from 'yjs/DocSync';
 import { SyncClient } from 'sync/SyncClient';
-import { fileForEditorView } from 'utils/editorFile';
+import { editorViewFor, fileForEditorView } from 'utils/editorFile';
 import { YjsStateStore } from 'yjs/YjsStateStore';
 import { VaultYjsIndexer } from 'yjs/VaultYjsIndexer';
 import { docStateFromContent } from "../../shared/yjsSeed";
@@ -30,6 +31,41 @@ function exactArrayBuffer(bytes: Uint8Array): ArrayBuffer {
 	return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
 }
 
+function changedRange(before: string, after: string): { from: number; to: number; insert: string } | null {
+	if (before === after) {
+		return null;
+	}
+	let prefix = 0;
+	while (prefix < before.length && prefix < after.length && before.charCodeAt(prefix) === after.charCodeAt(prefix)) {
+		prefix++;
+	}
+	let beforeSuffix = before.length;
+	let afterSuffix = after.length;
+	while (
+		beforeSuffix > prefix &&
+		afterSuffix > prefix &&
+		before.charCodeAt(beforeSuffix - 1) === after.charCodeAt(afterSuffix - 1)
+	) {
+		beforeSuffix--;
+		afterSuffix--;
+	}
+	return {
+		from: prefix,
+		to: beforeSuffix,
+		insert: after.slice(prefix, afterSuffix),
+	};
+}
+
+function mapPositionThroughReplacement(position: number, from: number, to: number, insertLength: number): number {
+	if (position <= from) {
+		return position;
+	}
+	if (position >= to) {
+		return position + insertLength - (to - from);
+	}
+	return from + insertLength;
+}
+
 async function sha256Hex(bytes: Uint8Array): Promise<string> {
 	const hash = await crypto.subtle.digest("SHA-256", exactArrayBuffer(bytes));
 	return [...new Uint8Array(hash)].map(byte => byte.toString(16).padStart(2, "0")).join("");
@@ -40,6 +76,7 @@ export default class SyncEngine extends Plugin {
 	db: OutboxStore;
 	docs: Map<Path, DocSync>;
 	pendingDocs: Map<Path, Promise<DocSync>>;
+	editorChangeQueues: Map<Path, Promise<void>>;
 	pruningDocs: Set<Path>;
 	yjsStateStore: YjsStateStore;
 	yjsIndexer: VaultYjsIndexer;
@@ -48,6 +85,7 @@ export default class SyncEngine extends Plugin {
 	private bootstrapStatusListeners: Set<() => void> = new Set();
 	private pendingFileTimers: Map<Path, number> = new Map();
 	private configDirStats: Map<Path, string> = new Map();
+	private remoteEditorDispatches: Set<EditorView> = new Set();
 	/** Content hashes of syncable config files on disk before the first startup pull. */
 	private bootConfigSha = new Map<Path, string>();
 	/** Last config file bytes applied from the server during startup/live pull. */
@@ -66,6 +104,7 @@ export default class SyncEngine extends Plugin {
 		this.yjsStateStore = new YjsStateStore(this.app, this.manifest);
 		this.docs = new Map<Path, DocSync>();
 		this.pendingDocs = new Map<Path, Promise<DocSync>>();
+		this.editorChangeQueues = new Map<Path, Promise<void>>();
 		this.pruningDocs = new Set<Path>();
 		await this.db.open();
 		await this.yjsStateStore.open();
@@ -107,6 +146,8 @@ export default class SyncEngine extends Plugin {
 			(path, bytes) => {
 				void this.recordRemoteConfigApplied(path, bytes);
 			},
+			(path, content) => this.applyRemoteYjsContentToOpenEditors(path, content),
+			(path) => this.flushEditorChangeQueue(path),
 			this.manifest.id,
 		);
 		this.app.workspace.onLayoutReady(() => {
@@ -154,7 +195,7 @@ export default class SyncEngine extends Plugin {
 
 	private makeEditorOutboxExtension(){
 		return EditorView.updateListener.of((update: ViewUpdate) => {
-			if (this.syncClient?.isApplyingRemoteChanges()) {
+			if (this.remoteEditorDispatches.has(update.view)) {
 				return;
 			}
 			if (!update.docChanged) {
@@ -168,8 +209,25 @@ export default class SyncEngine extends Plugin {
 			if (!shouldUseYjs(pathID, this.app.vault.configDir)) {
 				return;
 			}
-			void this.handleEditorChange(update, pathID);
+			this.queueEditorChange(update, pathID);
 		});
+	}
+
+	private queueEditorChange(update: ViewUpdate, pathID: Path): void {
+		const previous = this.editorChangeQueues.get(pathID) ?? Promise.resolve();
+		const next = previous
+			.catch(() => {})
+			.then(() => this.handleEditorChange(update, pathID))
+			.catch(error => {
+				log.error("failed to process editor change", { path: pathID, ...errorContext(error) });
+				new Notice(`Sync outbox write failed: ${errorMessage(error)}`);
+			})
+			.finally(() => {
+				if (this.editorChangeQueues.get(pathID) === next) {
+					this.editorChangeQueues.delete(pathID);
+				}
+			});
+		this.editorChangeQueues.set(pathID, next);
 	}
 
 	private async handleEditorChange(update: ViewUpdate, pathID: Path): Promise<void> {
@@ -181,12 +239,16 @@ export default class SyncEngine extends Plugin {
 			data: new Uint8Array(),
 			created: Date.now(),
 		};
-		doc.applyChanges(update.changes, row, (error) => {
+		await doc.applyChanges(update.changes, row, (error) => {
 			log.error("failed to enqueue editor Yjs update", { path: pathID, mutationId: row.mutationId, ...errorContext(error) });
 			new Notice(`Sync outbox write failed: ${error.message}`);
-		});
+		}, update.startState.doc.toString(), update.state.doc.toString());
 		log.debug("queued editor Yjs update", { path: pathID, mutationId: row.mutationId });
 		this.syncClient.wakeSoon();
+	}
+
+	private async flushEditorChangeQueue(pathID: Path): Promise<void> {
+		await (this.editorChangeQueues.get(pathID) ?? Promise.resolve());
 	}
 
 	private getOrCreateDoc(pathID: Path, initialContent: string): Promise<DocSync> {
@@ -368,6 +430,43 @@ export default class SyncEngine extends Plugin {
 			}
 		}
 		return false;
+	}
+
+	private async applyRemoteYjsContentToOpenEditors(path: Path, content: string): Promise<boolean> {
+		let applied = false;
+		for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
+			const view = leaf.view;
+			if (!(view instanceof MarkdownView) || view.file?.path !== path) {
+				continue;
+			}
+			applied = true;
+			const editorView = editorViewFor(view.editor);
+			if (!editorView) {
+				if (view.editor.getValue() !== content) {
+					view.editor.setValue(content);
+				}
+				continue;
+			}
+			const before = editorView.state.doc.toString();
+			const change = changedRange(before, content);
+			if (!change) {
+				continue;
+			}
+			const selection = editorView.state.selection.ranges.map(range => ({
+				anchor: mapPositionThroughReplacement(range.anchor, change.from, change.to, change.insert.length),
+				head: mapPositionThroughReplacement(range.head, change.from, change.to, change.insert.length),
+			}));
+			this.remoteEditorDispatches.add(editorView);
+			try {
+				editorView.dispatch({
+					changes: change,
+					selection: EditorSelection.create(selection.map(range => EditorSelection.range(range.anchor, range.head))),
+				});
+			} finally {
+				this.remoteEditorDispatches.delete(editorView);
+			}
+		}
+		return applied;
 	}
 
 	private queueNonMarkdownUpsert(file: TAbstractFile): void {
