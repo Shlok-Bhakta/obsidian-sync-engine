@@ -63,17 +63,24 @@ export class DocSync {
         onError?: (error: Error) => void,
     ): void {
         const before = Y.encodeStateVector(this.ydoc);
+        const changes: {
+            fromA: number;
+            toA: number;
+            insertText: string;
+        }[] = [];
+        changeset.iterChanges((fromA, toA, _fromB, _toB, inserted) => {
+            changes.push({ fromA, toA, insertText: inserted.toString() });
+        });
         this.ydoc.transact(() => {
-            changeset.iterChanges((fromA, toA, _fromB, _toB, inserted) => {
+            for (const { fromA, toA, insertText } of changes.reverse()) {
                 const deletelen = toA - fromA;
                 if (deletelen > 0) {
                     this.ytext.delete(fromA, deletelen);
                 }
-                const insertText = inserted.toString();
                 if (insertText.length > 0) {
                     this.ytext.insert(fromA, insertText);
                 }
-            });
+            }
         }, "user changes");
         row.data = Y.encodeStateAsUpdateV2(this.ydoc, before);
         void Promise.all([

@@ -377,6 +377,7 @@ type Client = {
   clientId: string;
   clientName: string;
   lastPulledRevision: string;
+  pushPromise: Promise<void>;
   socket: AuthenticatedSocket | null;
 };
 
@@ -413,17 +414,22 @@ async function pushChangesToOtherClients(sender: Client, revision: string): Prom
     if (target === sender || !target.socket || !target.isAuthenticated) {
       continue;
     }
-    pushes.push((async () => {
+    target.pushPromise = target.pushPromise.catch(() => {}).then(async () => {
       try {
         const fromRevision = target.lastPulledRevision;
         const packet = await handlePull({ type: opType.PullSince, revision: fromRevision });
         target.socket!.send(encodePacket(packet));
+        const pushedRevision = revisionFromServerPacket(packet);
+        if (pushedRevision && BigInt(pushedRevision) > BigInt(target.lastPulledRevision)) {
+          target.lastPulledRevision = pushedRevision;
+        }
         log.info("pushed changes to websocket client", {
           senderClientId: sender.clientId,
           targetClientId: target.clientId,
           targetClientName: target.clientName,
           fromRevision,
           acceptedRevision: revision,
+          pushedRevision,
           packetType: packet.type,
         });
       } catch (error) {
@@ -434,7 +440,8 @@ async function pushChangesToOtherClients(sender: Client, revision: string): Prom
           ...errorContext(error),
         });
       }
-    })());
+    });
+    pushes.push(target.pushPromise);
   }
   await Promise.all(pushes);
 }
@@ -447,6 +454,7 @@ app.get(
       clientId: "",
       clientName: "",
       lastPulledRevision: "0",
+      pushPromise: Promise.resolve(),
       socket: null,
     };
     return {

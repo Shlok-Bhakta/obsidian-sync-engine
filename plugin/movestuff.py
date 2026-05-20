@@ -29,8 +29,8 @@ def movefiles():
         dst = pathlib.Path(f"{VAULT_DIR}/{PLUGIN_DIR}/{PLUGIN_NAME}/{file}")
         shutil.copy2(src, dst)
     # ensure .hotreload file exists here too
-    hrl = pathlib.Path(f"{VAULT_DIR}/{PLUGIN_DIR}/{PLUGIN_NAME}/.hotreload")
-    hrl.touch()
+    # hrl = pathlib.Path(f"{VAULT_DIR}/{PLUGIN_DIR}/{PLUGIN_NAME}/.hotreload")
+    # hrl.touch()
 
 # check file timestamps every second if changed then movefiles()
 def checkfiles():
@@ -47,6 +47,6 @@ def checkfiles():
             print(e)
             time.sleep(1)
 
-hotplugin()
+# hotplugin()
 print("===== READY =====")
 checkfiles()

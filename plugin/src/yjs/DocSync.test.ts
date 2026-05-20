@@ -179,6 +179,21 @@ describe("DocSync editor typing", () => {
         expect(decodeContent(stateStore.states.get(PATH)!)).toBe("Hello world!");
     });
 
+    it("handles one transaction with multiple edits that change document length", async () => {
+        const { docSync, stateStore } = setup("hello world again");
+        const update = editorChange("hello world again", [
+            { from: 0, insert: "Say " },
+            { from: 6, to: 11, insert: "there" },
+            { from: 17, insert: "!" },
+        ]);
+
+        applyChanges(docSync, update.changes);
+        await tick();
+
+        expect(update.nextDoc).toBe("Say hello there again!");
+        expect(decodeContent(stateStore.states.get(PATH)!)).toBe(update.nextDoc);
+    });
+
     it("remote updates merge into the open document and persist", async () => {
         const { docSync, stateStore, initialState } = setup("hello");
         const remote = new Y.Doc();
