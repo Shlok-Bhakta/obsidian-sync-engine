@@ -86,7 +86,7 @@ type SnapshotPath = {
 };
 
 function exactArrayBuffer(bytes: Uint8Array): ArrayBuffer {
-    return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+    return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
 }
 
 async function sha256Hex(bytes: Uint8Array): Promise<string> {
@@ -101,6 +101,7 @@ export class SyncClient {
     private clientKey: string;
     private clientName: string;
     private lastPulledRevision: string;
+    private lastUploadedRevisionHint: string;
     private draining = false;
     private stopped = false;
     private flushTimer: number | null = null;
@@ -115,6 +116,10 @@ export class SyncClient {
     private blobClient: BlobClient;
     private readonly log: Logger;
     private livePushPromise: Promise<void> = Promise.resolve();
+    private livePushBacklog: Extract<wsPacket, { type: opType.ChangeBatch | opType.SnapshotReset }>[] = [];
+    private refreshAuthPromise: Promise<string> | null = null;
+    private catchUpPromise: Promise<void> | null = null;
+    private pendingPullResponses = 0;
 
     constructor(
         private readonly app: App,
@@ -125,12 +130,16 @@ export class SyncClient {
         private readonly onLastPulledRevisionChanged: (revision: string) => Promise<void> = async () => {},
         private readonly getDocSync: (path: string) => DocSync | undefined = () => undefined,
         private readonly onBootstrapStatus: (status: BootstrapStatus) => void = () => {},
+        private readonly onStartupSynced: () => void = () => {},
+        private readonly onRemoteConfigApplied: (path: string, bytes: Uint8Array) => void = () => {},
+        private readonly pluginId = "obsidian-sync-engine",
     ) {
         this.serverUrl = toWebSocketUrl(settings.backendUrl);
         this.clientId = settings.clientId;
         this.clientKey = settings.clientKey;
         this.clientName = settings.clientName;
         this.lastPulledRevision = settings.lastPulledRevision;
+        this.lastUploadedRevisionHint = settings.lastPulledRevision;
         this.blobClient = new BlobClient(settings.backendUrl, settings.clientKey, () => this.refreshBlobAuth());
         this.log = rootLog.child({
             clientId: this.clientId.slice(0, 18),
@@ -142,6 +151,16 @@ export class SyncClient {
         return this.applyingRemote;
     }
 
+    private isSyncableConfigPath(path: string): boolean {
+        const configDir = this.app.vault.configDir.replace(/^\/+|\/+$/g, "");
+        const normalized = normalizePath(path);
+        return (
+            (normalized === configDir || normalized.startsWith(`${configDir}/`))
+            && shouldSyncPath(normalized, this.app.vault.configDir, this.pluginId)
+            && !shouldUseYjs(normalized, this.app.vault.configDir)
+        );
+    }
+
     start(): void {
         this.stopped = false;
         this.recordConnectionSuccess();
@@ -151,6 +170,14 @@ export class SyncClient {
         });
         this.connectSoon();
         this.pollInterval = window.setInterval(() => {
+            if (this.startupSynced) {
+                void this.catchUpToServer().catch(error => {
+                    this.log.warn("periodic sync catch-up failed", errorContext(error));
+                    this.closeSocket();
+                    this.connectSoon();
+                });
+                return;
+            }
             this.connectSoon();
         }, 5000);
     }
@@ -179,6 +206,7 @@ export class SyncClient {
         this.clientKey = settings.clientKey;
         this.clientName = settings.clientName;
         this.lastPulledRevision = settings.lastPulledRevision;
+        this.lastUploadedRevisionHint = settings.lastPulledRevision;
         this.blobClient.update(settings.backendUrl, settings.clientKey);
         if (nextUrl !== this.serverUrl || authChanged) {
             this.log.info("sync settings changed; reconnecting", {
@@ -239,14 +267,17 @@ export class SyncClient {
     }
 
     wakeSoon(): void {
-        if (this.stopped || this.flushTimer !== null || this.startupSyncPromise || !this.startupSynced) {
+        if (this.stopped || this.startupSyncPromise || !this.startupSynced) {
             return;
+        }
+        if (this.flushTimer !== null) {
+            window.clearTimeout(this.flushTimer);
         }
 
         this.flushTimer = window.setTimeout(() => {
             this.flushTimer = null;
             void this.drainOutbox();
-        }, 1000);
+        }, 500);
     }
 
     async drainOutbox(): Promise<void> {
@@ -258,9 +289,13 @@ export class SyncClient {
         this.log.debug("outbox drain starting");
         try {
             let emptyCount = 0;
-            while (!this.stopped) {
+            while (!this.stopped && this.startupSynced) {
                 let segment: OutboxSegment | null = null;
                 try {
+                    await this.livePushPromise.catch(() => {});
+                    if (this.stopped || !this.startupSynced) {
+                        return;
+                    }
                     segment = await this.outbox.claimNextSegment(true);
                     if (!segment) {
                         emptyCount++;
@@ -268,6 +303,9 @@ export class SyncClient {
                             return;
                         }
                         await sleep(EMPTY_BACKOFF_MS);
+                        if (this.stopped || !this.startupSynced) {
+                            return;
+                        }
                         continue;
                     }
 
@@ -288,6 +326,9 @@ export class SyncClient {
                     }
                     this.closeSocket();
                     await sleep(ERROR_BACKOFF_MS);
+                    if (!this.startupSynced) {
+                        return;
+                    }
                 }
             }
         } finally {
@@ -326,17 +367,74 @@ export class SyncClient {
             });
             await this.applyChangeBatch(pullResponse);
         } else if (pullResponse.type === opType.SnapshotReset) {
-            this.log.warn("startup pull returned snapshot reset", {
-                targetRevision: pullResponse.targetRevision,
-                files: pullResponse.files.length,
-            });
-            await this.applySnapshotReset(pullResponse);
+            if (BigInt(pullResponse.targetRevision) <= BigInt(this.lastPulledRevision)) {
+                this.log.info("startup pull snapshot already applied", {
+                    targetRevision: pullResponse.targetRevision,
+                    lastPulledRevision: this.lastPulledRevision,
+                });
+            } else {
+                this.log.warn("startup pull returned snapshot reset", {
+                    targetRevision: pullResponse.targetRevision,
+                    files: pullResponse.files.length,
+                });
+                await this.applySnapshotReset(pullResponse);
+            }
         } else {
             throw new Error(`Unexpected pull response: ${pullResponse.type}`);
         }
+        await this.catchUpToServer(openWs);
         this.startupSynced = true;
         this.recordConnectionSuccess();
+        this.drainLivePushBacklog();
+        await this.livePushPromise.catch(() => {});
+        await this.catchUpToServer(openWs);
         this.log.info("startup sync complete", { lastPulledRevision: this.lastPulledRevision });
+        this.onStartupSynced();
+    }
+
+    private async catchUpToServer(openWs?: WebSocket): Promise<void> {
+        if (!openWs && this.catchUpPromise) {
+            return this.catchUpPromise;
+        }
+        const work = this.runCatchUpToServer(openWs);
+        if (!openWs) {
+            this.catchUpPromise = work.finally(() => {
+                this.catchUpPromise = null;
+            });
+            return this.catchUpPromise;
+        }
+        return work;
+    }
+
+    private async runCatchUpToServer(openWs?: WebSocket): Promise<void> {
+        if (this.stopped) {
+            return;
+        }
+        let ws = openWs ?? await this.ensureAuthenticatedSocket();
+        for (let attempt = 0; attempt < 20; attempt++) {
+            const before = this.lastPulledRevision;
+            const packet = await this.pullSince(ws, before);
+            if (packet.type === opType.InitRequired) {
+                await this.uploadInitialSnapshot(ws);
+            } else if (packet.type === opType.ChangeBatch) {
+                if (packet.changes.length === 0) {
+                    return;
+                }
+                await this.applyChangeBatch(packet);
+            } else if (packet.type === opType.SnapshotReset) {
+                if (BigInt(packet.targetRevision) <= BigInt(this.lastPulledRevision)) {
+                    return;
+                }
+                await this.applySnapshotReset(packet);
+            } else {
+                throw new Error(`Unexpected pull response: ${packet.type}`);
+            }
+            if (this.lastPulledRevision === before) {
+                return;
+            }
+            ws = await this.ensureAuthenticatedSocket();
+        }
+        throw new Error("Sync catch-up did not converge");
     }
 
     private recordConnectionFailure(error: unknown): void {
@@ -376,7 +474,8 @@ export class SyncClient {
         });
         openWs.send(encodePacket(packet));
         const revision = await ack;
-        await this.persistLastPulledRevision(revision);
+        this.recordUploadAckRevision(revision);
+        await this.catchUpToServer(openWs);
         this.log.info("outbox segment acknowledged", { segmentId: segment.id, revision });
     }
 
@@ -399,7 +498,7 @@ export class SyncClient {
         );
         ws.send(encodePacket(packet));
         const revision = await ack;
-        await this.persistLastPulledRevision(revision);
+        this.recordUploadAckRevision(revision);
         this.log.info("initial snapshot acknowledged", { segmentId: packet.segmentId, revision });
     }
 
@@ -481,7 +580,7 @@ export class SyncClient {
     private async listSnapshotPaths(): Promise<SnapshotPath[]> {
         const byPath = new Map<string, SnapshotPath>();
         for (const file of this.app.vault.getAllLoadedFiles()) {
-            if (!shouldSyncPath(file.path, this.app.vault.configDir)) {
+            if (!shouldSyncPath(file.path, this.app.vault.configDir, this.pluginId)) {
                 continue;
             }
             byPath.set(file.path, {
@@ -505,13 +604,13 @@ export class SyncClient {
         }
         const listed = await this.app.vault.adapter.list(dir);
         for (const folder of listed.folders) {
-            if (shouldSyncPath(folder, this.app.vault.configDir)) {
+            if (shouldSyncPath(folder, this.app.vault.configDir, this.pluginId)) {
                 byPath.set(folder, { path: folder, isFolder: true });
                 await this.addAdapterPaths(folder, byPath);
             }
         }
         for (const file of listed.files) {
-            if (shouldSyncPath(file, this.app.vault.configDir)) {
+            if (shouldSyncPath(file, this.app.vault.configDir, this.pluginId)) {
                 byPath.set(file, { path: file, isFolder: false });
             }
         }
@@ -524,14 +623,33 @@ export class SyncClient {
             changes: packet.changes.length,
             operations: summarizeServerChanges(packet.changes),
         });
-        await this.applyServerChanges(packet.changes);
-        await this.persistLastPulledRevision(packet.serverRevision);
+        const unappliedChanges = packet.changes.filter(change => BigInt(change.revision) > BigInt(this.lastPulledRevision));
+        if (unappliedChanges.length === 0) {
+            this.log.debug("change batch contained no unapplied changes", {
+                fromRevision: packet.fromRevision,
+                serverRevision: packet.serverRevision,
+                lastPulledRevision: this.lastPulledRevision,
+            });
+            return;
+        }
+        await this.applyServerChanges(unappliedChanges);
+        const appliedRevision = unappliedChanges.reduce((max, change) => {
+            return BigInt(change.revision) > BigInt(max) ? change.revision : max;
+        }, packet.fromRevision);
+        await this.persistLastPulledRevision(appliedRevision);
     }
 
     private async applySnapshotReset(packet: Extract<wsPacket, { type: opType.SnapshotReset }>): Promise<void> {
+        if (BigInt(packet.targetRevision) <= BigInt(this.lastPulledRevision)) {
+            this.log.debug("skipping snapshot reset; revision already current", {
+                targetRevision: packet.targetRevision,
+                lastPulledRevision: this.lastPulledRevision,
+            });
+            return;
+        }
         const snapshotPaths = new Set(packet.files.map(file => normalizePath(file.path)));
         const toDelete = [...this.app.vault.getFiles()]
-            .filter(file => shouldSyncPath(file.path, this.app.vault.configDir) && !snapshotPaths.has(normalizePath(file.path)));
+            .filter(file => shouldSyncPath(file.path, this.app.vault.configDir, this.pluginId) && !snapshotPaths.has(normalizePath(file.path)));
         const hasPendingChanges = await this.outbox.hasPendingChanges();
         this.log.warn("applying snapshot reset", {
             targetRevision: packet.targetRevision,
@@ -554,8 +672,8 @@ export class SyncClient {
         try {
             for (const change of changes) {
                 if (
-                    !shouldSyncPath(change.path, this.app.vault.configDir) ||
-                    (change.toPath && !shouldSyncPath(change.toPath, this.app.vault.configDir))
+                    !shouldSyncPath(change.path, this.app.vault.configDir, this.pluginId) ||
+                    (change.toPath && !shouldSyncPath(change.toPath, this.app.vault.configDir, this.pluginId))
                 ) {
                     this.log.warn("skipping ignored remote change", {
                         revision: change.revision,
@@ -574,23 +692,43 @@ export class SyncClient {
                     storageKind: change.storageKind,
                     byteSize: change.byteSize,
                 });
+                if (change.clientId === this.clientId) {
+                    this.log.debug("skipping echoed local change", {
+                        revision: change.revision,
+                        operation: change.operation,
+                        path: change.path,
+                    });
+                    continue;
+                }
                 if (change.operation === "CreateFolder") {
                     await this.ensureFolder(change.path);
                 } else if (change.operation === "UpsertFile") {
+                    let appliedBytes: Uint8Array | null = null;
                     if (change.storageKind === "lo") {
-                        await this.upsertBinaryFile(change.path, await this.blobClient.download(change.path));
+                        appliedBytes = await this.blobClient.download(change.path);
+                        await this.upsertBinaryFile(change.path, appliedBytes);
                     } else if (change.contentBytes) {
+                        appliedBytes = change.contentBytes;
                         await this.upsertBinaryFile(change.path, change.contentBytes);
                     } else {
-                        await this.upsertTextFile(change.path, change.content ?? "");
-                        await this.refreshYjsState(change.path, change.content ?? "", change.yjsState);
+                        const content = change.content ?? "";
+                        appliedBytes = new TextEncoder().encode(content);
+                        await this.upsertTextFile(change.path, content);
+                        await this.refreshYjsState(change.path, content, change.yjsState);
+                    }
+                    if (appliedBytes && this.isSyncableConfigPath(change.path)) {
+                        this.onRemoteConfigApplied(change.path, appliedBytes);
                     }
                 } else if (change.operation === "Delete") {
                     await this.deletePath(change.path);
                 } else if (change.operation === "Rename" && change.toPath) {
                     await this.renamePath(change.path, change.toPath);
-                } else if (change.operation === "YjsUpdate" && change.data) {
-                    await this.applyYjsUpdate(change.path, change.data);
+                } else if (change.operation === "YjsUpdate") {
+                    if (change.yjsState) {
+                        await this.applyYjsState(change.path, change.yjsState);
+                    } else if (change.data) {
+                        await this.applyYjsUpdate(change.path, change.data);
+                    }
                 }
             }
         } finally {
@@ -602,7 +740,7 @@ export class SyncClient {
         this.applyingRemote = true;
         try {
             const files = [...this.app.vault.getFiles()]
-                .filter(file => shouldSyncPath(file.path, this.app.vault.configDir) && !paths.has(normalizePath(file.path)))
+                .filter(file => shouldSyncPath(file.path, this.app.vault.configDir, this.pluginId) && !paths.has(normalizePath(file.path)))
                 .sort((a, b) => b.path.length - a.path.length);
             for (const file of files) {
                 await this.app.fileManager.trashFile(file);
@@ -645,7 +783,19 @@ export class SyncClient {
         if (existing) {
             await this.app.fileManager.trashFile(existing);
         }
-        await this.app.vault.create(normalized, content);
+        if (await this.app.vault.adapter.exists(normalized)) {
+            await this.app.vault.adapter.write(normalized, content);
+            return;
+        }
+        try {
+            await this.app.vault.create(normalized, content);
+        } catch (error) {
+            if (await this.app.vault.adapter.exists(normalized)) {
+                await this.app.vault.adapter.write(normalized, content);
+                return;
+            }
+            throw error;
+        }
     }
 
     private async upsertBinaryFile(path: string, bytes: Uint8Array): Promise<void> {
@@ -706,6 +856,22 @@ export class SyncClient {
         await this.stateStore.put(normalized, state);
     }
 
+    private async applyYjsState(path: string, state: Uint8Array): Promise<void> {
+        const normalized = normalizePath(path);
+        const doc = new Y.Doc();
+        Y.applyUpdateV2(doc, state);
+        const content = doc.getText(MARKDOWN_FIELD).toJSON();
+        doc.destroy();
+
+        await this.upsertTextFile(normalized, content);
+        await this.stateStore.put(normalized, state);
+
+        const openDoc = this.getDocSync(normalized);
+        if (openDoc) {
+            await openDoc.replaceState(state);
+        }
+    }
+
     private async readVaultContent(path: string): Promise<string> {
         const existing = this.app.vault.getAbstractFileByPath(path);
         return existing instanceof TFile ? this.app.vault.read(existing) : "";
@@ -763,8 +929,8 @@ export class SyncClient {
     private async prepareSegmentJsonl(ws: WebSocket, segment: OutboxSegment): Promise<string> {
         const inputRows = await this.outbox.readSegment(segment);
         const rows = inputRows.filter(row => {
-            const shouldKeep = shouldSyncPath(row.path, this.app.vault.configDir) &&
-                (!row.toPath || shouldSyncPath(row.toPath, this.app.vault.configDir));
+            const shouldKeep = shouldSyncPath(row.path, this.app.vault.configDir, this.pluginId) &&
+                (!row.toPath || shouldSyncPath(row.toPath, this.app.vault.configDir, this.pluginId));
             if (!shouldKeep) {
                 this.log.warn("dropping ignored outbox row", {
                     segmentId: segment.id,
@@ -977,6 +1143,13 @@ export class SyncClient {
         await this.onLastPulledRevisionChanged(revision);
     }
 
+    private recordUploadAckRevision(revision: string): void {
+        if (BigInt(revision) <= BigInt(this.lastUploadedRevisionHint)) {
+            return;
+        }
+        this.lastUploadedRevisionHint = revision;
+    }
+
     private async ensureAuthenticatedSocket(): Promise<WebSocket> {
         if (this.authPromise) {
             return this.authPromise;
@@ -1032,12 +1205,36 @@ export class SyncClient {
     }
 
     private async refreshBlobAuth(): Promise<string> {
-        const wasStartupSynced = this.startupSynced;
-        this.log.warn("refreshing blob auth after unauthorized response");
-        this.closeSocket();
-        await this.ensureAuthenticatedSocket();
-        this.startupSynced = wasStartupSynced;
-        return this.clientKey;
+        if (this.refreshAuthPromise) {
+            return this.refreshAuthPromise;
+        }
+        this.refreshAuthPromise = (async () => {
+            this.log.warn("refreshing blob auth after unauthorized response");
+            const wasStartupSynced = this.startupSynced;
+            const inStartupSync = this.startupSyncPromise !== null;
+            if (inStartupSync) {
+                await this.reauthenticateOpenSocket();
+            } else {
+                this.closeSocket();
+                await this.ensureAuthenticatedSocket();
+                await this.catchUpToServer();
+            }
+            this.startupSynced = wasStartupSynced;
+            return this.clientKey;
+        })().finally(() => {
+            this.refreshAuthPromise = null;
+        });
+        return this.refreshAuthPromise;
+    }
+
+    private async reauthenticateOpenSocket(): Promise<void> {
+        const openWs = this.ws;
+        if (!openWs || openWs.readyState !== WebSocket.OPEN) {
+            await this.ensureAuthenticatedSocket();
+            return;
+        }
+        this.authenticated = false;
+        await this.authenticateSocket();
     }
 
     private httpBackendUrl(): string {
@@ -1050,13 +1247,18 @@ export class SyncClient {
     }
 
     private async pullSince(ws: WebSocket, revision: string): Promise<wsPacket> {
-        const response = withTimeout(
-            this.waitForPullResponse(ws),
-            WS_WAIT_TIMEOUT_MS,
-            "Timed out waiting for pull response",
-        );
-        ws.send(encodePacket({ type: opType.PullSince, revision }));
-        return response;
+        this.pendingPullResponses++;
+        try {
+            const response = withTimeout(
+                this.waitForPullResponse(ws),
+                WS_WAIT_TIMEOUT_MS,
+                "Timed out waiting for pull response",
+            );
+            ws.send(encodePacket({ type: opType.PullSince, revision }));
+            return await response;
+        } finally {
+            this.pendingPullResponses--;
+        }
     }
 
     private async ensureSocket(): Promise<WebSocket> {
@@ -1078,6 +1280,7 @@ export class SyncClient {
                 this.ws = null;
                 this.authenticated = false;
                 this.startupSynced = false;
+                this.connectSoon();
             }
             this.log.debug("websocket closed");
         });
@@ -1089,6 +1292,9 @@ export class SyncClient {
                     return;
                 }
                 if (msg.type === opType.ChangeBatch || msg.type === opType.SnapshotReset) {
+                    if (this.pendingPullResponses > 0) {
+                        return;
+                    }
                     this.handleLivePush(msg);
                 }
             } catch {
@@ -1102,7 +1308,14 @@ export class SyncClient {
     }
 
     private handleLivePush(packet: Extract<wsPacket, { type: opType.ChangeBatch | opType.SnapshotReset }>): void {
-        if (!this.startupSynced || this.stopped) {
+        if (this.stopped) {
+            return;
+        }
+        if (!this.startupSynced) {
+            this.livePushBacklog.push(packet);
+            if (this.livePushBacklog.length > 100) {
+                this.livePushBacklog.shift();
+            }
             return;
         }
 
@@ -1113,7 +1326,7 @@ export class SyncClient {
                     return;
                 }
                 if (packet.type === opType.ChangeBatch) {
-                    if (BigInt(packet.serverRevision) <= BigInt(this.lastPulledRevision)) {
+                    if (packet.changes.length === 0) {
                         return;
                     }
                     await this.applyChangeBatch(packet);
@@ -1139,6 +1352,14 @@ export class SyncClient {
                 this.closeSocket();
                 this.connectSoon();
             });
+    }
+
+    private drainLivePushBacklog(): void {
+        const backlog = this.livePushBacklog;
+        this.livePushBacklog = [];
+        for (const packet of backlog) {
+            this.handleLivePush(packet);
+        }
     }
 
     private waitForOpen(ws: WebSocket): Promise<void> {
@@ -1271,17 +1492,17 @@ export class SyncClient {
                     return;
                 }
 
-                cleanup();
                 if (msg.type === opType.AuthAck) {
+                    cleanup();
                     resolve(msg);
                     return;
                 }
                 if (msg.type === opType.Deny) {
+                    cleanup();
                     new Notice(msg.message);
                     resolve(null);
                     return;
                 }
-                resolve(null);
             };
             const onClose = () => {
                 cleanup();

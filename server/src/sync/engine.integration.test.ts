@@ -1,7 +1,8 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
 import { sql } from "bun";
 import * as Y from "yjs";
-import { opType } from "../../../shared/types";
+import { opType, SyncMutation, wsPacket } from "../../../shared/types";
+import { decodePacket, encodePacket, PROTOCOL_VERSION } from "../../../shared/protocol";
 import {
   acceptMutations,
   countYjsEvents,
@@ -33,10 +34,134 @@ import {
 import { applyYjsPayload } from "../yjs/apply";
 import { buildBootstrapZip } from "../bootstrap";
 import { rotateClientKey } from "../security";
+import server from "../index";
 
 const CLIENT_A = "integration-client-a";
 const CLIENT_B = "integration-client-b";
 const NOTE_PATH = "notes/test.md";
+
+let wsServer: Bun.Server<unknown> | null = null;
+let wsUrl = "";
+
+function wait(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  return Promise.race([
+    promise,
+    wait(ms).then(() => {
+      throw new Error(message);
+    }),
+  ]);
+}
+
+class TestPeer {
+  private ws: WebSocket | null = null;
+  private packets: wsPacket[] = [];
+  private waiters: {
+    predicate: (packet: wsPacket) => boolean;
+    resolve: (packet: wsPacket) => void;
+  }[] = [];
+  clientKey: string;
+
+  constructor(
+    private readonly clientId: string,
+    clientKey: string,
+    private readonly lastPulledRevision = "0",
+  ) {
+    this.clientKey = clientKey;
+  }
+
+  async connect(): Promise<void> {
+    const ws = new WebSocket(wsUrl);
+    this.ws = ws;
+    await withTimeout(new Promise<void>((resolve, reject) => {
+      ws.addEventListener("open", () => resolve(), { once: true });
+      ws.addEventListener("error", () => reject(new Error("websocket failed to open")), { once: true });
+    }), 2000, "timed out opening websocket");
+    ws.addEventListener("message", event => {
+      const packet = decodePacket(String(event.data));
+      const waiterIndex = this.waiters.findIndex(waiter => waiter.predicate(packet));
+      if (waiterIndex !== -1) {
+        const [waiter] = this.waiters.splice(waiterIndex, 1);
+        waiter.resolve(packet);
+        return;
+      }
+      this.packets.push(packet);
+    });
+    this.send({
+      type: opType.Auth,
+      clientId: this.clientId,
+      clientName: this.clientId,
+      clientKey: this.clientKey,
+      protocolVersion: PROTOCOL_VERSION,
+      lastPulledRevision: this.lastPulledRevision,
+    });
+    const ack = await this.waitFor(packet => packet.type === opType.AuthAck);
+    if (ack.type !== opType.AuthAck) {
+      throw new Error(`Expected AuthAck, got ${ack.type}`);
+    }
+    this.clientKey = ack.newClientKey;
+  }
+
+  send(packet: wsPacket): void {
+    this.ws?.send(encodePacket(packet));
+  }
+
+  waitFor(predicate: (packet: wsPacket) => boolean): Promise<wsPacket> {
+    const existingIndex = this.packets.findIndex(predicate);
+    if (existingIndex !== -1) {
+      const [packet] = this.packets.splice(existingIndex, 1);
+      return Promise.resolve(packet);
+    }
+    return withTimeout(new Promise(resolve => {
+      this.waiters.push({ predicate, resolve });
+    }), 2000, "timed out waiting for websocket packet");
+  }
+
+  waitForClose(): Promise<void> {
+    const ws = this.ws;
+    if (!ws || ws.readyState === WebSocket.CLOSED) {
+      return Promise.resolve();
+    }
+    return withTimeout(new Promise(resolve => {
+      ws.addEventListener("close", () => resolve(), { once: true });
+    }), 2000, "timed out waiting for websocket close");
+  }
+
+  close(): void {
+    this.ws?.close();
+  }
+}
+
+function mutation(path: string, content: string): SyncMutation {
+  return {
+    mutationId: crypto.randomUUID(),
+    operation: "UpsertFile",
+    path,
+    content,
+    storageKind: "text",
+    isYjs: path.endsWith(".md"),
+    isFolder: false,
+    created: Date.now(),
+  };
+}
+
+function updateBatch(segmentId: string, mutations: SyncMutation[]): Extract<wsPacket, { type: opType.UpdateBatch }> {
+  const jsonl = mutations.map((entry, index) => JSON.stringify({ ...entry, id: index + 1 })).join("\n") + "\n";
+  return { type: opType.UpdateBatch, segmentId, jsonl };
+}
+
+function serverPacketPaths(packet: wsPacket): string[] {
+  if (packet.type === opType.ChangeBatch) {
+    return packet.changes.map(change => change.path);
+  }
+  if (packet.type === opType.SnapshotReset) {
+    return packet.files.map(change => change.path);
+  }
+  throw new Error(`Expected server changes, got ${packet.type}`);
+}
 
 function readUint16(bytes: Uint8Array, offset: number): number {
   return bytes[offset] | (bytes[offset + 1] << 8);
@@ -96,6 +221,12 @@ const describeIntegration = dbAvailable ? describe : describe.skip;
 describeIntegration("sync engine postgres integration", () => {
   beforeAll(async () => {
     await setupIntegrationDb();
+    wsServer = Bun.serve({
+      port: 0,
+      fetch: server.fetch,
+      websocket: server.websocket,
+    });
+    wsUrl = `ws://127.0.0.1:${wsServer.port}/worker`;
   });
 
   beforeEach(async () => {
@@ -107,6 +238,11 @@ describeIntegration("sync engine postgres integration", () => {
 
   afterEach(() => {
     resetCompactionConfig();
+  });
+
+  afterAll(() => {
+    wsServer?.stop(true);
+    wsServer = null;
   });
 
   it("bootstraps the first client key from the first auth request", async () => {
@@ -172,6 +308,23 @@ describeIntegration("sync engine postgres integration", () => {
       created: Date.now(),
     }])).rejects.toThrow("plugin-internal path");
   });
+
+  it("accepts plugin release artifacts", async () => {
+    const mainJs = new TextEncoder().encode("// synced plugin bundle");
+    await acceptMutations(CLIENT_A, [{
+      mutationId: crypto.randomUUID(),
+      operation: "UpsertFile",
+      path: ".obsidian/plugins/obsidian-sync-engine/main.js",
+      contentBytes: mainJs,
+      storageKind: "bytea",
+      isYjs: false,
+      byteSize: mainJs.byteLength,
+      contentSha256: "sha-plugin-main",
+      created: Date.now(),
+	    }]);
+	    const file = await getFile(".obsidian/plugins/obsidian-sync-engine/main.js");
+	    expect(new TextDecoder().decode(file?.contentBytes ?? undefined)).toBe("// synced plugin bundle");
+	  });
 
   it("round-trips non-markdown BYTEA files through snapshot metadata", async () => {
     const path = ".obsidian/workspace.json";
@@ -404,6 +557,7 @@ describeIntegration("sync engine postgres integration", () => {
 
   it("YjsUpdate stores payload only in sync_events and updates files.content", async () => {
     await seedMarkdownFile(CLIENT_A, NOTE_PATH, "hello");
+    const beforeUpdateRevision = await getServerRevision();
 
     const doc = makeClientDoc("hello");
     appendToDoc(doc, " world");
@@ -421,6 +575,18 @@ describeIntegration("sync engine postgres integration", () => {
     expect(last.content).toBeNull();
     expect(last.payload).not.toBeNull();
     expect(last.payload!.length).toBeGreaterThan(0);
+
+    const pull = await handlePull({ type: opType.PullSince, revision: beforeUpdateRevision });
+    expect(pull.type).toBe(opType.ChangeBatch);
+    if (pull.type === opType.ChangeBatch) {
+      const yjsChange = pull.changes.find(change => change.operation === "YjsUpdate");
+      expect(yjsChange?.yjsState).toBeInstanceOf(Uint8Array);
+      expect(yjsChange?.yjsState?.length).toBeGreaterThan(0);
+      const materialized = new Y.Doc();
+      Y.applyUpdateV2(materialized, yjsChange!.yjsState!);
+      expect(readDoc(materialized)).toBe("hello world");
+      materialized.destroy();
+    }
   });
 
   it("rejects duplicate mutation_id without double-applying", async () => {
@@ -601,6 +767,18 @@ describeIntegration("sync engine postgres integration", () => {
       contentSha256: "sha-lo",
       created: Date.now(),
     }]);
+    const pluginMainJs = new TextEncoder().encode("// bootstrap plugin");
+    await acceptMutations(CLIENT_A, [{
+      mutationId: crypto.randomUUID(),
+      operation: "UpsertFile",
+      path: ".obsidian/plugins/obsidian-sync-engine/main.js",
+      contentBytes: pluginMainJs,
+      storageKind: "bytea",
+      isYjs: false,
+      byteSize: pluginMainJs.byteLength,
+      contentSha256: "sha-plugin-main",
+      created: Date.now(),
+    }]);
 
     const built = await buildBootstrapZip({
       vaultName: "Bootstrap Vault",
@@ -618,6 +796,7 @@ describeIntegration("sync engine postgres integration", () => {
       expect(new TextDecoder().decode(entries.get("Bootstrap Vault/notes/test.md"))).toBe("bootstrap note");
       expect(entries.get("Bootstrap Vault/.obsidian/workspace.json")).toEqual(new TextEncoder().encode('{"pane":"left"}'));
       expect(entries.get("Bootstrap Vault/assets/photo.bin")).toEqual(new Uint8Array([0, 1, 2, 255]));
+      expect(new TextDecoder().decode(entries.get("Bootstrap Vault/.obsidian/plugins/obsidian-sync-engine/main.js"))).toBe("// bootstrap plugin");
       expect(entries.get("Bootstrap Vault/.obsidian/plugins/obsidian-sync-engine/yjs-state/notes/test.md.state")?.byteLength).toBeGreaterThan(0);
       expect(new TextDecoder().decode(entries.get("Bootstrap Vault/.obsidian/plugins/obsidian-sync-engine/outbox/active.jsonl"))).toBe("");
       expect(new TextDecoder().decode(entries.get("Bootstrap Vault/.obsidian/plugins/obsidian-sync-engine/outbox/meta.json"))).toBe('{"nextRowId":1,"nextSegmentId":1}');
@@ -760,6 +939,43 @@ describeIntegration("sync engine postgres integration", () => {
 
     expect(BigInt(r1)).toBeGreaterThan(BigInt(r0));
     expect(BigInt(r2)).toBeGreaterThan(BigInt(r1));
+  });
+
+  it("websocket fan-out keeps target cursor behind until the client pulls/applies", async () => {
+    const peerB = new TestPeer("ws-client-b", "obs_sync_seed", "0");
+    await peerB.connect();
+    const peerA = new TestPeer("ws-client-a", peerB.clientKey, "0");
+    await peerA.connect();
+
+    try {
+      peerA.send(updateBatch("segment-1", [mutation("notes/a.md", "first")]));
+      await peerA.waitFor(packet => packet.type === opType.BatchAck && packet.segmentId === "segment-1");
+      const firstPush = await peerB.waitFor(packet => packet.type === opType.ChangeBatch || packet.type === opType.SnapshotReset);
+      expect(serverPacketPaths(firstPush)).toEqual(["notes/a.md"]);
+
+      peerA.send(updateBatch("segment-2", [mutation("notes/b.md", "second")]));
+      await peerA.waitFor(packet => packet.type === opType.BatchAck && packet.segmentId === "segment-2");
+      const secondPush = await peerB.waitFor(packet => packet.type === opType.ChangeBatch || packet.type === opType.SnapshotReset);
+
+      expect(serverPacketPaths(secondPush)).toEqual(["notes/a.md", "notes/b.md"]);
+    } finally {
+      peerA.close();
+      peerB.close();
+    }
+  });
+
+  it("websocket auth evicts an older connection with the same clientId", async () => {
+    const first = new TestPeer("duplicate-client", "obs_sync_seed", "0");
+    await first.connect();
+    const second = new TestPeer("duplicate-client", first.clientKey, "0");
+    await second.connect();
+
+    try {
+      await first.waitForClose();
+    } finally {
+      first.close();
+      second.close();
+    }
   });
 });
 

@@ -1,8 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
 import { TFile, TFolder } from "obsidian";
-import { MARKDOWN_FIELD } from "../../../shared/yjsSeed";
+import { docStateFromContent, MARKDOWN_FIELD } from "../../../shared/yjsSeed";
 import { opType, outboxData } from "../../../shared/types";
+import { encodePacket } from "../../../shared/protocol";
 import { SyncClient } from "./SyncClient";
 import { YjsStateStore } from "../yjs/YjsStateStore";
 import { OutboxSegment, OutboxStore } from "../db/db";
@@ -21,6 +22,47 @@ class MemoryOutboxStore implements OutboxStore {
     async releaseSegment(_segment: OutboxSegment): Promise<void> {}
 }
 
+class QueueOutboxStore extends MemoryOutboxStore {
+    claimed = 0;
+    completed = 0;
+    released = 0;
+
+    constructor(private readonly segments: { segment: OutboxSegment; rows: outboxData[] }[]) {
+        super();
+    }
+
+    async claimNextSegment(_sealActive: boolean): Promise<OutboxSegment | null> {
+        const next = this.segments.shift();
+        if (!next) {
+            return null;
+        }
+        this.claimed++;
+        return next.segment;
+    }
+
+    async readSegment(segment: OutboxSegment): Promise<outboxData[]> {
+        if (segment.id === "segment") {
+            return [{
+                mutationId: "kept",
+                operation: "UpsertFile",
+                path: ".obsidian/workspace.json",
+                contentBytes: new TextEncoder().encode("{}"),
+                storageKind: "bytea",
+                created: 2,
+            }];
+        }
+        return [];
+    }
+
+    async completeSegment(_segment: OutboxSegment): Promise<void> {
+        this.completed++;
+    }
+
+    async releaseSegment(_segment: OutboxSegment): Promise<void> {
+        this.released++;
+    }
+}
+
 class MemoryYjsStateStore {
     states = new Map<string, Uint8Array>();
 
@@ -30,6 +72,24 @@ class MemoryYjsStateStore {
 
     async put(path: string, state: Uint8Array): Promise<void> {
         this.states.set(path, new Uint8Array(state));
+    }
+}
+
+class FakeWebSocket extends EventTarget {
+    sent: string[] = [];
+    readyState = 1;
+
+    send(packet: string): void {
+        this.sent.push(packet);
+    }
+
+    close(): void {
+        this.readyState = 3;
+        this.dispatchEvent(new Event("close"));
+    }
+
+    emitPacket(packet: Parameters<typeof encodePacket>[0]): void {
+        this.dispatchEvent(new MessageEvent("message", { data: encodePacket(packet) }));
     }
 }
 
@@ -123,6 +183,9 @@ async function makeClient(
                         throw new Error(`Missing test file: ${path}`);
                     }
                     return typeof value === "string" ? value : textDecoder.decode(value);
+                },
+                write: async (path: string, content: string) => {
+                    files[path] = content;
                 },
                 readBinary: async (path: string) => {
                     const value = files[path];
@@ -222,7 +285,7 @@ describe("SyncClient initial snapshot", () => {
             {
                 mutationId: "ignored",
                 operation: "UpsertFile",
-                path: ".obsidian/plugins/obsidian-sync-engine/.hotreload",
+                path: ".obsidian/plugins/obsidian-sync-engine/data.json",
                 contentBytes: new Uint8Array([1]),
                 created: 1,
             },
@@ -244,7 +307,7 @@ describe("SyncClient initial snapshot", () => {
         }).prepareSegmentJsonl({} as WebSocket, { id: "segment", path: "pending.jsonl" });
 
         expect(jsonl).toContain(".obsidian/workspace.json");
-        expect(jsonl).not.toContain(".hotreload");
+        expect(jsonl).not.toContain("data.json");
     });
 
     it("waits for startup sync before requesting a bootstrap link", async () => {
@@ -312,6 +375,141 @@ describe("SyncClient initial snapshot", () => {
         expect(liveClient.lastPulledRevision).toBe("2");
     });
 
+    it("applies a remote live batch even when a local upload ack has a newer revision", async () => {
+        const files = { "notes/existing.md": "before" };
+        const { client } = await makeClient(files);
+        const liveClient = client as unknown as {
+            startupSynced: boolean;
+            lastPulledRevision: string;
+            lastUploadedRevisionHint: string;
+            livePushPromise: Promise<void>;
+            handleLivePush: (packet: unknown) => void;
+            recordUploadAckRevision: (revision: string) => void;
+        };
+        liveClient.startupSynced = true;
+        liveClient.lastPulledRevision = "1";
+
+        liveClient.recordUploadAckRevision("3");
+        expect(liveClient.lastPulledRevision).toBe("1");
+        expect(liveClient.lastUploadedRevisionHint).toBe("3");
+
+        liveClient.handleLivePush({
+            type: opType.ChangeBatch,
+            fromRevision: "1",
+            serverRevision: "2",
+            changes: [{
+                mutationId: "remote-2",
+                operation: "UpsertFile",
+                path: "notes/existing.md",
+                content: "remote revision 2",
+                storageKind: "text",
+                isFolder: false,
+                isYjs: false,
+                created: Date.now(),
+                revision: "2",
+                clientId: "other-client",
+            }],
+        });
+        await liveClient.livePushPromise;
+
+        expect(files["notes/existing.md"]).toBe("remote revision 2");
+        expect(liveClient.lastPulledRevision).toBe("2");
+    });
+
+    it("replaces stale local markdown and state from a YjsUpdate full server state", async () => {
+        const files = { "notes/existing.md": "stale local" };
+        const stateStore = new MemoryYjsStateStore();
+        await stateStore.put("notes/existing.md", docStateFromContent("stale local", Y));
+        const { client } = await makeClient(files, stateStore);
+        const yjsState = docStateFromContent("server materialized", Y);
+        const testClient = client as unknown as {
+            lastPulledRevision: string;
+            applyChangeBatch: (packet: unknown) => Promise<void>;
+        };
+        testClient.lastPulledRevision = "1";
+
+        await testClient.applyChangeBatch({
+            type: opType.ChangeBatch,
+            fromRevision: "1",
+            serverRevision: "2",
+            changes: [{
+                mutationId: "remote-yjs",
+                operation: "YjsUpdate",
+                path: "notes/existing.md",
+                data: new Uint8Array([0, 1, 2]),
+                yjsState,
+                created: Date.now(),
+                revision: "2",
+                clientId: "other-client",
+            }],
+        });
+
+        expect(files["notes/existing.md"]).toBe("server materialized");
+        expect(readYjsContent(stateStore.states.get("notes/existing.md")!)).toBe("server materialized");
+        expect(testClient.lastPulledRevision).toBe("2");
+    });
+
+    it("snapshot upsert overwrites an adapter-existing text file that is not loaded", async () => {
+        const files = { "notes/unloaded.md": "local" };
+        const { client } = await makeClient(files);
+        const testClient = client as unknown as {
+            lastPulledRevision: string;
+            applySnapshotReset: (packet: unknown) => Promise<void>;
+        };
+        testClient.lastPulledRevision = "0";
+
+        await testClient.applySnapshotReset({
+            type: opType.SnapshotReset,
+            targetRevision: "5",
+            files: [{
+                mutationId: "snapshot:notes/unloaded.md:5",
+                operation: "UpsertFile",
+                path: "notes/unloaded.md",
+                content: "server",
+                storageKind: "text",
+                isFolder: false,
+                isYjs: true,
+                created: Date.now(),
+                revision: "5",
+                clientId: "server",
+            }],
+        });
+
+        expect(files["notes/unloaded.md"]).toBe("server");
+        expect(testClient.lastPulledRevision).toBe("5");
+    });
+
+    it("skips echoed local change rows while still advancing through them", async () => {
+        const files = { "notes/existing.md": "local" };
+        const { client } = await makeClient(files);
+        const testClient = client as unknown as {
+            lastPulledRevision: string;
+            applyChangeBatch: (packet: unknown) => Promise<void>;
+        };
+        testClient.lastPulledRevision = "0";
+
+        await testClient.applyChangeBatch({
+            type: opType.ChangeBatch,
+            fromRevision: "0",
+            serverRevision: "1",
+            changes: [{
+                mutationId: "local-echo",
+                operation: "UpsertFile",
+                path: "notes/existing.md",
+                content: "server echo",
+                storageKind: "text",
+                isFolder: false,
+                isYjs: true,
+                created: Date.now(),
+                revision: "1",
+                clientId: "client",
+            }],
+        });
+
+        expect(files["notes/existing.md"]).toBe("local");
+        expect(testClient.lastPulledRevision).toBe("1");
+    });
+
     it("does not regress lastPulledRevision when a stale live push finishes after a batch ack", async () => {
         const persisted: string[] = [];
         const { client } = await makeClient({ "notes/existing.md": "before" });
@@ -367,5 +565,186 @@ describe("SyncClient initial snapshot", () => {
 
         expect(liveClient.lastPulledRevision).toBe("3");
         expect(persisted).toEqual(["3"]);
+    });
+
+    it("waitForAuthAck ignores bootstrap status packets before AuthAck", async () => {
+        const { client } = await makeClient({ "notes/existing.md": "before" });
+        const ws = new FakeWebSocket();
+        const waiter = (client as unknown as {
+            waitForAuthAck: (socket: WebSocket) => Promise<unknown>;
+        }).waitForAuthAck(ws as unknown as WebSocket);
+
+        ws.emitPacket({
+            type: opType.BootstrapStatus,
+            status: "building",
+            vaultName: "Vault",
+            message: "Building",
+        });
+        ws.emitPacket({
+            type: opType.AuthAck,
+            newClientKey: "obs_sync_rotated",
+            serverRevision: "9",
+        });
+
+        await expect(waiter).resolves.toMatchObject({
+            type: opType.AuthAck,
+            serverRevision: "9",
+        });
+    });
+
+    it("does not close the websocket when refreshing blob auth during startup sync", async () => {
+        const { client } = await makeClient({ "assets/image.bin": new Uint8Array([1, 2, 3]) });
+        const testClient = client as unknown as {
+            startupSyncPromise: Promise<void> | null;
+            closeSocket: () => void;
+            refreshBlobAuth: () => Promise<string>;
+            reauthenticateOpenSocket: () => Promise<void>;
+        };
+        testClient.startupSyncPromise = Promise.resolve();
+        vi.spyOn(testClient, "reauthenticateOpenSocket").mockResolvedValue(undefined);
+        const closeSpy = vi.spyOn(testClient, "closeSocket");
+
+        await expect(testClient.refreshBlobAuth()).resolves.toBe("obs_sync_test");
+        expect(closeSpy).not.toHaveBeenCalled();
+    });
+
+    it("skips snapshot reset when the target revision is already current", async () => {
+        const persisted: string[] = [];
+        const files = { "notes/existing.md": "before" };
+        const { client } = await makeClient(files);
+        const testClient = client as unknown as {
+            lastPulledRevision: string;
+            applySnapshotReset: (packet: unknown) => Promise<void>;
+        };
+        (client as unknown as {
+            onLastPulledRevisionChanged: (revision: string) => Promise<void>;
+        }).onLastPulledRevisionChanged = async revision => {
+            persisted.push(revision);
+        };
+        testClient.lastPulledRevision = "104";
+
+        await testClient.applySnapshotReset({
+            type: opType.SnapshotReset,
+            targetRevision: "104",
+            files: [{
+                mutationId: "snapshot:notes/existing.md:104",
+                operation: "UpsertFile",
+                path: "notes/existing.md",
+                content: "after",
+                storageKind: "text",
+                isFolder: false,
+                isYjs: true,
+                created: Date.now(),
+                revision: "104",
+                clientId: "server",
+            }],
+        });
+
+        expect(files["notes/existing.md"]).toBe("before");
+        expect(persisted).toEqual([]);
+    });
+
+    it("queues live pushes during startup and drains them after startup sync", async () => {
+        const files = { "notes/existing.md": "before" };
+        const { client } = await makeClient(files);
+        const liveClient = client as unknown as {
+            startupSynced: boolean;
+            lastPulledRevision: string;
+            livePushPromise: Promise<void>;
+            livePushBacklog: unknown[];
+            drainLivePushBacklog: () => void;
+            handleLivePush: (packet: unknown) => void;
+        };
+        liveClient.startupSynced = false;
+        liveClient.lastPulledRevision = "1";
+
+        liveClient.handleLivePush({
+            type: opType.ChangeBatch,
+            fromRevision: "1",
+            serverRevision: "2",
+            changes: [{
+                mutationId: "remote-queued",
+                operation: "UpsertFile",
+                path: "notes/existing.md",
+                content: "after",
+                storageKind: "text",
+                isFolder: false,
+                isYjs: false,
+                created: Date.now(),
+                revision: "2",
+                clientId: "other-client",
+            }],
+        });
+
+        expect(files["notes/existing.md"]).toBe("before");
+        expect(liveClient.livePushBacklog).toHaveLength(1);
+
+        liveClient.startupSynced = true;
+        liveClient.drainLivePushBacklog();
+        await liveClient.livePushPromise;
+
+        expect(files["notes/existing.md"]).toBe("after");
+        expect(liveClient.lastPulledRevision).toBe("2");
+        expect(liveClient.livePushBacklog).toHaveLength(0);
+    });
+
+    it("does not advance revision on an empty change batch with a higher server cursor", async () => {
+        const persisted: string[] = [];
+        const { client } = await makeClient({ "notes/existing.md": "before" });
+        const testClient = client as unknown as {
+            lastPulledRevision: string;
+            applyChangeBatch: (packet: unknown) => Promise<void>;
+        };
+        (client as unknown as {
+            onLastPulledRevisionChanged: (revision: string) => Promise<void>;
+        }).onLastPulledRevisionChanged = async revision => {
+            persisted.push(revision);
+        };
+        testClient.lastPulledRevision = "5";
+
+        await testClient.applyChangeBatch({
+            type: opType.ChangeBatch,
+            fromRevision: "5",
+            serverRevision: "9",
+            changes: [],
+        });
+
+        expect(testClient.lastPulledRevision).toBe("5");
+        expect(persisted).toEqual([]);
+    });
+
+    it("drainOutbox waits for in-flight live push before claiming a segment", async () => {
+        vi.useFakeTimers();
+        try {
+            const outbox = new QueueOutboxStore([{ segment: { id: "segment", path: "pending.jsonl" }, rows: [] }]);
+            const { client } = await makeClient({ ".obsidian/workspace.json": "{}" }, new MemoryYjsStateStore(), outbox);
+            let releaseLive!: () => void;
+            const liveBlocked = new Promise<void>(resolve => {
+                releaseLive = resolve;
+            });
+            const testClient = client as unknown as {
+                startupSynced: boolean;
+                livePushPromise: Promise<void>;
+                drainOutbox: () => Promise<void>;
+                sendSegment: (_segment: OutboxSegment) => Promise<void>;
+            };
+            testClient.startupSynced = true;
+            testClient.livePushPromise = liveBlocked;
+            testClient.sendSegment = vi.fn(async () => {});
+
+            const drain = testClient.drainOutbox();
+            await Promise.resolve();
+            expect(outbox.claimed).toBe(0);
+
+            releaseLive();
+            await Promise.resolve();
+            await vi.advanceTimersByTimeAsync(3000);
+            await drain;
+
+            expect(outbox.claimed).toBe(1);
+            expect(outbox.completed).toBe(1);
+        } finally {
+            vi.useRealTimers();
+        }
     });
 });

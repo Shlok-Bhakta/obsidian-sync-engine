@@ -26,6 +26,15 @@ function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
+function exactArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+	return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+}
+
+async function sha256Hex(bytes: Uint8Array): Promise<string> {
+	const hash = await crypto.subtle.digest("SHA-256", exactArrayBuffer(bytes));
+	return [...new Uint8Array(hash)].map(byte => byte.toString(16).padStart(2, "0")).join("");
+}
+
 export default class SyncEngine extends Plugin {
 	settings: SyncEngineSettings;
 	db: OutboxStore;
@@ -39,6 +48,11 @@ export default class SyncEngine extends Plugin {
 	private bootstrapStatusListeners: Set<() => void> = new Set();
 	private pendingFileTimers: Map<Path, number> = new Map();
 	private configDirStats: Map<Path, string> = new Map();
+	/** Content hashes of syncable config files on disk before the first startup pull. */
+	private bootConfigSha = new Map<Path, string>();
+	/** Last config file bytes applied from the server during startup/live pull. */
+	private serverConfigBytes = new Map<Path, Uint8Array>();
+	private serverConfigSha = new Map<Path, string>();
 	async onload() {
 		await this.loadSettings();
 		log.info("plugin loading", {
@@ -55,6 +69,7 @@ export default class SyncEngine extends Plugin {
 		this.pruningDocs = new Set<Path>();
 		await this.db.open();
 		await this.yjsStateStore.open();
+		void this.captureBootConfigShas();
 		this.yjsIndexer = new VaultYjsIndexer(
 			this.app,
 			this.yjsStateStore,
@@ -86,6 +101,13 @@ export default class SyncEngine extends Plugin {
 					listener();
 				}
 			},
+			() => {
+				this.startConfigDirPoller();
+			},
+			(path, bytes) => {
+				void this.recordRemoteConfigApplied(path, bytes);
+			},
+			this.manifest.id,
 		);
 		this.app.workspace.onLayoutReady(() => {
 			log.info("workspace ready; starting Yjs indexer");
@@ -93,7 +115,6 @@ export default class SyncEngine extends Plugin {
 			void this.yjsIndexer.waitForInitialScan().finally(() => {
 				log.info("initial Yjs index complete; starting sync client");
 				this.syncClient.start();
-				this.startConfigDirPoller();
 			});
 		});
 
@@ -377,11 +398,74 @@ export default class SyncEngine extends Plugin {
 		this.pendingFileTimers.set(path, timer);
 	}
 
+	private async captureBootConfigShas(): Promise<void> {
+		for (const path of await this.listConfigDirFiles(this.app.vault.configDir)) {
+			if (!this.isSyncableConfigPath(path)) {
+				continue;
+			}
+			try {
+				const bytes = new Uint8Array(await this.app.vault.adapter.readBinary(path));
+				this.bootConfigSha.set(path, await sha256Hex(bytes));
+			} catch (error) {
+				log.debug("failed to capture boot config hash", { path, ...errorContext(error) });
+			}
+		}
+	}
+
+	private async recordRemoteConfigApplied(path: string, bytes: Uint8Array): Promise<void> {
+		if (!this.isSyncableConfigPath(path)) {
+			return;
+		}
+		const snapshot = new Uint8Array(bytes);
+		this.serverConfigBytes.set(path, snapshot);
+		this.serverConfigSha.set(path, await sha256Hex(snapshot));
+		const stat = await this.app.vault.adapter.stat(path);
+		if (stat?.type === "file") {
+			this.configDirStats.set(path, `${stat.mtime}:${stat.size}`);
+		}
+	}
+
+	private async restoreServerConfig(path: string): Promise<boolean> {
+		const bytes = this.serverConfigBytes.get(path);
+		if (!bytes) {
+			return false;
+		}
+		await this.app.vault.adapter.writeBinary(path, exactArrayBuffer(bytes));
+		const stat = await this.app.vault.adapter.stat(path);
+		if (stat?.type === "file") {
+			this.configDirStats.set(path, `${stat.mtime}:${stat.size}`);
+		}
+		log.info("restored config file from last server version", { path });
+		return true;
+	}
+
+	private isSyncableConfigPath(path: string): boolean {
+		return this.isConfigDirPath(path)
+			&& shouldSyncPath(path, this.app.vault.configDir, this.manifest.id)
+			&& !shouldUseYjs(path, this.app.vault.configDir);
+	}
+
 	private async queuePathUpsert(path: string): Promise<void> {
 		if (this.syncClient?.isApplyingRemoteChanges() || !shouldSyncPath(path, this.app.vault.configDir, this.manifest.id)) {
 			return;
 		}
 		const bytes = new Uint8Array(await this.app.vault.adapter.readBinary(path));
+		let localSha: string | undefined;
+		if (this.isSyncableConfigPath(path)) {
+			localSha = await sha256Hex(bytes);
+			const serverSha = this.serverConfigSha.get(path);
+			if (serverSha && localSha === serverSha) {
+				log.debug("skip config upsert; matches last server version", { path });
+				return;
+			}
+			const bootSha = this.bootConfigSha.get(path);
+			if (serverSha && bootSha && localSha === bootSha && localSha !== serverSha) {
+				if (await this.restoreServerConfig(path)) {
+					log.warn("ignored obsidian config rewrite that reverted a synced change", { path });
+					return;
+				}
+			}
+		}
 		if (bytes.byteLength > INLINE_BYTES_LIMIT) {
 			const metadata = await this.syncClient.uploadBlob(path, bytes);
 			await this.db.putInOutbox({
@@ -411,6 +495,12 @@ export default class SyncEngine extends Plugin {
 			created: Date.now(),
 		});
 		log.info("queued file upsert", { path, byteSize: bytes.byteLength });
+		if (this.isSyncableConfigPath(path)) {
+			const appliedSha = localSha ?? await sha256Hex(bytes);
+			this.bootConfigSha.set(path, appliedSha);
+			this.serverConfigSha.set(path, appliedSha);
+			this.serverConfigBytes.set(path, new Uint8Array(bytes));
+		}
 		this.syncClient.wakeSoon();
 	}
 

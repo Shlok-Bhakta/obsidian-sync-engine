@@ -41,6 +41,7 @@ const BOOTSTRAP_TTL_MS = 10 * 60 * 1000;
 
 type AuthenticatedSocket = {
   send: (data: string) => void;
+  close?: (code?: number, reason?: string) => void;
 };
 
 type BootstrapLink = {
@@ -391,6 +392,21 @@ function revisionFromServerPacket(packet: wsPacket): string | null {
   return null;
 }
 
+function evictDuplicateClientConnection(client: Client): void {
+  for (const existing of authenticatedClients) {
+    if (existing === client || existing.clientId !== client.clientId) {
+      continue;
+    }
+    authenticatedClients.delete(existing);
+    if (existing.socket) {
+      authenticatedSockets.delete(existing.socket);
+      existing.socket.close?.(4000, "Client reconnected");
+      existing.socket = null;
+    }
+    existing.isAuthenticated = false;
+  }
+}
+
 async function pushChangesToOtherClients(sender: Client, revision: string): Promise<void> {
   const pushes: Promise<void>[] = [];
   for (const target of authenticatedClients) {
@@ -402,7 +418,6 @@ async function pushChangesToOtherClients(sender: Client, revision: string): Prom
         const fromRevision = target.lastPulledRevision;
         const packet = await handlePull({ type: opType.PullSince, revision: fromRevision });
         target.socket!.send(encodePacket(packet));
-        target.lastPulledRevision = revisionFromServerPacket(packet) ?? revision;
         log.info("pushed changes to websocket client", {
           senderClientId: sender.clientId,
           targetClientId: target.clientId,
@@ -473,6 +488,7 @@ app.get(
               clientProtocolVersion: data.protocolVersion,
               serverProtocolVersion: PROTOCOL_VERSION,
             });
+            ws.close(1008, "Protocol mismatch");
             return;
           }
 
@@ -481,6 +497,7 @@ app.get(
             const deny: wsPacket = { type: opType.Deny, message: "Client key is invalid" };
             ws.send(encodePacket(deny));
             log.warn("websocket auth denied", { clientId: data.clientId, clientName: data.clientName });
+            ws.close(1008, "Authentication denied");
             return;
           }
 
@@ -496,6 +513,7 @@ app.get(
           client.clientName = data.clientName;
           client.lastPulledRevision = data.lastPulledRevision;
           client.socket = ws;
+          evictDuplicateClientConnection(client);
           authenticatedClients.add(client);
           authenticatedSockets.add(client.socket);
           log.info("websocket authenticated", {
@@ -596,7 +614,7 @@ app.get(
             segmentId: data.segmentId,
             revision,
           });
-          await pushChangesToOtherClients(client, revision);
+          void pushChangesToOtherClients(client, revision);
           return;
         }
 
@@ -616,7 +634,7 @@ app.get(
             segmentId: data.segmentId,
             revision,
           });
-          await pushChangesToOtherClients(client, revision);
+          void pushChangesToOtherClients(client, revision);
           return;
         }
 
@@ -626,6 +644,7 @@ app.get(
             message: "Legacy Update packets are not supported; use DocSync and UpdateBatch",
           };
           ws.send(encodePacket(deny));
+          ws.close(1008, "Unsupported packet");
           return;
         }
         } catch (error) {

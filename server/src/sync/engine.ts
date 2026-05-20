@@ -65,6 +65,7 @@ export type EventRow = {
   byteSize: string | null;
   contentSha256: string | null;
   payload: Uint8Array | null;
+  yjsState: Uint8Array | null;
   compacted: boolean;
   isFolder: boolean | null;
   isYjs: boolean | null;
@@ -154,6 +155,7 @@ export async function listSyncEvents(path: string): Promise<EventRow[]> {
       byte_size::TEXT AS "byteSize",
       content_sha256 AS "contentSha256",
       payload,
+      NULL::BYTEA AS "yjsState",
       compacted,
       is_folder AS "isFolder",
       is_yjs AS "isYjs",
@@ -217,6 +219,7 @@ function rowToChange(row: EventRow): ServerChange {
     content: row.content ?? undefined,
     contentBytes: row.storageKind === "bytea" ? row.contentBytes ?? undefined : undefined,
     data: row.payload ?? undefined,
+    yjsState: row.operation === "YjsUpdate" && row.yjsState ? row.yjsState : undefined,
     isFolder: row.isFolder ?? undefined,
     isYjs: row.isYjs ?? undefined,
     storageKind: row.storageKind ?? undefined,
@@ -256,30 +259,38 @@ export async function snapshotPacket(): Promise<Extract<wsPacket, { type: opType
 export async function changeBatchPacket(fromRevision: string): Promise<Extract<wsPacket, { type: opType.ChangeBatch }>> {
   const rows = await sql<EventRow[]>`
     SELECT
-      revision::TEXT AS revision,
-      client_id AS "clientId",
-      mutation_id AS "mutationId",
-      operation,
-      path,
-      to_path AS "toPath",
-      content,
-      content_bytes AS "contentBytes",
-      storage_kind AS "storageKind",
-      byte_size::TEXT AS "byteSize",
-      content_sha256 AS "contentSha256",
-      payload,
-      compacted,
-      is_folder AS "isFolder",
-      is_yjs AS "isYjs",
-      EXTRACT(EPOCH FROM created_at) * 1000 AS "createdAt"
-    FROM sync_events
-    WHERE revision > ${fromRevision}
-    ORDER BY revision ASC;
+      e.revision::TEXT AS revision,
+      e.client_id AS "clientId",
+      e.mutation_id AS "mutationId",
+      e.operation,
+      e.path,
+      e.to_path AS "toPath",
+      e.content,
+      e.content_bytes AS "contentBytes",
+      e.storage_kind AS "storageKind",
+      e.byte_size::TEXT AS "byteSize",
+      e.content_sha256 AS "contentSha256",
+      e.payload,
+      CASE
+        WHEN e.operation = 'YjsUpdate' AND f.deleted = FALSE THEN f.yjs_state
+        ELSE NULL
+      END AS "yjsState",
+      e.compacted,
+      e.is_folder AS "isFolder",
+      e.is_yjs AS "isYjs",
+      EXTRACT(EPOCH FROM e.created_at) * 1000 AS "createdAt"
+    FROM sync_events e
+    LEFT JOIN files f ON f.path = e.path
+    WHERE e.revision > ${fromRevision}
+    ORDER BY e.revision ASC;
   `;
+  const serverRevision = rows.reduce((max, row) => {
+    return BigInt(row.revision) > BigInt(max) ? row.revision : max;
+  }, fromRevision);
   return {
     type: opType.ChangeBatch,
     fromRevision,
-    serverRevision: await getServerRevision(),
+    serverRevision,
     changes: rows.map(rowToChange),
   };
 }

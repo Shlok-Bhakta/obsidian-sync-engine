@@ -9,17 +9,27 @@ export function pluginInternalPrefix(configDir: string, pluginId: string): strin
     return `${normalizeConfigDir(configDir)}/plugins/${pluginId}`;
 }
 
+/** Plugin-local state that must not be replicated between clients. */
 export function isPluginInternalPath(
     path: string,
     configDir = DEFAULT_CONFIG_DIR,
     pluginId = DEFAULT_PLUGIN_ID,
 ): boolean {
     const prefix = pluginInternalPrefix(configDir, pluginId);
-    return path === prefix || path.startsWith(`${prefix}/`);
+    if (path === `${prefix}/data.json`) {
+        return true;
+    }
+    if (path === `${prefix}/yjs-state` || path.startsWith(`${prefix}/yjs-state/`)) {
+        return true;
+    }
+    if (path === `${prefix}/outbox` || path.startsWith(`${prefix}/outbox/`)) {
+        return true;
+    }
+    return false;
 }
 
 export function isIgnoredVaultPath(path: string): boolean {
-    return path === ".trash" || path.startsWith(".trash/");
+    return path === ".trash" || path.startsWith(".trash/") || path.split("/").includes(".git");
 }
 
 export function shouldSyncPath(
