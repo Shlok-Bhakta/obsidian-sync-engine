@@ -14,6 +14,7 @@ export class DocSync {
     private ydoc = new Y.Doc();
     private ytext = this.ydoc.getText(MARKDOWN_FIELD);
     private openedTime = Date.now();
+    private localRevision = 0;
 
 
     constructor(
@@ -37,6 +38,10 @@ export class DocSync {
         return this.ydoc;
     }
 
+    public getLocalRevision(): number {
+        return this.localRevision;
+    }
+
     public async persistState(): Promise<void> {
         await this.stateStore.put(this.path, Y.encodeStateAsUpdateV2(this.ydoc));
     }
@@ -46,7 +51,16 @@ export class DocSync {
         this.ydoc = new Y.Doc();
         Y.applyUpdateV2(this.ydoc, state);
         this.ytext = this.ydoc.getText(MARKDOWN_FIELD);
+        this.localRevision++;
         await this.persistState();
+    }
+
+    public async replaceStateIfRevision(state: Uint8Array, expectedRevision: number): Promise<boolean> {
+        if (this.localRevision !== expectedRevision) {
+            return false;
+        }
+        await this.replaceState(state);
+        return true;
     }
 
     public encodeStateVector(): Uint8Array {
@@ -82,6 +96,7 @@ export class DocSync {
                 }
             }
         }, "user changes");
+        this.localRevision++;
         row.data = Y.encodeStateAsUpdateV2(this.ydoc, before);
         void Promise.all([
             this.db.putInOutbox(row),
@@ -95,6 +110,7 @@ export class DocSync {
 
     public applyRemoteUpdate(update: Uint8Array): string {
         Y.applyUpdateV2(this.ydoc, update);
+        this.localRevision++;
         void this.persistState().catch(error => {
             log.error("failed to persist remote Yjs state", { path: this.path, ...errorContext(error) });
         });

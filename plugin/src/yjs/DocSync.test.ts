@@ -207,4 +207,18 @@ describe("DocSync editor typing", () => {
         expect(content).toBe("hello from another device");
         expect(decodeContent(stateStore.states.get(PATH)!)).toBe("hello from another device");
     });
+
+    it("refuses to replace state when local edits advanced the open document", async () => {
+        const { docSync, stateStore } = setup("qwertyuiop");
+        const expectedRevision = docSync.getLocalRevision();
+        const update = editorChange("qwertyuiop", { from: 9, to: 10 });
+
+        applyChanges(docSync, update.changes);
+        const replaced = await docSync.replaceStateIfRevision(docStateFromContent("stale", Y), expectedRevision);
+        await tick();
+
+        expect(replaced).toBe(false);
+        expect(docSync.getYdoc().getText(MARKDOWN_FIELD).toString()).toBe("qwertyuio");
+        expect(decodeContent(stateStore.states.get(PATH)!)).toBe("qwertyuio");
+    });
 });

@@ -965,6 +965,7 @@ export class SyncClient {
                 destroy: () => void;
                 stateVector: Uint8Array;
                 created: number;
+                openDoc?: DocSync;
             }[] = [];
 
             for (const path of yjsPaths) {
@@ -976,6 +977,7 @@ export class SyncClient {
                     destroy,
                     stateVector: Y.encodeStateVector(doc),
                     created: Math.max(...pathRows.map(row => row.created)),
+                    openDoc: this.getDocSync(path),
                 });
             }
 
@@ -1008,10 +1010,16 @@ export class SyncClient {
                         syncResult.yjsState,
                         target,
                     );
-                    await this.stateStore.put(entry.path, state);
-                    const openDoc = this.getDocSync(entry.path);
-                    if (openDoc) {
-                        await openDoc.replaceState(state);
+                    if (entry.openDoc) {
+                        const replaceRevision = entry.openDoc.getLocalRevision();
+                        if (!(await entry.openDoc.replaceStateIfRevision(state, replaceRevision))) {
+                            this.log.debug("skipped stale open-doc state replacement after DocSync", {
+                                segmentId: segment.id,
+                                path: entry.path,
+                            });
+                        }
+                    } else {
+                        await this.stateStore.put(entry.path, state);
                     }
                     coalesced.set(entry.path, {
                         mutationId: crypto.randomUUID(),

@@ -25,12 +25,14 @@ export class YjsStateStore {
     }
 
     async put(vaultPath: string, state: Uint8Array): Promise<void> {
-        const path = this.statePathFor(vaultPath);
-        await this.ensureDirectory(dirname(path));
-        await this.app.vault.adapter.writeBinary(path, state.buffer.slice(
-            state.byteOffset,
-            state.byteOffset + state.byteLength,
-        ));
+        return this.runSerialized(async () => {
+            const path = this.statePathFor(vaultPath);
+            await this.ensureDirectory(dirname(path));
+            await this.app.vault.adapter.writeBinary(path, state.buffer.slice(
+                state.byteOffset,
+                state.byteOffset + state.byteLength,
+            ));
+        });
     }
 
     async rename(fromVaultPath: string, toVaultPath: string, isFolder: boolean): Promise<void> {

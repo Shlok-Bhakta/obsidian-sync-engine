@@ -5,6 +5,7 @@ import { YjsStateStore } from "./YjsStateStore";
 class MemoryAdapter {
     private readonly files = new Map<string, Uint8Array>();
     private readonly dirs = new Set<string>();
+    onWriteBinary?: (path: string, data: Uint8Array) => Promise<void>;
 
     async exists(path: string): Promise<boolean> {
         return this.files.has(path) || this.dirs.has(path);
@@ -23,7 +24,9 @@ class MemoryAdapter {
     }
 
     async writeBinary(path: string, data: ArrayBuffer): Promise<void> {
-        this.files.set(normalizePath(path), new Uint8Array(data));
+        const bytes = new Uint8Array(data);
+        await this.onWriteBinary?.(path, bytes);
+        this.files.set(normalizePath(path), bytes);
     }
 
     async remove(path: string): Promise<void> {
@@ -100,7 +103,36 @@ function makeStore(): { store: YjsStateStore; adapter: MemoryAdapter; yjsDir: st
     return { store, adapter, yjsDir };
 }
 
-describe("YjsStateStore.rename", () => {
+describe("YjsStateStore", () => {
+    it("serializes concurrent state writes in enqueue order", async () => {
+        const { store, adapter } = makeStore();
+        await store.open();
+        let releaseFirst!: () => void;
+        const firstWriteBlocked = new Promise<void>(resolve => {
+            releaseFirst = resolve;
+        });
+        let firstWriteStarted!: () => void;
+        const firstWriteDidStart = new Promise<void>(resolve => {
+            firstWriteStarted = resolve;
+        });
+        adapter.onWriteBinary = async (_path, data) => {
+            if (data[0] === 1) {
+                firstWriteStarted();
+                await firstWriteBlocked;
+            }
+        };
+
+        const first = store.put("notes/test.md", new Uint8Array([1]));
+        await firstWriteDidStart;
+        const second = store.put("notes/test.md", new Uint8Array([2]));
+        await Promise.resolve();
+
+        releaseFirst();
+        await Promise.all([first, second]);
+
+        expect(await store.get("notes/test.md")).toEqual(new Uint8Array([2]));
+    });
+
     it("serializes folder and child renames without losing state", async () => {
         const { store, adapter, yjsDir } = makeStore();
         await store.open();
