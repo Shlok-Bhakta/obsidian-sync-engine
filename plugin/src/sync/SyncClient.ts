@@ -10,6 +10,8 @@ import { SyncEngineSettings } from "../settings";
 import { DocSync } from "../yjs/DocSync";
 import { YjsStateStore } from "../yjs/YjsStateStore";
 import { BlobClient } from "./BlobClient";
+import { exactArrayBuffer, VaultMutator } from "./VaultMutator";
+import { YjsApplicator } from "./YjsApplicator";
 import { errorContext, Logger } from "../../../shared/logger";
 import { log as rootLog } from "../logger";
 
@@ -21,6 +23,7 @@ const CONNECT_BACKOFF_INITIAL_MS = 5000;
 const CONNECT_BACKOFF_MAX_MS = 60000;
 const WS_WAIT_TIMEOUT_MS = 60_000;
 const INLINE_BYTES_LIMIT = 64 * 1024;
+const FAILURE_NOTICE_THROTTLE_MS = 60_000;
 
 function sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
@@ -46,6 +49,10 @@ function asError(error: unknown): Error {
     return error instanceof Error ? error : new Error(String(error));
 }
 
+function shortErrorMessage(error: unknown): string {
+    return asError(error).message;
+}
+
 function summarizeMutations(mutations: SyncMutation[]): Record<string, number> {
     return mutations.reduce<Record<string, number>>((summary, mutation) => {
         summary[mutation.operation] = (summary[mutation.operation] ?? 0) + 1;
@@ -58,6 +65,10 @@ function summarizeServerChanges(changes: ServerChange[]): Record<string, number>
         summary[change.operation] = (summary[change.operation] ?? 0) + 1;
         return summary;
     }, {});
+}
+
+function remoteChangePaths(change: ServerChange): string[] {
+    return change.toPath ? [change.path, change.toPath] : [change.path];
 }
 
 function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
@@ -76,27 +87,10 @@ function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promi
     });
 }
 
-function dirname(path: string): string {
-    const index = path.lastIndexOf("/");
-    return index === -1 ? "" : path.slice(0, index);
-}
-
 type SnapshotPath = {
     path: string;
     isFolder: boolean;
 };
-
-function exactArrayBuffer(bytes: Uint8Array): ArrayBuffer {
-    return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
-}
-
-function yjsContentFromState(state: Uint8Array): string {
-    const doc = new Y.Doc();
-    Y.applyUpdateV2(doc, state);
-    const content = doc.getText(MARKDOWN_FIELD).toJSON();
-    doc.destroy();
-    return content;
-}
 
 async function sha256Hex(bytes: Uint8Array): Promise<string> {
     const hash = await crypto.subtle.digest("SHA-256", exactArrayBuffer(bytes));
@@ -129,6 +123,9 @@ export class SyncClient {
     private refreshAuthPromise: Promise<string> | null = null;
     private catchUpPromise: Promise<void> | null = null;
     private pendingPullResponses = 0;
+    private lastFailureNoticeAt = 0;
+    private readonly vaultMutator: VaultMutator;
+    private readonly yjsApplicator: YjsApplicator;
 
     constructor(
         private readonly app: App,
@@ -152,14 +149,26 @@ export class SyncClient {
         this.lastPulledRevision = settings.lastPulledRevision;
         this.lastUploadedRevisionHint = settings.lastPulledRevision;
         this.blobClient = new BlobClient(settings.backendUrl, settings.clientKey, () => this.refreshBlobAuth());
+        this.vaultMutator = new VaultMutator(app, stateStore);
+        this.yjsApplicator = new YjsApplicator({
+            stateStore,
+            vaultMutator: this.vaultMutator,
+            readVaultContent: path => this.readVaultContent(path),
+            getDocSync,
+            onOpenYjsContent,
+            flushOpenYjsChanges,
+        });
         this.log = rootLog.child({
             clientId: this.clientId.slice(0, 18),
             clientName: this.clientName,
         });
     }
 
-    isApplyingRemoteChanges(): boolean {
-        return this.applyingRemote;
+    isApplyingRemoteChanges(path?: string): boolean {
+        if (path) {
+            return this.vaultMutator.isApplyingRemoteChanges(path);
+        }
+        return this.applyingRemote || this.vaultMutator.isApplyingRemoteChanges();
     }
 
     private isSyncableConfigPath(path: string): boolean {
@@ -331,6 +340,7 @@ export class SyncClient {
                         segmentId: segment?.id,
                         ...errorContext(error),
                     });
+                    this.showFailureNotice(`Sync upload failed; retrying: ${shortErrorMessage(error)}`);
                     if (segment) {
                         await this.outbox.releaseSegment(segment);
                         this.log.warn("released outbox segment after failure", { segmentId: segment.id });
@@ -389,7 +399,16 @@ export class SyncClient {
                     targetRevision: pullResponse.targetRevision,
                     files: pullResponse.files.length,
                 });
-                await this.applySnapshotReset(pullResponse);
+                if (await this.shouldUploadFirstSyncOverSnapshot(pullResponse)) {
+                    this.log.warn("first sync snapshot is missing local files; uploading local snapshot", {
+                        targetRevision: pullResponse.targetRevision,
+                        files: pullResponse.files.length,
+                    });
+                    new Notice("Sync server has a partial first-sync snapshot; uploading this vault instead");
+                    await this.uploadInitialSnapshot(openWs);
+                } else {
+                    await this.applySnapshotReset(pullResponse);
+                }
             }
         } else {
             throw new Error(`Unexpected pull response: ${pullResponse.type}`);
@@ -479,6 +498,9 @@ export class SyncClient {
             failedConnectAttempts: this.failedConnectAttempts,
             ...errorContext(error),
         });
+        this.showFailureNotice(
+            `Sync startup failed; retrying in ${Math.ceil(delay / 1000)}s: ${shortErrorMessage(error)}`,
+        );
     }
 
     private recordConnectionSuccess(): void {
@@ -590,7 +612,19 @@ export class SyncClient {
                     created,
                 };
                 if (contentBytes.byteLength > INLINE_BYTES_LIMIT) {
-                    await this.blobClient.upload(entry.path, contentBytes, base.contentSha256!);
+                    try {
+                        await this.blobClient.upload(entry.path, contentBytes, base.contentSha256!);
+                    } catch (error) {
+                        this.log.error("skipping large file during initial snapshot after blob upload failure", {
+                            path: entry.path,
+                            byteSize: contentBytes.byteLength,
+                            ...errorContext(error),
+                        });
+                        this.showFailureNotice(
+                            `Sync skipped a large file during initial upload: ${entry.path} (${shortErrorMessage(error)})`,
+                        );
+                        continue;
+                    }
                     changes.push({
                         ...base,
                         storageKind: "lo",
@@ -606,6 +640,15 @@ export class SyncClient {
         }
 
         return changes;
+    }
+
+    private async shouldUploadFirstSyncOverSnapshot(packet: Extract<wsPacket, { type: opType.SnapshotReset }>): Promise<boolean> {
+        if (this.lastPulledRevision !== "0") {
+            return false;
+        }
+        const snapshotPaths = new Set(packet.files.map(file => normalizePath(file.path)));
+        const localPaths = await this.listSnapshotPaths();
+        return localPaths.some(entry => !snapshotPaths.has(normalizePath(entry.path)));
     }
 
     private async listSnapshotPaths(): Promise<SnapshotPath[]> {
@@ -688,8 +731,15 @@ export class SyncClient {
             localFilesMissingFromSnapshot: toDelete.length,
             hasPendingChanges,
         });
-        if (toDelete.length > 0 && hasPendingChanges) {
-            new Notice(`Sync snapshot reset: preserving ${toDelete.length} local file(s) while pending changes upload`);
+        const isFirstSync = this.lastPulledRevision === "0";
+        if (toDelete.length > 0 && (hasPendingChanges || isFirstSync)) {
+            const reason = isFirstSync ? "during first sync" : "while pending changes upload";
+            new Notice(`Sync snapshot reset: preserving ${toDelete.length} local file(s) ${reason}`);
+            this.log.warn("preserved local files missing from snapshot", {
+                targetRevision: packet.targetRevision,
+                files: toDelete.length,
+                reason,
+            });
         } else if (toDelete.length > 0) {
             new Notice(`Sync snapshot reset: removing ${toDelete.length} local file(s) not on server`);
             await this.deletePathsMissingFromSnapshot(snapshotPaths);
@@ -731,38 +781,40 @@ export class SyncClient {
                     });
                     continue;
                 }
-                if (change.operation === "CreateFolder") {
-                    await this.ensureFolder(change.path);
-                } else if (change.operation === "UpsertFile") {
-                    let appliedBytes: Uint8Array | null = null;
-                    if (change.storageKind === "lo") {
-                        appliedBytes = await this.blobClient.download(change.path);
-                        await this.upsertBinaryFile(change.path, appliedBytes);
-                    } else if (change.contentBytes) {
-                        appliedBytes = change.contentBytes;
-                        await this.upsertBinaryFile(change.path, change.contentBytes);
-                    } else if (change.isYjs) {
-                        const content = change.content ?? "";
-                        await this.applyYjsState(change.path, change.yjsState ?? docStateFromContent(content, Y));
-                    } else {
-                        const content = change.content ?? "";
-                        appliedBytes = new TextEncoder().encode(content);
-                        await this.upsertTextFile(change.path, content);
+                await this.vaultMutator.runRemoteMutation(remoteChangePaths(change), async () => {
+                    if (change.operation === "CreateFolder") {
+                        await this.vaultMutator.ensureFolder(change.path);
+                    } else if (change.operation === "UpsertFile") {
+                        let appliedBytes: Uint8Array | null = null;
+                        if (change.storageKind === "lo") {
+                            appliedBytes = await this.blobClient.download(change.path);
+                            await this.vaultMutator.upsertBinaryFile(change.path, appliedBytes);
+                        } else if (change.contentBytes) {
+                            appliedBytes = change.contentBytes;
+                            await this.vaultMutator.upsertBinaryFile(change.path, change.contentBytes);
+                        } else if (change.isYjs) {
+                            const content = change.content ?? "";
+                            await this.yjsApplicator.applyState(change.path, change.yjsState ?? docStateFromContent(content, Y));
+                        } else {
+                            const content = change.content ?? "";
+                            appliedBytes = new TextEncoder().encode(content);
+                            await this.vaultMutator.upsertTextFile(change.path, content);
+                        }
+                        if (appliedBytes && this.isSyncableConfigPath(change.path)) {
+                            this.onRemoteConfigApplied(change.path, appliedBytes);
+                        }
+                    } else if (change.operation === "Delete") {
+                        await this.vaultMutator.deletePath(change.path);
+                    } else if (change.operation === "Rename" && change.toPath) {
+                        await this.vaultMutator.renamePath(change.path, change.toPath);
+                    } else if (change.operation === "YjsUpdate") {
+                        if (change.yjsState) {
+                            await this.yjsApplicator.applyState(change.path, change.yjsState);
+                        } else if (change.data) {
+                            await this.yjsApplicator.applyUpdate(change.path, change.data);
+                        }
                     }
-                    if (appliedBytes && this.isSyncableConfigPath(change.path)) {
-                        this.onRemoteConfigApplied(change.path, appliedBytes);
-                    }
-                } else if (change.operation === "Delete") {
-                    await this.deletePath(change.path);
-                } else if (change.operation === "Rename" && change.toPath) {
-                    await this.renamePath(change.path, change.toPath);
-                } else if (change.operation === "YjsUpdate") {
-                    if (change.yjsState) {
-                        await this.applyYjsState(change.path, change.yjsState);
-                    } else if (change.data) {
-                        await this.applyYjsUpdate(change.path, change.data);
-                    }
-                }
+                });
             }
         } finally {
             this.applyingRemote = false;
@@ -770,198 +822,20 @@ export class SyncClient {
     }
 
     private async deletePathsMissingFromSnapshot(paths: Set<string>): Promise<void> {
-        this.applyingRemote = true;
-        try {
-            const files = [...this.app.vault.getFiles()]
-                .filter(file => shouldSyncPath(file.path, this.app.vault.configDir, this.pluginId) && !paths.has(normalizePath(file.path)))
-                .sort((a, b) => b.path.length - a.path.length);
+        const files = [...this.app.vault.getFiles()]
+            .filter(file => shouldSyncPath(file.path, this.app.vault.configDir, this.pluginId) && !paths.has(normalizePath(file.path)))
+            .sort((a, b) => b.path.length - a.path.length);
+        await this.vaultMutator.runRemoteMutation(files.map(file => file.path), async () => {
             for (const file of files) {
                 await this.app.fileManager.trashFile(file);
                 await this.stateStore.delete(file.path);
             }
-        } finally {
-            this.applyingRemote = false;
-        }
-    }
-
-    private async ensureFolder(path: string): Promise<void> {
-        const normalized = normalizePath(path);
-        if (!normalized || await this.app.vault.adapter.exists(normalized)) {
-            return;
-        }
-        const parent = dirname(normalized);
-        if (parent) {
-            await this.ensureFolder(parent);
-        }
-        try {
-            await this.app.vault.createFolder(normalized);
-        } catch (error) {
-            if (!(await this.app.vault.adapter.exists(normalized))) {
-                throw error;
-            }
-        }
-    }
-
-    private async upsertTextFile(path: string, content: string): Promise<void> {
-        const normalized = normalizePath(path);
-        const parent = dirname(normalized);
-        if (parent) {
-            await this.ensureFolder(parent);
-        }
-        const existing = this.app.vault.getAbstractFileByPath(normalized);
-        if (existing instanceof TFile) {
-            await this.app.vault.modify(existing, content);
-            return;
-        }
-        if (existing) {
-            await this.app.fileManager.trashFile(existing);
-        }
-        if (await this.app.vault.adapter.exists(normalized)) {
-            await this.app.vault.adapter.write(normalized, content);
-            return;
-        }
-        try {
-            await this.app.vault.create(normalized, content);
-        } catch (error) {
-            if (await this.app.vault.adapter.exists(normalized)) {
-                await this.app.vault.adapter.write(normalized, content);
-                return;
-            }
-            throw error;
-        }
-    }
-
-    private async upsertBinaryFile(path: string, bytes: Uint8Array): Promise<void> {
-        const normalized = normalizePath(path);
-        const parent = dirname(normalized);
-        if (parent) {
-            await this.ensureFolder(parent);
-        }
-        const existing = this.app.vault.getAbstractFileByPath(normalized);
-        if (existing instanceof TFile) {
-            await this.app.vault.adapter.writeBinary(normalized, exactArrayBuffer(bytes));
-            return;
-        }
-        if (existing) {
-            await this.app.fileManager.trashFile(existing);
-        }
-        await this.app.vault.adapter.writeBinary(normalized, exactArrayBuffer(bytes));
-    }
-
-    private async deletePath(path: string): Promise<void> {
-        const existing = this.app.vault.getAbstractFileByPath(normalizePath(path));
-        if (existing) {
-            await this.app.fileManager.trashFile(existing);
-        }
-        await this.stateStore.delete(path, existing instanceof TFolder);
-    }
-
-    private async renamePath(fromPath: string, toPath: string): Promise<void> {
-        const existing = this.app.vault.getAbstractFileByPath(normalizePath(fromPath));
-        if (!existing) {
-            return;
-        }
-        const parent = dirname(toPath);
-        if (parent) {
-            await this.ensureFolder(parent);
-        }
-        await this.app.vault.rename(existing, normalizePath(toPath));
-        await this.stateStore.rename(fromPath, toPath, existing instanceof TFolder);
-    }
-
-    private async applyYjsUpdate(path: string, update: Uint8Array): Promise<void> {
-        const normalized = normalizePath(path);
-        await this.flushOpenYjsChanges(normalized);
-        const openDoc = this.getDocSync(normalized);
-        let content: string;
-        let state: Uint8Array;
-        if (openDoc) {
-            content = openDoc.applyRemoteUpdate(update);
-            state = Y.encodeStateAsUpdateV2(openDoc.getYdoc());
-        } else {
-            const doc = new Y.Doc();
-            Y.applyUpdateV2(doc, await this.getOrSeedState(normalized));
-            Y.applyUpdateV2(doc, update);
-            content = doc.getText(MARKDOWN_FIELD).toJSON();
-            state = Y.encodeStateAsUpdateV2(doc);
-            doc.destroy();
-        }
-        await this.upsertYjsTextFile(normalized, content);
-        await this.stateStore.put(normalized, state);
-    }
-
-    private async applyYjsState(path: string, state: Uint8Array): Promise<void> {
-        const normalized = normalizePath(path);
-        await this.flushOpenYjsChanges(normalized);
-        const openDoc = this.getDocSync(normalized);
-        if (openDoc) {
-            if (openDoc.hasLocalEdits()) {
-                const content = openDoc.applyRemoteUpdate(state);
-                await this.upsertYjsTextFile(normalized, content);
-                await this.stateStore.put(normalized, Y.encodeStateAsUpdateV2(openDoc.getYdoc()));
-                return;
-            }
-
-            const content = yjsContentFromState(state);
-            await this.upsertYjsTextFile(normalized, content);
-            await this.stateStore.put(normalized, state);
-            await openDoc.replaceState(state);
-            return;
-        }
-
-        const content = yjsContentFromState(state);
-        await this.upsertYjsTextFile(normalized, content);
-        await this.stateStore.put(normalized, state);
+        });
     }
 
     private async readVaultContent(path: string): Promise<string> {
         const existing = this.app.vault.getAbstractFileByPath(path);
         return existing instanceof TFile ? this.app.vault.read(existing) : "";
-    }
-
-    private async refreshYjsState(path: string, content: string, yjsState?: Uint8Array): Promise<void> {
-        if (!shouldUseYjs(path, this.app.vault.configDir)) {
-            return;
-        }
-        const state = yjsState ?? docStateFromContent(content, Y);
-        await this.stateStore.put(path, state);
-        const openDoc = this.getDocSync(normalizePath(path));
-        if (openDoc) {
-            await openDoc.replaceState(state);
-        }
-    }
-
-    private async upsertYjsTextFile(path: string, content: string): Promise<void> {
-        const normalized = normalizePath(path);
-        if (this.getDocSync(normalized) && await this.onOpenYjsContent(normalized, content)) {
-            return;
-        }
-        await this.upsertTextFile(normalized, content);
-    }
-
-    private async getOrSeedState(path: string): Promise<Uint8Array> {
-        const existing = await this.stateStore.get(path);
-        if (existing) {
-            return existing;
-        }
-        const state = docStateFromContent(await this.readVaultContent(path), Y);
-        await this.stateStore.put(path, state);
-        return state;
-    }
-
-    private async resolveYdoc(path: string): Promise<{ doc: Y.Doc; destroy: () => void }> {
-        const normalized = normalizePath(path);
-        const openDoc = this.getDocSync(normalized);
-        if (openDoc) {
-            return {
-                doc: openDoc.getYdoc(),
-                destroy: () => {},
-            };
-        }
-        const doc = new Y.Doc();
-        const loadedState = await this.getOrSeedState(normalized);
-        Y.applyUpdateV2(doc, loadedState);
-        return { doc, destroy: () => doc.destroy() };
     }
 
     private encodeMutationsJsonl(mutations: SyncMutation[]): string {
@@ -1020,7 +894,7 @@ export class SyncClient {
 
             for (const path of yjsPaths) {
                 const pathRows = rows.filter(row => row.operation === "YjsUpdate" && row.path === path);
-                const { doc, destroy } = await this.resolveYdoc(path);
+                const { doc, destroy } = await this.yjsApplicator.resolveYdoc(path);
                 resolved.push({
                     path,
                     doc,
@@ -1206,6 +1080,15 @@ export class SyncClient {
             return;
         }
         this.lastUploadedRevisionHint = revision;
+    }
+
+    private showFailureNotice(message: string): void {
+        const now = Date.now();
+        if (now - this.lastFailureNoticeAt < FAILURE_NOTICE_THROTTLE_MS) {
+            return;
+        }
+        this.lastFailureNoticeAt = now;
+        new Notice(message);
     }
 
     private async ensureAuthenticatedSocket(): Promise<WebSocket> {

@@ -1,8 +1,11 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
+import { readdir, stat } from "node:fs/promises";
+import { join, posix, relative, sep } from "node:path";
 import { sql } from "bun";
 import * as Y from "yjs";
 import { opType, SyncMutation, wsPacket } from "../../../shared/types";
 import { decodePacket, encodePacket, PROTOCOL_VERSION } from "../../../shared/protocol";
+import { shouldSyncPath, shouldUseYjs } from "../../../shared/pathPolicy";
 import {
   acceptMutations,
   countYjsEvents,
@@ -39,6 +42,9 @@ import server from "../index";
 const CLIENT_A = "integration-client-a";
 const CLIENT_B = "integration-client-b";
 const NOTE_PATH = "notes/test.md";
+const SAMPLE_VAULT_PATH = "/home/shlok/Obsidian/obsidian-notes-test";
+const SAMPLE_VAULT_INLINE_LIMIT = 512 * 1024;
+const SAMPLE_VAULT_BATCH_SIZE = 100;
 
 let wsServer: Bun.Server<unknown> | null = null;
 let wsUrl = "";
@@ -287,6 +293,135 @@ async function readStoredZipCentralDirectory(path: string): Promise<string[]> {
     offset = nameStart + nameLength + extraLength + commentLength;
   }
   return names;
+}
+
+type SampleVaultSnapshot = {
+  folderMutations: SyncMutation[];
+  fileMutations: SyncMutation[];
+  markdownPaths: string[];
+  skippedLargeFiles: number;
+  totalBytes: number;
+};
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await stat(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function vaultRelativePath(root: string, path: string): string {
+  return relative(root, path).split(sep).join(posix.sep);
+}
+
+async function listSampleVaultFiles(root: string): Promise<{ path: string; size: number }[]> {
+  const files: { path: string; size: number }[] = [];
+  async function walk(dir: string): Promise<void> {
+    const entries = await readdir(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      const fullPath = join(dir, entry.name);
+      const relativePath = vaultRelativePath(root, fullPath);
+      if (!shouldSyncPath(relativePath)) {
+        continue;
+      }
+      if (entry.isDirectory()) {
+        await walk(fullPath);
+      } else if (entry.isFile()) {
+        files.push({ path: fullPath, size: (await stat(fullPath)).size });
+      }
+    }
+  }
+  await walk(root);
+  return files.sort((a, b) => vaultRelativePath(root, a.path).localeCompare(vaultRelativePath(root, b.path)));
+}
+
+function folderMutationsForFiles(paths: string[]): SyncMutation[] {
+  const folders = new Set<string>();
+  for (const path of paths) {
+    const parts = path.split("/");
+    for (let index = 1; index < parts.length; index++) {
+      const folder = parts.slice(0, index).join("/");
+      if (shouldSyncPath(folder)) {
+        folders.add(folder);
+      }
+    }
+  }
+  return [...folders].sort().map(path => ({
+    mutationId: crypto.randomUUID(),
+    operation: "CreateFolder",
+    path,
+    isFolder: true,
+    created: Date.now(),
+  }));
+}
+
+async function buildSampleVaultSnapshot(root: string): Promise<SampleVaultSnapshot> {
+  const files = await listSampleVaultFiles(root);
+  const fileMutations: SyncMutation[] = [];
+  const markdownPaths: string[] = [];
+  let skippedLargeFiles = 0;
+  let totalBytes = 0;
+
+  for (const file of files) {
+    const path = vaultRelativePath(root, file.path);
+    const isYjs = shouldUseYjs(path);
+    if (!isYjs && file.size > SAMPLE_VAULT_INLINE_LIMIT) {
+      skippedLargeFiles++;
+      continue;
+    }
+
+    if (isYjs) {
+      const content = await Bun.file(file.path).text();
+      const bytes = new TextEncoder().encode(content);
+      totalBytes += bytes.byteLength;
+      markdownPaths.push(path);
+      fileMutations.push({
+        mutationId: crypto.randomUUID(),
+        operation: "UpsertFile",
+        path,
+        content,
+        yjsState: stateFromMarkdown(content),
+        isYjs: true,
+        isFolder: false,
+        storageKind: "text",
+        byteSize: bytes.byteLength,
+        created: Date.now(),
+      });
+    } else {
+      const bytes = new Uint8Array(await Bun.file(file.path).arrayBuffer());
+      totalBytes += bytes.byteLength;
+      fileMutations.push({
+        mutationId: crypto.randomUUID(),
+        operation: "UpsertFile",
+        path,
+        contentBytes: bytes,
+        isYjs: false,
+        isFolder: false,
+        storageKind: "bytea",
+        byteSize: bytes.byteLength,
+        contentSha256: `sample-vault-${bytes.byteLength}-${path.length}`,
+        created: Date.now(),
+      });
+    }
+  }
+
+  return {
+    folderMutations: folderMutationsForFiles(fileMutations.map(mutation => mutation.path)),
+    fileMutations,
+    markdownPaths,
+    skippedLargeFiles,
+    totalBytes,
+  };
+}
+
+async function acceptInBatches(clientId: string, mutations: SyncMutation[]): Promise<string> {
+  let revision = await getServerRevision();
+  for (let offset = 0; offset < mutations.length; offset += SAMPLE_VAULT_BATCH_SIZE) {
+    revision = await acceptMutations(clientId, mutations.slice(offset, offset + SAMPLE_VAULT_BATCH_SIZE));
+  }
+  return revision;
 }
 
 const dbAvailable = await canConnectToDatabase();
@@ -822,6 +957,119 @@ describeIntegration("sync engine postgres integration", () => {
         client.doc.destroy();
       }
     }
+  });
+
+  it("initial-syncs a large real sample vault, simulates two clients typing, and bootstraps the result", async () => {
+    if (!(await pathExists(SAMPLE_VAULT_PATH))) {
+      console.warn(`sample vault integration skipped: ${SAMPLE_VAULT_PATH} does not exist`);
+      return;
+    }
+
+    setCompactionConfig({ count: 10000, bytes: 100 * 1024 * 1024 });
+    await ensureIntegrationClient("sample-vault-seeder");
+    await ensureIntegrationClient("sample-vault-typer-a");
+    await ensureIntegrationClient("sample-vault-typer-b");
+
+    const latencies = {
+      scanVault: [] as number[],
+      initialFolderUpload: [] as number[],
+      initialFileUpload: [] as number[],
+      typingUpload: [] as number[],
+      finalCatchUp: [] as number[],
+      bootstrapBuild: [] as number[],
+      bootstrapInspect: [] as number[],
+    };
+    const sample = await measure(latencies.scanVault, () => buildSampleVaultSnapshot(SAMPLE_VAULT_PATH));
+    expect(sample.fileMutations.length).toBeGreaterThan(500);
+    expect(sample.markdownPaths.length).toBeGreaterThan(100);
+    expect(sample.skippedLargeFiles).toBeGreaterThan(0);
+
+    await measure(latencies.initialFolderUpload, () => acceptInBatches("sample-vault-seeder", sample.folderMutations));
+    const initialRevision = await measure(latencies.initialFileUpload, () => acceptInBatches("sample-vault-seeder", sample.fileMutations));
+    expect(BigInt(initialRevision)).toBeGreaterThan(0n);
+
+    const snapshot = await snapshotPacket();
+    expect(snapshot.files).toHaveLength(sample.folderMutations.length + sample.fileMutations.length);
+    expect(snapshot.files.some(file => file.path.startsWith(".trash/"))).toBe(false);
+    expect(snapshot.files.some(file => file.path.includes("/.git/") || file.path === ".git")).toBe(false);
+    expect(snapshot.files.some(file => file.path.endsWith(".md") && file.yjsState?.byteLength)).toBe(true);
+    expect(snapshot.files.some(file => file.storageKind === "bytea" && (file.contentBytes?.byteLength ?? 0) > 0)).toBe(true);
+
+    const pull = await handlePull({ type: opType.PullSince, revision: "0" });
+    expect(pull.type).toBe(opType.SnapshotReset);
+    if (pull.type === opType.SnapshotReset) {
+      expect(pull.files).toHaveLength(snapshot.files.length);
+    }
+
+    const typingPath = sample.markdownPaths.find(path => path === "Blog/Test Blog.md")
+      ?? sample.markdownPaths.find(path => path.startsWith("Blog/"))
+      ?? sample.markdownPaths[0]!;
+    const baseFile = await getFile(typingPath);
+    expect(baseFile?.yjsState).toBeInstanceOf(Uint8Array);
+    const docA = docFromState(baseFile!.yjsState!);
+    const docB = docFromState(baseFile!.yjsState!);
+    const markersA: string[] = [];
+    const markersB: string[] = [];
+
+    try {
+      for (let index = 0; index < 30; index++) {
+        const markerA = `[sample-vault-client-a-${index}]`;
+        appendToDoc(docA, `\n${markerA}`);
+        markersA.push(markerA);
+        await measure(latencies.typingUpload, () => uploadYjsEdit("sample-vault-typer-a", typingPath, docA, crypto.randomUUID()));
+
+        const markerB = `[sample-vault-client-b-${index}]`;
+        appendToDoc(docB, `\n${markerB}`);
+        markersB.push(markerB);
+        await measure(latencies.typingUpload, () => uploadYjsEdit("sample-vault-typer-b", typingPath, docB, crypto.randomUUID()));
+      }
+
+      const serverDoc = await currentServerDoc(typingPath);
+      try {
+        const serverContent = readDoc(serverDoc);
+        for (const marker of [...markersA, ...markersB]) {
+          expectMarkerOnce(serverContent, marker);
+        }
+        expect((await getFile(typingPath))?.content).toBe(serverContent);
+
+        await measure(latencies.finalCatchUp, () => catchUpClientDoc(typingPath, docA));
+        await measure(latencies.finalCatchUp, () => catchUpClientDoc(typingPath, docB));
+        expect(readDoc(docA)).toBe(serverContent);
+        expect(readDoc(docB)).toBe(serverContent);
+      } finally {
+        serverDoc.destroy();
+      }
+    } finally {
+      docA.destroy();
+      docB.destroy();
+    }
+
+    const built = await measure(latencies.bootstrapBuild, () => buildBootstrapZip({
+      vaultName: "Sample Vault Bootstrap",
+      backendUrl: "https://sync.example.test",
+      configDir: ".obsidian",
+      pluginId: "obsidian-sync-engine",
+    }));
+    try {
+      const centralNames = await measure(latencies.bootstrapInspect, () => readStoredZipCentralDirectory(built.zipPath));
+      expect(centralNames).toContain(`Sample Vault Bootstrap/${typingPath}`);
+      expect(centralNames).toContain(`Sample Vault Bootstrap/.obsidian/plugins/obsidian-sync-engine/yjs-state/${typingPath}.state`);
+      expect(centralNames).toContain("Sample Vault Bootstrap/.obsidian/plugins/obsidian-sync-engine/data.json");
+      expect(built.snapshotRevision).toBe(await getServerRevision());
+      expect(built.zipBytes).toBeGreaterThan(sample.totalBytes);
+    } finally {
+      await built.cleanup();
+    }
+
+    logLatencySummary("sample vault initial sync and two-client typing", latencies, {
+      folders: sample.folderMutations.length,
+      files: sample.fileMutations.length,
+      markdownFiles: sample.markdownPaths.length,
+      skippedLargeFiles: sample.skippedLargeFiles,
+      loadedBytes: sample.totalBytes,
+      typingPath,
+      typedEdits: markersA.length + markersB.length,
+    });
   });
 
   it("DocSync returns catch-up bytes for a client behind the server", async () => {

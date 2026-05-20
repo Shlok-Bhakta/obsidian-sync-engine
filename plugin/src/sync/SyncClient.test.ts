@@ -310,6 +310,26 @@ describe("SyncClient initial snapshot", () => {
         expect(stateStore.states.get("notes/unloaded.md")).toEqual(note?.yjsState);
     });
 
+    it("skips large files that fail blob upload while still building the initial snapshot", async () => {
+        const { client } = await makeClient({
+            "notes/existing.md": "existing note",
+            "assets/too-large.pdf": new Uint8Array((64 * 1024) + 1),
+            ".obsidian/workspace.json": "{}",
+        });
+        (client as unknown as {
+            blobClient: { upload: () => Promise<void> };
+        }).blobClient.upload = vi.fn(async () => {
+            throw new Error("413");
+        });
+
+        const changes = await (client as unknown as { readVaultSnapshot: () => Promise<outboxData[]> }).readVaultSnapshot();
+        const paths = changes.map(change => change.path);
+
+        expect(paths).toContain("notes/existing.md");
+        expect(paths).toContain(".obsidian/workspace.json");
+        expect(paths).not.toContain("assets/too-large.pdf");
+    });
+
     it("drops stale ignored rows while preparing an outbox segment", async () => {
         const outbox = new MemoryOutboxStore([
             {
@@ -364,6 +384,50 @@ describe("SyncClient initial snapshot", () => {
             configDir: ".obsidian",
             pluginId: "obsidian-sync-engine",
         });
+    });
+
+    it("uploads local first-sync snapshot over a server snapshot that is missing local files", async () => {
+        const { client } = await makeClient({
+            "notes/existing.md": "local note",
+            ".obsidian/workspace.json": "{}",
+        });
+        const ws = new FakeWebSocket();
+        const testClient = client as unknown as {
+            runStartupSync: () => Promise<void>;
+            ensureAuthenticatedSocket: () => Promise<FakeWebSocket>;
+            flushPendingOutboxForStartup: () => Promise<void>;
+            pullSince: (_ws: FakeWebSocket, _revision: string) => Promise<unknown>;
+            uploadInitialSnapshot: (_ws: FakeWebSocket) => Promise<void>;
+            catchUpToServer: (_ws?: FakeWebSocket) => Promise<void>;
+            livePushPromise: Promise<void>;
+            startupSynced: boolean;
+        };
+        testClient.ensureAuthenticatedSocket = async () => ws;
+        testClient.flushPendingOutboxForStartup = async () => {};
+        testClient.pullSince = async () => ({
+            type: opType.SnapshotReset,
+            targetRevision: "170",
+            files: [{
+                mutationId: "snapshot:assets/blob.pdf:170",
+                operation: "UpsertFile",
+                path: "assets/blob.pdf",
+                contentBytes: new Uint8Array([1]),
+                storageKind: "bytea",
+                isFolder: false,
+                isYjs: false,
+                created: Date.now(),
+                revision: "170",
+                clientId: "server",
+            }],
+        });
+        testClient.uploadInitialSnapshot = vi.fn(async () => {});
+        testClient.catchUpToServer = async () => {};
+        testClient.livePushPromise = Promise.resolve();
+
+        await testClient.runStartupSync();
+
+        expect(testClient.uploadInitialSnapshot).toHaveBeenCalledTimes(1);
+        expect(testClient.startupSynced).toBe(true);
     });
 
     it("applies live change batches pushed over the authenticated socket", async () => {
@@ -837,6 +901,39 @@ describe("SyncClient initial snapshot", () => {
 
         expect(files["notes/existing.md"]).toBe("before");
         expect(persisted).toEqual([]);
+    });
+
+    it("preserves local files missing from a first-sync snapshot reset", async () => {
+        const files = {
+            "notes/existing.md": "local note",
+            "assets/blob.pdf": new Uint8Array([1, 2, 3]),
+        };
+        const { client } = await makeClient(files);
+        const testClient = client as unknown as {
+            lastPulledRevision: string;
+            applySnapshotReset: (packet: unknown) => Promise<void>;
+        };
+        testClient.lastPulledRevision = "0";
+
+        await testClient.applySnapshotReset({
+            type: opType.SnapshotReset,
+            targetRevision: "58",
+            files: [{
+                mutationId: "snapshot:assets/blob.pdf:58",
+                operation: "UpsertFile",
+                path: "assets/blob.pdf",
+                contentBytes: new Uint8Array([4, 5, 6]),
+                storageKind: "bytea",
+                isFolder: false,
+                isYjs: false,
+                created: Date.now(),
+                revision: "58",
+                clientId: "server",
+            }],
+        });
+
+        expect(files["notes/existing.md"]).toBe("local note");
+        expect(files["assets/blob.pdf"]).toEqual(new Uint8Array([4, 5, 6]));
     });
 
     it("queues live pushes during startup and drains them after startup sync", async () => {

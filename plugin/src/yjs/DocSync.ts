@@ -94,7 +94,7 @@ export class DocSync {
             changes.push({ fromA, toA, insertText: inserted.toString() });
         });
         this.ydoc.transact(() => {
-            if (expectedBefore !== undefined && this.ytext.toString() !== expectedBefore) {
+            if (expectedBefore !== undefined && this.ytext.toJSON() !== expectedBefore) {
                 log.warn("repairing Yjs/editor mismatch before applying local edit", {
                     path: this.path,
                     yjsChars: this.ytext.length,
@@ -116,7 +116,7 @@ export class DocSync {
                     this.ytext.insert(fromA, insertText);
                 }
             }
-            if (expectedAfter !== undefined && this.ytext.toString() !== expectedAfter) {
+            if (expectedAfter !== undefined && this.ytext.toJSON() !== expectedAfter) {
                 log.warn("repairing Yjs/editor mismatch after applying local edit", {
                     path: this.path,
                     yjsChars: this.ytext.length,

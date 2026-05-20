@@ -28,7 +28,7 @@ function errorMessage(error: unknown): string {
 }
 
 function exactArrayBuffer(bytes: Uint8Array): ArrayBuffer {
-	return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+	return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
 }
 
 function changedRange(before: string, after: string): { from: number; to: number; insert: string } | null {
@@ -281,7 +281,7 @@ export default class SyncEngine extends Plugin {
 	}
 
 	private async enqueueLocalDelete(file: TAbstractFile): Promise<void> {
-		if (this.syncClient?.isApplyingRemoteChanges() || !shouldSyncPath(file.path, this.app.vault.configDir, this.manifest.id)) {
+		if (this.syncClient?.isApplyingRemoteChanges(file.path) || !shouldSyncPath(file.path, this.app.vault.configDir, this.manifest.id)) {
 			return;
 		}
 		await this.db.putInOutbox({
@@ -297,7 +297,7 @@ export default class SyncEngine extends Plugin {
 
 	private async enqueueLocalRename(file: TAbstractFile, oldPath: string): Promise<void> {
 		if (
-			this.syncClient?.isApplyingRemoteChanges() ||
+			(this.syncClient?.isApplyingRemoteChanges(oldPath) || this.syncClient?.isApplyingRemoteChanges(file.path)) ||
 			!shouldSyncPath(oldPath, this.app.vault.configDir, this.manifest.id) ||
 			!shouldSyncPath(file.path, this.app.vault.configDir, this.manifest.id)
 		) {
@@ -373,7 +373,7 @@ export default class SyncEngine extends Plugin {
 	}
 
 	private async enqueueLocalPathDelete(path: string): Promise<void> {
-		if (this.syncClient?.isApplyingRemoteChanges() || !shouldSyncPath(path, this.app.vault.configDir, this.manifest.id)) {
+		if (this.syncClient?.isApplyingRemoteChanges(path) || !shouldSyncPath(path, this.app.vault.configDir, this.manifest.id)) {
 			return;
 		}
 		await this.db.putInOutbox({
@@ -471,7 +471,7 @@ export default class SyncEngine extends Plugin {
 
 	private queueNonMarkdownUpsert(file: TAbstractFile): void {
 		if (
-			this.syncClient?.isApplyingRemoteChanges() ||
+			this.syncClient?.isApplyingRemoteChanges(file.path) ||
 			!(file instanceof TFile) ||
 			this.isConfigDirPath(file.path) ||
 			shouldUseYjs(file.path, this.app.vault.configDir) ||
@@ -545,7 +545,7 @@ export default class SyncEngine extends Plugin {
 	}
 
 	private async queuePathUpsert(path: string): Promise<void> {
-		if (this.syncClient?.isApplyingRemoteChanges() || !shouldSyncPath(path, this.app.vault.configDir, this.manifest.id)) {
+		if (this.syncClient?.isApplyingRemoteChanges(path) || !shouldSyncPath(path, this.app.vault.configDir, this.manifest.id)) {
 			return;
 		}
 		const bytes = new Uint8Array(await this.app.vault.adapter.readBinary(path));
