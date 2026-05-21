@@ -15,10 +15,11 @@ type EncodedServerChange = Omit<ServerChange, "data" | "contentBytes" | "yjsStat
     yjsState?: string;
 };
 
-type EncodedOutboxRow = Omit<outboxData, "data" | "contentBytes"> & {
+type EncodedOutboxRow = Omit<outboxData, "data" | "contentBytes" | "yjsState"> & {
     id: number;
     data?: string;
     contentBytes?: string;
+    yjsState?: string;
 };
 
 type EncodedDocSyncPath = {
@@ -53,6 +54,29 @@ export function base64ToBytes(base64: string): Uint8Array {
     }
 
     return bytes;
+}
+
+export function bytesToBase64Url(bytes: Uint8Array): string {
+    return bytesToBase64(bytes)
+        .replace(/\+/g, "-")
+        .replace(/\//g, "_")
+        .replace(/=+$/g, "");
+}
+
+export function base64UrlToBytes(value: string): Uint8Array {
+    const base64 = value
+        .replace(/-/g, "+")
+        .replace(/_/g, "/")
+        .padEnd(Math.ceil(value.length / 4) * 4, "=");
+    return base64ToBytes(base64);
+}
+
+export function encodePathToken(path: string): string {
+    return encodeURIComponent(bytesToBase64Url(new TextEncoder().encode(path)));
+}
+
+export function decodePathToken(token: string): string {
+    return new TextDecoder().decode(base64UrlToBytes(decodeURIComponent(token)));
 }
 
 function encodeMutation(mutation: SyncMutation): EncodedMutation {
@@ -229,6 +253,16 @@ export function decodePacket(packet: string): wsPacket {
     return validatePacket(data);
 }
 
+export function encodeUpdateBatchJsonl(mutations: SyncMutation[]): string {
+    if (mutations.length === 0) {
+        return "";
+    }
+    return mutations.map((row, index) => JSON.stringify({
+        ...encodeMutation(row),
+        id: index + 1,
+    })).join("\n") + "\n";
+}
+
 export function decodeUpdateBatchJsonl(jsonl: string): SyncMutation[] {
     const updates: SyncMutation[] = [];
 
@@ -249,6 +283,7 @@ export function decodeUpdateBatchJsonl(jsonl: string): SyncMutation[] {
             toPath: row.toPath,
             data: row.data ? base64ToBytes(row.data) : undefined,
             contentBytes: row.contentBytes ? base64ToBytes(row.contentBytes) : undefined,
+            yjsState: row.yjsState ? base64ToBytes(row.yjsState) : undefined,
             isFolder: row.isFolder,
             isYjs: row.isYjs,
             storageKind: row.storageKind,

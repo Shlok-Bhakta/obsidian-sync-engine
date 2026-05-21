@@ -1,5 +1,5 @@
 import { requestUrl } from "obsidian";
-import { bytesToBase64 } from "../../../shared/protocol";
+import { encodePathToken } from "../../../shared/protocol";
 import { errorContext } from "../../../shared/logger";
 import { log } from "../logger";
 
@@ -15,10 +15,6 @@ function toHttpUrl(backendUrl: string): string {
     url.search = "";
     url.hash = "";
     return url.toString().replace(/\/+$/, "");
-}
-
-function pathToken(path: string): string {
-    return encodeURIComponent(bytesToBase64(new TextEncoder().encode(path)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, ""));
 }
 
 function exactArrayBuffer(bytes: Uint8Array): ArrayBuffer {
@@ -77,7 +73,7 @@ export class BlobClient {
 
     private uploadOnce(path: string, bytes: Uint8Array, sha256: string): Promise<BlobResponse> {
         return requestUrl({
-            url: `${this.baseUrl}/v1/blobs/${pathToken(path)}`,
+            url: `${this.baseUrl}/v1/blobs/${encodePathToken(path)}`,
             method: "PUT",
             throw: false,
             headers: {
@@ -94,7 +90,7 @@ export class BlobClient {
 
     private downloadOnce(path: string): Promise<BlobResponse> {
         return requestUrl({
-            url: `${this.baseUrl}/v1/blobs/${pathToken(path)}`,
+            url: `${this.baseUrl}/v1/blobs/${encodePathToken(path)}`,
             method: "GET",
             throw: false,
             headers: {

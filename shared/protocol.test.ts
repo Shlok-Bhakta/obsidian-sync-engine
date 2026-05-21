@@ -4,9 +4,12 @@ import { opType } from "./types";
 import {
     bytesToBase64,
     base64ToBytes,
+    decodePathToken,
     decodePacket,
     decodeUpdateBatchJsonl,
     encodePacket,
+    encodePathToken,
+    encodeUpdateBatchJsonl,
     PROTOCOL_VERSION,
 } from "./protocol";
 
@@ -14,6 +17,11 @@ describe("protocol base64", () => {
     it("round-trips binary data", () => {
         const bytes = new Uint8Array([0, 1, 2, 255]);
         expect(base64ToBytes(bytesToBase64(bytes))).toEqual(bytes);
+    });
+
+    it("round-trips path tokens", () => {
+        const path = "ZArchive/books/a+b/c=1.pdf";
+        expect(decodePathToken(encodePathToken(path))).toBe(path);
     });
 });
 
@@ -166,6 +174,20 @@ describe("encodePacket / decodePacket", () => {
 });
 
 describe("decodeUpdateBatchJsonl", () => {
+    it("round-trips encoded JSONL rows", () => {
+        const mutations = [{
+            mutationId: "m-1",
+            operation: "UpsertFile" as const,
+            path: "asset.bin",
+            contentBytes: new Uint8Array([1, 2, 3]),
+            storageKind: "bytea" as const,
+            byteSize: 3,
+            created: 1,
+        }];
+
+        expect(decodeUpdateBatchJsonl(encodeUpdateBatchJsonl(mutations))).toEqual(mutations);
+    });
+
     it("parses YjsUpdate rows", () => {
         const data = bytesToBase64(new Uint8Array([9, 8, 7]));
         const jsonl = JSON.stringify({

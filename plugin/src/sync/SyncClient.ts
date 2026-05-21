@@ -2,7 +2,7 @@ import { App, Notice, TFile, TFolder, normalizePath } from "obsidian";
 import * as Y from "yjs";
 import { OutboxSegment, OutboxStore } from "db/db";
 import { BootstrapStatus, opType, ServerChange, SyncMutation, wsPacket } from "../../../shared/types";
-import { bytesToBase64, decodePacket, encodePacket, PROTOCOL_VERSION } from "../../../shared/protocol";
+import { decodePacket, encodePacket, encodeUpdateBatchJsonl, PROTOCOL_VERSION } from "../../../shared/protocol";
 import { docStateFromContent, MARKDOWN_FIELD } from "../../../shared/yjsSeed";
 import { buildUploadFromSyncedDoc, shouldApplyDocSyncCatchUp } from "../../../shared/yjsUpload";
 import { shouldSyncPath, shouldUseYjs } from "../../../shared/pathPolicy";
@@ -14,6 +14,7 @@ import { exactArrayBuffer, VaultMutator } from "./VaultMutator";
 import { YjsApplicator } from "./YjsApplicator";
 import { errorContext, Logger } from "../../../shared/logger";
 import { log as rootLog } from "../logger";
+import { readSocketMessage, waitForPacket, withTimeout } from "./SocketRequest";
 
 const FLUSH_DELAY_MS = 25;
 const EMPTY_BACKOFF_MS = 25;
@@ -36,13 +37,6 @@ function toWebSocketUrl(backendUrl: string): string {
     url.search = "";
     url.hash = "";
     return url.toString();
-}
-
-function readSocketMessage(event: MessageEvent): string {
-    if (typeof event.data === "string") {
-        return event.data;
-    }
-    throw new Error("WebSocket returned a non-text packet");
 }
 
 function asError(error: unknown): Error {
@@ -69,22 +63,6 @@ function summarizeServerChanges(changes: ServerChange[]): Record<string, number>
 
 function remoteChangePaths(change: ServerChange): string[] {
     return change.toPath ? [change.path, change.toPath] : [change.path];
-}
-
-function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
-    return new Promise((resolve, reject) => {
-        const timer = window.setTimeout(() => reject(new Error(message)), ms);
-        promise.then(
-            value => {
-                window.clearTimeout(timer);
-                resolve(value);
-            },
-            error => {
-                window.clearTimeout(timer);
-                reject(asError(error));
-            },
-        );
-    });
 }
 
 type SnapshotPath = {
@@ -126,6 +104,7 @@ export class SyncClient {
     private lastFailureNoticeAt = 0;
     private readonly vaultMutator: VaultMutator;
     private readonly yjsApplicator: YjsApplicator;
+    private skippedInitialSnapshotPaths = new Set<string>();
 
     constructor(
         private readonly app: App,
@@ -558,6 +537,7 @@ export class SyncClient {
     private async readVaultSnapshot(): Promise<SyncMutation[]> {
         const created = Date.now();
         const changes: SyncMutation[] = [];
+        this.skippedInitialSnapshotPaths.clear();
         const paths = await this.listSnapshotPaths();
         this.log.debug("reading vault snapshot", { paths: paths.length });
 
@@ -615,6 +595,7 @@ export class SyncClient {
                     try {
                         await this.blobClient.upload(entry.path, contentBytes, base.contentSha256!);
                     } catch (error) {
+                        this.skippedInitialSnapshotPaths.add(normalizePath(entry.path));
                         this.log.error("skipping large file during initial snapshot after blob upload failure", {
                             path: entry.path,
                             byteSize: contentBytes.byteLength,
@@ -648,7 +629,10 @@ export class SyncClient {
         }
         const snapshotPaths = new Set(packet.files.map(file => normalizePath(file.path)));
         const localPaths = await this.listSnapshotPaths();
-        return localPaths.some(entry => !snapshotPaths.has(normalizePath(entry.path)));
+        return localPaths.some(entry => {
+            const path = normalizePath(entry.path);
+            return !this.skippedInitialSnapshotPaths.has(path) && !snapshotPaths.has(path);
+        });
     }
 
     private async listSnapshotPaths(): Promise<SnapshotPath[]> {
@@ -838,18 +822,6 @@ export class SyncClient {
         return existing instanceof TFile ? this.app.vault.read(existing) : "";
     }
 
-    private encodeMutationsJsonl(mutations: SyncMutation[]): string {
-        if (mutations.length === 0) {
-            return "";
-        }
-        return mutations.map((row, index) => JSON.stringify({
-            ...row,
-            id: index + 1,
-            data: row.data ? bytesToBase64(row.data) : undefined,
-            contentBytes: row.contentBytes ? bytesToBase64(row.contentBytes) : undefined,
-        })).join("\n") + "\n";
-    }
-
     private async prepareSegmentJsonl(ws: WebSocket, segment: OutboxSegment): Promise<string> {
         const inputRows = await this.outbox.readSegment(segment);
         const rows = inputRows.filter(row => {
@@ -1008,7 +980,7 @@ export class SyncClient {
             outputRows: output.length,
             operations: summarizeMutations(output),
         });
-        return this.encodeMutationsJsonl(output);
+        return encodeUpdateBatchJsonl(output);
     }
 
     private requestDocSync(
@@ -1016,44 +988,10 @@ export class SyncClient {
         paths: { path: string; stateVector: Uint8Array; content?: string }[],
     ): Promise<Extract<wsPacket, { type: opType.DocSyncAck }>> {
         const response = withTimeout(
-            new Promise<Extract<wsPacket, { type: opType.DocSyncAck }>>((resolve, reject) => {
-                const onMessage = (event: MessageEvent) => {
-                    let msg: wsPacket;
-                    try {
-                        msg = decodePacket(readSocketMessage(event));
-                    } catch (error) {
-                        cleanup();
-                        reject(asError(error));
-                        return;
-                    }
-
-                    if (msg.type === opType.DocSyncAck) {
-                        cleanup();
-                        resolve(msg);
-                        return;
-                    }
-                    if (msg.type === opType.Deny) {
-                        cleanup();
-                        reject(new Error(msg.message));
-                    }
-                };
-                const onClose = () => {
-                    cleanup();
-                    reject(new Error("WebSocket closed before DocSync ack"));
-                };
-                const onError = () => {
-                    cleanup();
-                    reject(new Error("WebSocket errored before DocSync ack"));
-                };
-                const cleanup = () => {
-                    ws.removeEventListener("message", onMessage);
-                    ws.removeEventListener("close", onClose);
-                    ws.removeEventListener("error", onError);
-                };
-
-                ws.addEventListener("message", onMessage);
-                ws.addEventListener("close", onClose, { once: true });
-                ws.addEventListener("error", onError, { once: true });
+            waitForPacket(ws, {
+                accept: packet => packet.type === opType.DocSyncAck ? packet : undefined,
+                closeMessage: "WebSocket closed before DocSync ack",
+                errorMessage: "WebSocket errored before DocSync ack",
             }),
             WS_WAIT_TIMEOUT_MS,
             "Timed out waiting for DocSync ack",
@@ -1334,134 +1272,33 @@ export class SyncClient {
     }
 
     private waitForBatchAck(ws: WebSocket, segmentId: string): Promise<string> {
-        return new Promise((resolve, reject) => {
-            const onMessage = (event: MessageEvent) => {
-                let msg: wsPacket;
-                try {
-                    msg = decodePacket(readSocketMessage(event));
-                } catch (error) {
-                    cleanup();
-                    reject(asError(error));
-                    return;
-                }
-
-                if (msg.type === opType.BatchAck && msg.segmentId === segmentId) {
-                    cleanup();
-                    resolve(msg.revision);
-                    return;
-                }
-                if (msg.type === opType.Deny) {
-                    cleanup();
-                    reject(new Error(msg.message));
-                }
-            };
-            const onClose = () => {
-                cleanup();
-                reject(new Error("WebSocket closed before batch ack"));
-            };
-            const onError = () => {
-                cleanup();
-                reject(new Error("WebSocket errored before batch ack"));
-            };
-            const cleanup = () => {
-                ws.removeEventListener("message", onMessage);
-                ws.removeEventListener("close", onClose);
-                ws.removeEventListener("error", onError);
-            };
-
-            ws.addEventListener("message", onMessage);
-            ws.addEventListener("close", onClose, { once: true });
-            ws.addEventListener("error", onError, { once: true });
+        return waitForPacket(ws, {
+            accept: packet => packet.type === opType.BatchAck && packet.segmentId === segmentId
+                ? packet.revision
+                : undefined,
+            closeMessage: "WebSocket closed before batch ack",
+            errorMessage: "WebSocket errored before batch ack",
         });
     }
 
     private waitForPullResponse(ws: WebSocket): Promise<wsPacket> {
-        return new Promise((resolve, reject) => {
-            const onMessage = (event: MessageEvent) => {
-                let msg: wsPacket;
-                try {
-                    msg = decodePacket(readSocketMessage(event));
-                } catch (error) {
-                    cleanup();
-                    reject(asError(error));
-                    return;
-                }
-
-                if (
-                    msg.type === opType.InitRequired ||
-                    msg.type === opType.ChangeBatch ||
-                    msg.type === opType.SnapshotReset
-                ) {
-                    cleanup();
-                    resolve(msg);
-                    return;
-                }
-                if (msg.type === opType.Deny) {
-                    cleanup();
-                    reject(new Error(msg.message));
-                }
-            };
-            const onClose = () => {
-                cleanup();
-                reject(new Error("WebSocket closed before pull response"));
-            };
-            const onError = () => {
-                cleanup();
-                reject(new Error("WebSocket errored before pull response"));
-            };
-            const cleanup = () => {
-                ws.removeEventListener("message", onMessage);
-                ws.removeEventListener("close", onClose);
-                ws.removeEventListener("error", onError);
-            };
-
-            ws.addEventListener("message", onMessage);
-            ws.addEventListener("close", onClose, { once: true });
-            ws.addEventListener("error", onError, { once: true });
+        return waitForPacket(ws, {
+            accept: packet => (
+                packet.type === opType.InitRequired ||
+                packet.type === opType.ChangeBatch ||
+                packet.type === opType.SnapshotReset
+            ) ? packet : undefined,
+            closeMessage: "WebSocket closed before pull response",
+            errorMessage: "WebSocket errored before pull response",
         });
     }
 
     private waitForAuthAck(ws: WebSocket): Promise<wsPacket | null> {
-        return new Promise((resolve, reject) => {
-            const onMessage = (event: MessageEvent) => {
-                let msg: wsPacket;
-                try {
-                    msg = decodePacket(readSocketMessage(event));
-                } catch (error) {
-                    cleanup();
-                    reject(asError(error));
-                    return;
-                }
-
-                if (msg.type === opType.AuthAck) {
-                    cleanup();
-                    resolve(msg);
-                    return;
-                }
-                if (msg.type === opType.Deny) {
-                    cleanup();
-                    new Notice(msg.message);
-                    resolve(null);
-                    return;
-                }
-            };
-            const onClose = () => {
-                cleanup();
-                reject(new Error("WebSocket closed before auth ack"));
-            };
-            const onError = () => {
-                cleanup();
-                reject(new Error("WebSocket errored before auth ack"));
-            };
-            const cleanup = () => {
-                ws.removeEventListener("message", onMessage);
-                ws.removeEventListener("close", onClose);
-                ws.removeEventListener("error", onError);
-            };
-
-            ws.addEventListener("message", onMessage);
-            ws.addEventListener("close", onClose, { once: true });
-            ws.addEventListener("error", onError, { once: true });
+        return waitForPacket(ws, {
+            accept: packet => packet.type === opType.AuthAck ? packet : undefined,
+            closeMessage: "WebSocket closed before auth ack",
+            errorMessage: "WebSocket errored before auth ack",
+            denyReturnsNull: true,
         });
     }
 

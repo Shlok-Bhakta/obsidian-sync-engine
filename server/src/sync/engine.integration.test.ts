@@ -4,7 +4,7 @@ import { join, posix, relative, sep } from "node:path";
 import { sql } from "bun";
 import * as Y from "yjs";
 import { opType, SyncMutation, wsPacket } from "../../../shared/types";
-import { decodePacket, encodePacket, PROTOCOL_VERSION } from "../../../shared/protocol";
+import { decodePacket, encodePacket, encodePathToken, PROTOCOL_VERSION } from "../../../shared/protocol";
 import { shouldSyncPath, shouldUseYjs } from "../../../shared/pathPolicy";
 import {
   acceptMutations,
@@ -43,8 +43,10 @@ const CLIENT_A = "integration-client-a";
 const CLIENT_B = "integration-client-b";
 const NOTE_PATH = "notes/test.md";
 const SAMPLE_VAULT_PATH = "/home/shlok/Obsidian/obsidian-notes-test";
+const SAMPLE_LARGE_PDF_PATH = "ZArchive/CS436/Books/Research Methods in Human-Computer Interaction,Jonathan Lazar,Jinjuan Heidi Feng (Harry Hochheiser) (Z-Library).pdf";
 const SAMPLE_VAULT_INLINE_LIMIT = 512 * 1024;
 const SAMPLE_VAULT_BATCH_SIZE = 100;
+const BUN_DEFAULT_MAX_REQUEST_BODY_SIZE = 128 * 1024 * 1024;
 
 let wsServer: Bun.Server<unknown> | null = null;
 let wsUrl = "";
@@ -157,6 +159,13 @@ function mutation(path: string, content: string): SyncMutation {
 function updateBatch(segmentId: string, mutations: SyncMutation[]): Extract<wsPacket, { type: opType.UpdateBatch }> {
   const jsonl = mutations.map((entry, index) => JSON.stringify({ ...entry, id: index + 1 })).join("\n") + "\n";
   return { type: opType.UpdateBatch, segmentId, jsonl };
+}
+
+function httpUrl(path: string): string {
+  if (!wsServer) {
+    throw new Error("test server is not running");
+  }
+  return `http://127.0.0.1:${wsServer.port}${path}`;
 }
 
 function serverPacketPaths(packet: wsPacket): string[] {
@@ -431,9 +440,8 @@ describeIntegration("sync engine postgres integration", () => {
   beforeAll(async () => {
     await setupIntegrationDb();
     wsServer = Bun.serve({
+      ...server,
       port: 0,
-      fetch: server.fetch,
-      websocket: server.websocket,
     });
     wsUrl = `ws://127.0.0.1:${wsServer.port}/worker`;
   });
@@ -603,6 +611,58 @@ describeIntegration("sync engine postgres integration", () => {
 
     expect(await getBlobMetadata(path)).toBeNull();
     expect((await getFile(path))?.contentOid).toBeNull();
+  });
+
+  it("accepts an HTTP blob upload larger than Bun's default 128 MiB request limit", async () => {
+    const samplePath = join(SAMPLE_VAULT_PATH, ...SAMPLE_LARGE_PDF_PATH.split("/"));
+    const hasSample = await pathExists(samplePath);
+    const path = hasSample ? SAMPLE_LARGE_PDF_PATH : "assets/synthetic-over-128mb.bin";
+    const byteSize = hasSample
+      ? (await stat(samplePath)).size
+      : BUN_DEFAULT_MAX_REQUEST_BODY_SIZE + 1;
+    expect(byteSize).toBeGreaterThan(BUN_DEFAULT_MAX_REQUEST_BODY_SIZE);
+
+    const auth = await rotateClientKey("To Be Generated");
+    expect(auth.clientKey).toBeDefined();
+    const body = hasSample
+      ? Bun.file(samplePath)
+      : new Uint8Array(byteSize).fill(7);
+    const response = await fetch(httpUrl(`/v1/blobs/${encodePathToken(path)}`), {
+      method: "PUT",
+      headers: {
+        "Authorization": `Bearer ${auth.clientKey}`,
+        "Content-Type": "application/octet-stream",
+        "X-Content-Sha256": "sha-over-128mb",
+      },
+      body,
+    });
+
+    expect(response.status).not.toBe(413);
+    expect(response.status).toBeGreaterThanOrEqual(200);
+    expect(response.status).toBeLessThan(300);
+    const uploaded = await response.json() as { byteSize: number; contentSha256: string };
+    expect(uploaded.byteSize).toBe(byteSize);
+
+    await acceptMutations(CLIENT_A, [{
+      mutationId: crypto.randomUUID(),
+      operation: "UpsertFile",
+      path,
+      storageKind: "lo",
+      isYjs: false,
+      byteSize,
+      contentSha256: "sha-over-128mb",
+      created: Date.now(),
+    }]);
+    expect((await getBlobMetadata(path))?.byteSize).toBe(byteSize);
+
+    await acceptMutations(CLIENT_A, [{
+      mutationId: crypto.randomUUID(),
+      operation: "Delete",
+      path,
+      isFolder: false,
+      created: Date.now(),
+    }]);
+    expect(await getBlobMetadata(path)).toBeNull();
   });
 
   it("multiple clients can upsert distinct BYTEA blob files and pull both changes", async () => {
@@ -1070,7 +1130,7 @@ describeIntegration("sync engine postgres integration", () => {
       typingPath,
       typedEdits: markersA.length + markersB.length,
     });
-  });
+  }, 20_000);
 
   it("DocSync returns catch-up bytes for a client behind the server", async () => {
     await seedMarkdownFile(CLIENT_A, NOTE_PATH, "server text");

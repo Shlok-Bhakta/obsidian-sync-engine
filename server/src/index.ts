@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { upgradeWebSocket, websocket } from "hono/bun";
 import { BootstrapStatus, opType, wsPacket } from "../../shared/types";
-import { decodePacket, decodeUpdateBatchJsonl, encodePacket, PROTOCOL_VERSION } from "../../shared/protocol";
+import { decodePacket, decodePathToken, decodeUpdateBatchJsonl, encodePacket, PROTOCOL_VERSION } from "../../shared/protocol";
 import { buildBootstrapZip, BootstrapBuildResult } from "./bootstrap";
 import { bootstrapDB } from "./db/MigrationRunner";
 import { rotateClientKey, validateClientKey } from "./security";
@@ -38,6 +38,10 @@ app.get("/", c => c.text("Hello Hono!"));
 app.get("/health", c => c.text("OK"));
 
 const BOOTSTRAP_TTL_MS = 10 * 60 * 1000;
+export const MAX_REQUEST_BODY_SIZE = Number.parseInt(
+  process.env.SYNC_MAX_REQUEST_BODY_BYTES ?? String(512 * 1024 * 1024),
+  10,
+);
 
 type AuthenticatedSocket = {
   send: (data: string) => void;
@@ -222,15 +226,6 @@ async function registerBootstrapLink(
   startCountdown(token);
 }
 
-function base64UrlToBytes(value: string): Uint8Array {
-  const padded = value.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(value.length / 4) * 4, "=");
-  return Uint8Array.from(atob(padded), char => char.charCodeAt(0));
-}
-
-function blobPath(token: string): string {
-  return new TextDecoder().decode(base64UrlToBytes(decodeURIComponent(token)));
-}
-
 function authHeaderKey(request: Request): string {
   const authorization = request.headers.get("Authorization");
   if (authorization?.startsWith("Bearer ")) {
@@ -253,7 +248,7 @@ app.put("/v1/blobs/:path", async c => {
     log.warn("blob upload denied", { status: denied.status });
     return denied;
   }
-  const path = blobPath(c.req.param("path"));
+  const path = decodePathToken(c.req.param("path"));
   const body = c.req.raw.body;
   if (!body) {
     return c.text("Blob body is required", 400);
@@ -279,9 +274,10 @@ app.get("/v1/blobs/:path", async c => {
     log.warn("blob download denied", { status: denied.status });
     return denied;
   }
-  const metadata = await getBlobMetadata(blobPath(c.req.param("path")));
+  const path = decodePathToken(c.req.param("path"));
+  const metadata = await getBlobMetadata(path);
   if (!metadata) {
-    log.warn("blob download missing", { path: blobPath(c.req.param("path")) });
+    log.warn("blob download missing", { path });
     return c.text("Blob not found", 404);
   }
   log.info("blob download streaming", {
@@ -359,7 +355,7 @@ app.on("HEAD", "/v1/blobs/:path", async c => {
   if (denied) {
     return denied;
   }
-  const metadata = await getBlobMetadata(blobPath(c.req.param("path")));
+  const metadata = await getBlobMetadata(decodePathToken(c.req.param("path")));
   if (!metadata) {
     return new Response(null, { status: 404 });
   }
@@ -687,4 +683,5 @@ app.get(
 export default {
   fetch: app.fetch,
   websocket,
+  maxRequestBodySize: MAX_REQUEST_BODY_SIZE,
 };

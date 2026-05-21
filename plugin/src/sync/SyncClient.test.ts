@@ -330,6 +330,34 @@ describe("SyncClient initial snapshot", () => {
         expect(paths).not.toContain("assets/too-large.pdf");
     });
 
+    it("does not keep retrying first-sync upload only because a large blob was skipped", async () => {
+        const { client } = await makeClient({
+            "notes/existing.md": "existing note",
+            "assets/too-large.pdf": new Uint8Array((64 * 1024) + 1),
+            ".obsidian/workspace.json": "{}",
+        });
+        (client as unknown as {
+            blobClient: { upload: () => Promise<void> };
+        }).blobClient.upload = vi.fn(async () => {
+            throw new Error("413");
+        });
+        const testClient = client as unknown as {
+            readVaultSnapshot: () => Promise<outboxData[]>;
+            shouldUploadFirstSyncOverSnapshot: (packet: unknown) => Promise<boolean>;
+        };
+        const uploaded = await testClient.readVaultSnapshot();
+
+        await expect(testClient.shouldUploadFirstSyncOverSnapshot({
+            type: opType.SnapshotReset,
+            targetRevision: "10",
+            files: uploaded.map((change, index) => ({
+                ...change,
+                revision: String(index + 1),
+                clientId: "server",
+            })),
+        })).resolves.toBe(false);
+    });
+
     it("drops stale ignored rows while preparing an outbox segment", async () => {
         const outbox = new MemoryOutboxStore([
             {
