@@ -150,12 +150,8 @@ export default class SyncEngine extends Plugin {
 			this.manifest.id,
 		);
 		this.app.workspace.onLayoutReady(() => {
-			log.info("workspace ready; starting Yjs indexer");
-			this.yjsIndexer.start();
-			void this.yjsIndexer.waitForInitialScan().finally(() => {
-				log.info("initial Yjs index complete; starting sync client");
-				this.syncClient.start();
-			});
+			log.info("workspace ready; starting sync client");
+			this.syncClient.start();
 		});
 
 		this.registerEvent(this.app.workspace.on("layout-change", () => {
