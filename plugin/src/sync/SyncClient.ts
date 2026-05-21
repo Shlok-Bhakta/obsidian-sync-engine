@@ -10,6 +10,7 @@ import { SyncEngineSettings } from "../settings";
 import { DocSync } from "../yjs/DocSync";
 import { YjsStateStore } from "../yjs/YjsStateStore";
 import { BlobClient } from "./BlobClient";
+import { BootstrapUploader } from "./BootstrapUploader";
 import { exactArrayBuffer, VaultMutator } from "./VaultMutator";
 import { YjsApplicator } from "./YjsApplicator";
 import { errorContext, Logger } from "../../../shared/logger";
@@ -104,6 +105,7 @@ export class SyncClient {
     private lastFailureNoticeAt = 0;
     private readonly vaultMutator: VaultMutator;
     private readonly yjsApplicator: YjsApplicator;
+    private readonly bootstrapUploader: BootstrapUploader;
     private skippedInitialSnapshotPaths = new Set<string>();
 
     constructor(
@@ -141,6 +143,15 @@ export class SyncClient {
             clientId: this.clientId.slice(0, 18),
             clientName: this.clientName,
         });
+        this.bootstrapUploader = new BootstrapUploader(
+            app,
+            stateStore,
+            settings,
+            () => this.ensureAuthenticatedSocket(),
+            this.log,
+            this.onBootstrapStatus,
+            pluginId,
+        );
     }
 
     isApplyingRemoteChanges(path?: string): boolean {
@@ -207,6 +218,7 @@ export class SyncClient {
         this.lastPulledRevision = settings.lastPulledRevision;
         this.lastUploadedRevisionHint = settings.lastPulledRevision;
         this.blobClient.update(settings.backendUrl, settings.clientKey);
+        this.bootstrapUploader.update(settings);
         if (nextUrl !== this.serverUrl || authChanged) {
             this.log.info("sync settings changed; reconnecting", {
                 backendChanged: nextUrl !== this.serverUrl,
@@ -357,8 +369,9 @@ export class SyncClient {
         const pullResponse = await this.pullSince(openWs, this.lastPulledRevision);
 
         if (pullResponse.type === opType.InitRequired) {
-            this.log.info("server requires initial vault upload", { serverRevision: pullResponse.serverRevision });
-            await this.uploadInitialSnapshot(openWs);
+            this.log.info("server requires bootstrap upload", { serverRevision: pullResponse.serverRevision });
+            const revision = await this.bootstrapUploader.uploadAuthoritativeSnapshot();
+            await this.persistLastPulledRevision(revision);
         } else if (pullResponse.type === opType.ChangeBatch) {
             this.log.info("startup pull returned change batch", {
                 fromRevision: pullResponse.fromRevision,
@@ -379,12 +392,13 @@ export class SyncClient {
                     files: pullResponse.files.length,
                 });
                 if (await this.shouldUploadFirstSyncOverSnapshot(pullResponse)) {
-                    this.log.warn("first sync snapshot is missing local files; uploading local snapshot", {
+                    this.log.warn("first sync snapshot is missing local files; replacing server with bootstrap snapshot", {
                         targetRevision: pullResponse.targetRevision,
                         files: pullResponse.files.length,
                     });
-                    new Notice("Sync server has a partial first-sync snapshot; uploading this vault instead");
-                    await this.uploadInitialSnapshot(openWs);
+                    const revision = await this.bootstrapUploader.uploadAuthoritativeSnapshot();
+                    await this.persistLastPulledRevision(revision);
+                    new Notice("Sync completed first sync by uploading this vault snapshot");
                 } else {
                     await this.applySnapshotReset(pullResponse);
                 }
@@ -511,7 +525,7 @@ export class SyncClient {
         this.log.info("outbox segment acknowledged", { segmentId: segment.id, revision });
     }
 
-    private async uploadInitialSnapshot(ws: WebSocket): Promise<void> {
+    private async uploadInitialSnapshot(ws: WebSocket): Promise<string> {
         const packet: wsPacket = {
             type: opType.InitUploadBatch,
             segmentId: `init-${Date.now()}`,
@@ -532,6 +546,7 @@ export class SyncClient {
         const revision = await ack;
         this.recordUploadAckRevision(revision);
         this.log.info("initial snapshot acknowledged", { segmentId: packet.segmentId, revision });
+        return revision;
     }
 
     private async readVaultSnapshot(): Promise<SyncMutation[]> {
@@ -1075,6 +1090,7 @@ export class SyncClient {
             await this.onClientKeyRotated(packet.newClientKey);
             this.clientKey = packet.newClientKey;
             this.blobClient.update(this.httpBackendUrl(), this.clientKey);
+            this.bootstrapUploader.updateClientKey(this.clientKey);
             this.log.info("client key rotated");
         }
 
@@ -1092,6 +1108,9 @@ export class SyncClient {
             const wasStartupSynced = this.startupSynced;
             const inStartupSync = this.startupSyncPromise !== null;
             if (inStartupSync) {
+                if (this.authenticated) {
+                    return this.clientKey;
+                }
                 await this.reauthenticateOpenSocket();
             } else {
                 this.closeSocket();

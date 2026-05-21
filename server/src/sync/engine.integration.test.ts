@@ -4,7 +4,7 @@ import { join, posix, relative, sep } from "node:path";
 import { sql } from "bun";
 import * as Y from "yjs";
 import { opType, SyncMutation, wsPacket } from "../../../shared/types";
-import { decodePacket, encodePacket, encodePathToken, PROTOCOL_VERSION } from "../../../shared/protocol";
+import { decodePacket, encodePacket, encodePathToken, encodeUpdateBatchJsonl, PROTOCOL_VERSION } from "../../../shared/protocol";
 import { shouldSyncPath, shouldUseYjs } from "../../../shared/pathPolicy";
 import {
   acceptMutations,
@@ -36,7 +36,9 @@ import {
 } from "../test/yjsHarness";
 import { applyYjsPayload } from "../yjs/apply";
 import { buildBootstrapZip } from "../bootstrap";
-import { rotateClientKey } from "../security";
+import { putBootstrapBlob } from "./bootstrapBlobUpload";
+import { acceptBootstrapSnapshot } from "./bootstrapUpload";
+import { authenticateClientKey, rotateClientKey, validateClientKey } from "../security";
 import server from "../index";
 
 const CLIENT_A = "integration-client-a";
@@ -166,6 +168,11 @@ function httpUrl(path: string): string {
     throw new Error("test server is not running");
   }
   return `http://127.0.0.1:${wsServer.port}${path}`;
+}
+
+async function sha256Hex(value: string): Promise<string> {
+  const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return [...new Uint8Array(hash)].map(byte => byte.toString(16).padStart(2, "0")).join("");
 }
 
 function serverPacketPaths(packet: wsPacket): string[] {
@@ -463,7 +470,7 @@ describeIntegration("sync engine postgres integration", () => {
   });
 
   it("bootstraps the first client key from the first auth request", async () => {
-    const auth = await rotateClientKey("To Be Generated");
+    const auth = await authenticateClientKey("To Be Generated");
 
     expect(auth.authenticated).toBe(true);
     expect(auth.clientKey).toStartWith("obs_sync_");
@@ -479,6 +486,30 @@ describeIntegration("sync engine postgres integration", () => {
     expect(rows).toHaveLength(1);
     expect(rows[0]!.clientKey).toBe(auth.clientKey!);
     expect(rows[0]!.valid).toBe(true);
+  });
+
+  it("does not rotate a valid client key during normal auth", async () => {
+    const first = await authenticateClientKey("To Be Generated");
+    expect(first.clientKey).toBeDefined();
+
+    const second = await authenticateClientKey(first.clientKey!);
+
+    expect(second.authenticated).toBe(true);
+    expect(second.clientKey).toBe(first.clientKey);
+    expect(await validateClientKey(first.clientKey!)).toBe(true);
+  });
+
+  it("rotates a client key only by explicit request", async () => {
+    const first = await authenticateClientKey("To Be Generated");
+    expect(first.clientKey).toBeDefined();
+
+    const rotated = await rotateClientKey(first.clientKey!);
+
+    expect(rotated.authenticated).toBe(true);
+    expect(rotated.clientKey).toStartWith("obs_sync_");
+    expect(rotated.clientKey).not.toBe(first.clientKey);
+    expect(await validateClientKey(first.clientKey!)).toBe(false);
+    expect(await validateClientKey(rotated.clientKey!)).toBe(true);
   });
 
   it("UpsertFile writes files.content and files.yjs_state", async () => {
@@ -613,6 +644,123 @@ describeIntegration("sync engine postgres integration", () => {
     expect((await getFile(path))?.contentOid).toBeNull();
   });
 
+  it("finalizes bootstrap snapshot atomically with staged large blobs", async () => {
+    await acceptMutations(CLIENT_A, [mutation("notes/stale.md", "old partial state")]);
+    expect(await getFile("notes/stale.md")).not.toBeNull();
+
+    const bootstrapId = "bootstrap-integration-success";
+    const blobPath = "assets/archive.bin";
+    const blobBytes = new Uint8Array([10, 20, 30, 40, 50]);
+    await putBootstrapBlob(bootstrapId, blobPath, blobBytes, "sha-bootstrap-blob");
+
+    const result = await acceptBootstrapSnapshot(CLIENT_A, bootstrapId, [{
+      mutationId: crypto.randomUUID(),
+      operation: "CreateFolder",
+      path: "assets",
+      isFolder: true,
+      created: Date.now(),
+    }, {
+      mutationId: crypto.randomUUID(),
+      operation: "UpsertFile",
+      path: NOTE_PATH,
+      content: "bootstrapped note",
+      yjsState: stateFromMarkdown("bootstrapped note"),
+      storageKind: "text",
+      isYjs: true,
+      isFolder: false,
+      created: Date.now(),
+    }, {
+      mutationId: crypto.randomUUID(),
+      operation: "UpsertFile",
+      path: blobPath,
+      storageKind: "lo",
+      isYjs: false,
+      isFolder: false,
+      byteSize: blobBytes.byteLength,
+      contentSha256: "sha-bootstrap-blob",
+      created: Date.now(),
+    }]);
+
+    expect(BigInt(result.revision)).toBeGreaterThan(0n);
+    expect(result.files).toBe(3);
+    expect(await getFile("notes/stale.md")).toBeNull();
+    expect((await getFile(NOTE_PATH))?.content).toBe("bootstrapped note");
+    expect((await readBlobFile(blobPath))?.bytes).toEqual(blobBytes);
+
+    const stagedRows = await sql<{ count: string }[]>`
+      SELECT COUNT(*)::TEXT AS count
+      FROM bootstrap_blobs
+      WHERE bootstrap_id = ${bootstrapId};
+    `;
+    expect(stagedRows[0]?.count).toBe("0");
+  });
+
+  it("finalizes bootstrap manifest through HTTP and removes stale files", async () => {
+    await acceptMutations(CLIENT_A, [
+      mutation("notes/stale.md", "old partial state"),
+      mutation("ZArchive/OLD/POLS-207/Exam 2/Origins of Political Science/virtue.md", "old archive"),
+    ]);
+
+    const auth = await authenticateClientKey("To Be Generated");
+    expect(auth.clientKey).toBeDefined();
+    const bootstrapId = "bootstrap-http-manifest";
+    const mutations: SyncMutation[] = [{
+      mutationId: crypto.randomUUID(),
+      operation: "CreateFolder",
+      path: "notes",
+      isFolder: true,
+      created: Date.now(),
+    }, {
+      mutationId: crypto.randomUUID(),
+      operation: "UpsertFile",
+      path: NOTE_PATH,
+      content: "bootstrapped over HTTP",
+      yjsState: stateFromMarkdown("bootstrapped over HTTP"),
+      storageKind: "text",
+      isYjs: true,
+      isFolder: false,
+      created: Date.now(),
+    }];
+    const jsonl = encodeUpdateBatchJsonl(mutations);
+    const response = await fetch(httpUrl(`/v1/bootstrap-upload/${bootstrapId}/manifest`), {
+      method: "PUT",
+      headers: {
+        "Authorization": `Bearer ${auth.clientKey}`,
+        "Content-Type": "application/x-ndjson",
+        "X-Client-Id": CLIENT_A,
+        "X-Content-Sha256": await sha256Hex(jsonl),
+      },
+      body: jsonl,
+    });
+
+    expect(response.status).toBe(200);
+    const result = await response.json() as { revision: string; files: number };
+    expect(BigInt(result.revision)).toBeGreaterThan(0n);
+    expect(result.files).toBe(2);
+    expect(await getFile("notes/stale.md")).toBeNull();
+    expect(await getFile("ZArchive/OLD/POLS-207/Exam 2/Origins of Political Science/virtue.md")).toBeNull();
+    expect((await getFile(NOTE_PATH))?.content).toBe("bootstrapped over HTTP");
+  });
+
+  it("rolls back bootstrap finalize when a staged large blob is missing", async () => {
+    await acceptMutations(CLIENT_A, [mutation("notes/stale.md", "old partial state")]);
+
+    await expect(acceptBootstrapSnapshot(CLIENT_A, "bootstrap-missing-blob", [{
+      mutationId: crypto.randomUUID(),
+      operation: "UpsertFile",
+      path: "assets/missing.bin",
+      storageKind: "lo",
+      isYjs: false,
+      isFolder: false,
+      byteSize: 5,
+      contentSha256: "sha-missing",
+      created: Date.now(),
+    }])).rejects.toThrow("Bootstrap blob is missing");
+
+    expect((await getFile("notes/stale.md"))?.content).toBe("old partial state");
+    expect(await getFile("assets/missing.bin")).toBeNull();
+  });
+
   it("accepts an HTTP blob upload larger than Bun's default 128 MiB request limit", async () => {
     const samplePath = join(SAMPLE_VAULT_PATH, ...SAMPLE_LARGE_PDF_PATH.split("/"));
     const hasSample = await pathExists(samplePath);
@@ -622,7 +770,7 @@ describeIntegration("sync engine postgres integration", () => {
       : BUN_DEFAULT_MAX_REQUEST_BODY_SIZE + 1;
     expect(byteSize).toBeGreaterThan(BUN_DEFAULT_MAX_REQUEST_BODY_SIZE);
 
-    const auth = await rotateClientKey("To Be Generated");
+    const auth = await authenticateClientKey("To Be Generated");
     expect(auth.clientKey).toBeDefined();
     const body = hasSample
       ? Bun.file(samplePath)

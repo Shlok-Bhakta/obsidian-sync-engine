@@ -30,7 +30,7 @@ export async function validateClientKey(clientKey: string): Promise<boolean> {
     return isClientKeyAccepted(clientKey);
 }
 
-export async function rotateClientKey(clientKey: string): Promise<ClientKeyRotationResult> {
+export async function authenticateClientKey(clientKey: string): Promise<ClientKeyRotationResult> {
     return sql.begin(async tx => {
         await tx`SELECT pg_advisory_xact_lock(918342781);`;
         const zerocheck = await tx<ClientKeyCount[]>`SELECT COUNT(valid) FROM client_keys`;
@@ -60,40 +60,40 @@ export async function rotateClientKey(clientKey: string): Promise<ClientKeyRotat
         }
 
         const keyRow = existing[0];
-        if(keyRow.valid){
-            const key = generateClientKey();
-            const inserted = await tx<ClientKeyRow[]>`
-                INSERT INTO client_keys (client_key, previous_key_id, valid)
-                VALUES (${key}, ${keyRow.id}, TRUE)
-                RETURNING id, client_key AS "clientKey", valid;
-            `;
-            await tx`UPDATE client_keys SET valid = FALSE WHERE id = ${keyRow.id};`;
-            return { authenticated: true, clientKey: key, currentKeyId: inserted[0].id, previousKeyId: keyRow.id };
-        }
-
-        const current = await tx<ClientKeyRow[]>`
-            WITH RECURSIVE descendants AS (
-                SELECT id, client_key, valid, created_at, 1 AS depth
-                FROM client_keys
-                WHERE previous_key_id = ${keyRow.id}
-
-                UNION ALL
-
-                SELECT child.id, child.client_key, child.valid, child.created_at, descendants.depth + 1
-                FROM client_keys child
-                JOIN descendants ON child.previous_key_id = descendants.id
-            )
-            SELECT id, client_key AS "clientKey", valid
-            FROM descendants
-            WHERE valid = TRUE
-            ORDER BY depth DESC, created_at DESC
-            LIMIT 1;
-        `;
-        if(current.length === 0){
+        if(!keyRow.valid){
             return { authenticated: false };
         }
 
-        return { authenticated: true, clientKey: current[0].clientKey, currentKeyId: current[0].id, previousKeyId: keyRow.id };
+        return { authenticated: true, clientKey: keyRow.clientKey, currentKeyId: keyRow.id, previousKeyId: null };
+    });
+}
+
+export async function rotateClientKey(clientKey: string): Promise<ClientKeyRotationResult> {
+    return sql.begin(async tx => {
+        await tx`SELECT pg_advisory_xact_lock(918342781);`;
+        if(!isClientKeyShape(clientKey)){
+            return { authenticated: false };
+        }
+
+        const existing = await tx<ClientKeyRow[]>`
+            SELECT id, client_key AS "clientKey", valid
+            FROM client_keys
+            WHERE client_key = ${clientKey}
+            FOR UPDATE;
+        `;
+        const keyRow = existing[0];
+        if(!keyRow?.valid){
+            return { authenticated: false };
+        }
+
+        const key = generateClientKey();
+        const inserted = await tx<ClientKeyRow[]>`
+            INSERT INTO client_keys (client_key, previous_key_id, valid)
+            VALUES (${key}, ${keyRow.id}, TRUE)
+            RETURNING id, client_key AS "clientKey", valid;
+        `;
+        await tx`UPDATE client_keys SET valid = FALSE WHERE id = ${keyRow.id};`;
+        return { authenticated: true, clientKey: key, currentKeyId: inserted[0].id, previousKeyId: keyRow.id };
     });
 }
 

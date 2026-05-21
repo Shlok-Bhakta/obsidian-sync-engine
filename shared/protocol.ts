@@ -289,6 +289,7 @@ export function decodeUpdateBatchJsonl(jsonl: string): SyncMutation[] {
             storageKind: row.storageKind,
             byteSize: row.byteSize,
             contentSha256: row.contentSha256,
+            content: row.content,
             created: row.created,
         });
     }

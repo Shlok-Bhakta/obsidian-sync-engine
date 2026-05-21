@@ -1,6 +1,7 @@
 import { sql } from "bun";
 import migration0001 from "./migrations/0001_init.sql" with { type: "file" };
 import migration0002 from "./migrations/0002_blob_storage.sql" with { type: "file" };
+import migration0003 from "./migrations/0003_bootstrap_blob_staging.sql" with { type: "file" };
 import { log } from "../logger";
 
 const migrationsManifest = [
@@ -11,6 +12,10 @@ const migrationsManifest = [
     {
         name: "0002_blob_storage",
         sql: migration0002,
+    },
+    {
+        name: "0003_bootstrap_blob_staging",
+        sql: migration0003,
     }
 ]
 

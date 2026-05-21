@@ -26,6 +26,38 @@ If your plugin does not need CSS, delete this file.
 	color: var(--text-error);
 }
 
+.sync-engine-bootstrap-status__phase {
+	margin-bottom: 8px;
+	color: var(--text-normal);
+	font-size: var(--font-ui-small);
+	font-weight: 600;
+}
+
+.sync-engine-bootstrap-status__meta {
+	margin-top: 8px;
+	color: var(--text-muted);
+	font-size: var(--font-ui-smaller);
+}
+
+.sync-engine-bootstrap-progress {
+	overflow: hidden;
+	width: 100%;
+	height: 6px;
+	border-radius: 999px;
+	background: var(--background-modifier-border);
+}
+
+.sync-engine-bootstrap-progress__bar {
+	height: 100%;
+	border-radius: inherit;
+	background: var(--interactive-accent);
+	transition: width 120ms ease-out;
+}
+
+.sync-engine-bootstrap-statusbar {
+	color: var(--text-muted);
+}
+
 .sync-engine-bootstrap-link__meta {
 	margin-bottom: 8px;
 	color: var(--text-muted);

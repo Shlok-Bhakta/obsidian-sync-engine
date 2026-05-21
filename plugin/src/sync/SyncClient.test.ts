@@ -425,10 +425,17 @@ describe("SyncClient initial snapshot", () => {
             ensureAuthenticatedSocket: () => Promise<FakeWebSocket>;
             flushPendingOutboxForStartup: () => Promise<void>;
             pullSince: (_ws: FakeWebSocket, _revision: string) => Promise<unknown>;
-            uploadInitialSnapshot: (_ws: FakeWebSocket) => Promise<void>;
+            bootstrapUploader: { uploadAuthoritativeSnapshot: () => Promise<string> };
             catchUpToServer: (_ws?: FakeWebSocket) => Promise<void>;
             livePushPromise: Promise<void>;
             startupSynced: boolean;
+            lastPulledRevision: string;
+        };
+        const persisted: string[] = [];
+        (client as unknown as {
+            onLastPulledRevisionChanged: (revision: string) => Promise<void>;
+        }).onLastPulledRevisionChanged = async revision => {
+            persisted.push(revision);
         };
         testClient.ensureAuthenticatedSocket = async () => ws;
         testClient.flushPendingOutboxForStartup = async () => {};
@@ -448,13 +455,55 @@ describe("SyncClient initial snapshot", () => {
                 clientId: "server",
             }],
         });
-        testClient.uploadInitialSnapshot = vi.fn(async () => {});
+        testClient.bootstrapUploader.uploadAuthoritativeSnapshot = vi.fn(async () => "171");
         testClient.catchUpToServer = async () => {};
         testClient.livePushPromise = Promise.resolve();
 
         await testClient.runStartupSync();
 
-        expect(testClient.uploadInitialSnapshot).toHaveBeenCalledTimes(1);
+        expect(testClient.bootstrapUploader.uploadAuthoritativeSnapshot).toHaveBeenCalledTimes(1);
+        expect(testClient.lastPulledRevision).toBe("171");
+        expect(persisted).toEqual(["171"]);
+        expect(testClient.startupSynced).toBe(true);
+    });
+
+    it("uses authoritative bootstrap upload when the server requires init", async () => {
+        const { client } = await makeClient({
+            "notes/existing.md": "local note",
+        });
+        const ws = new FakeWebSocket();
+        const testClient = client as unknown as {
+            runStartupSync: () => Promise<void>;
+            ensureAuthenticatedSocket: () => Promise<FakeWebSocket>;
+            flushPendingOutboxForStartup: () => Promise<void>;
+            pullSince: (_ws: FakeWebSocket, _revision: string) => Promise<unknown>;
+            bootstrapUploader: { uploadAuthoritativeSnapshot: () => Promise<string> };
+            catchUpToServer: (_ws?: FakeWebSocket) => Promise<void>;
+            livePushPromise: Promise<void>;
+            startupSynced: boolean;
+            lastPulledRevision: string;
+        };
+        const persisted: string[] = [];
+        (client as unknown as {
+            onLastPulledRevisionChanged: (revision: string) => Promise<void>;
+        }).onLastPulledRevisionChanged = async revision => {
+            persisted.push(revision);
+        };
+        testClient.ensureAuthenticatedSocket = async () => ws;
+        testClient.flushPendingOutboxForStartup = async () => {};
+        testClient.pullSince = async () => ({
+            type: opType.InitRequired,
+            serverRevision: "0",
+        });
+        testClient.bootstrapUploader.uploadAuthoritativeSnapshot = vi.fn(async () => "42");
+        testClient.catchUpToServer = async () => {};
+        testClient.livePushPromise = Promise.resolve();
+
+        await testClient.runStartupSync();
+
+        expect(testClient.bootstrapUploader.uploadAuthoritativeSnapshot).toHaveBeenCalledTimes(1);
+        expect(testClient.lastPulledRevision).toBe("42");
+        expect(persisted).toEqual(["42"]);
         expect(testClient.startupSynced).toBe(true);
     });
 

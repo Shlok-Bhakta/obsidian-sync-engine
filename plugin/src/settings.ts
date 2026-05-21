@@ -160,10 +160,23 @@ export class SyncEngineSettingTab extends PluginSettingTab {
 			if (!status) {
 				return;
 			}
-			if (status.status === "building") {
-				bootstrapStatusEl.createDiv({
-					cls: "sync-engine-bootstrap-status",
-					text: status.message ?? "Building vault zip...",
+			if (status.status === "building" || status.status === "uploading") {
+				const panel = bootstrapStatusEl.createDiv({ cls: "sync-engine-bootstrap-status" });
+				panel.createDiv({
+					cls: "sync-engine-bootstrap-status__phase",
+					text: status.phase ?? status.message ?? (status.status === "building" ? "Building bootstrap snapshot" : "Uploading bootstrap snapshot"),
+				});
+				const total = status.progressTotal ?? 0;
+				const current = status.progressCurrent ?? 0;
+				const percent = total > 0 ? Math.min(100, Math.floor((current / total) * 100)) : 0;
+				const progress = panel.createDiv({ cls: "sync-engine-bootstrap-progress" });
+				progress.createDiv({
+					cls: "sync-engine-bootstrap-progress__bar",
+					attr: { style: `width: ${percent}%` },
+				});
+				panel.createDiv({
+					cls: "sync-engine-bootstrap-status__meta",
+					text: total > 0 ? `${current}/${total} files - ${percent}%` : "Preparing...",
 				});
 			} else if (status.status === "ready" && status.downloadUrl) {
 				const seconds = Math.max(0, Math.ceil((status.remainingMs ?? 0) / 1000));
@@ -201,6 +214,11 @@ export class SyncEngineSettingTab extends PluginSettingTab {
 				bootstrapStatusEl.createDiv({
 					cls: "sync-engine-bootstrap-status sync-engine-bootstrap-status--success",
 					text: "Vault link downloaded.",
+				});
+			} else if (status.status === "complete") {
+				bootstrapStatusEl.createDiv({
+					cls: "sync-engine-bootstrap-status sync-engine-bootstrap-status--success",
+					text: status.message ?? "Bootstrap upload complete.",
 				});
 			} else if (status.status === "expired") {
 				bootstrapStatusEl.createDiv({

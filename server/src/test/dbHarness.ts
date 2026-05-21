@@ -17,7 +17,7 @@ export async function setupIntegrationDb(): Promise<void> {
 }
 
 export async function resetIntegrationData(): Promise<void> {
-  await sql`TRUNCATE TABLE sync_events, files, clients, client_keys RESTART IDENTITY CASCADE;`;
+  await sql`TRUNCATE TABLE sync_events, files, bootstrap_blobs, clients, client_keys RESTART IDENTITY CASCADE;`;
   await sql`
     UPDATE server_meta
     SET compacted_revision = 0

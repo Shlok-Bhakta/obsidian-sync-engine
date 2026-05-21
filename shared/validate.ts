@@ -29,6 +29,20 @@ const initUploadBatchPacketSchema = z.object({
     changes: z.array(z.record(z.unknown())),
 });
 
+const bootstrapUploadPacketSchema = z.object({
+    type: z.literal(opType.BootstrapUpload),
+    bootstrapId: z.string().min(1),
+    manifestSha256: z.string().min(1),
+    jsonl: z.string().min(1),
+});
+
+const bootstrapUploadAckPacketSchema = z.object({
+    type: z.literal(opType.BootstrapUploadAck),
+    bootstrapId: z.string().min(1),
+    revision: revisionSchema,
+    files: z.number().int().nonnegative(),
+});
+
 const denyPacketSchema = z.object({
     type: z.literal(opType.Deny),
     message: z.string(),
@@ -74,8 +88,11 @@ const bootstrapCreatePacketSchema = z.object({
 
 const bootstrapStatusPacketSchema = z.object({
     type: z.literal(opType.BootstrapStatus),
-    status: z.enum(["building", "ready", "downloaded", "expired", "failed"]),
+    status: z.enum(["building", "uploading", "ready", "downloaded", "complete", "expired", "failed"]),
     vaultName: z.string(),
+    phase: z.string().optional(),
+    progressCurrent: z.number().optional(),
+    progressTotal: z.number().optional(),
     downloadUrl: z.string().optional(),
     expiresAt: z.number().optional(),
     remainingMs: z.number().optional(),
@@ -108,6 +125,8 @@ const packetSchemas: Record<string, z.ZodType<unknown>> = {
     [opType.PullSince]: pullSincePacketSchema,
     [opType.UpdateBatch]: updateBatchPacketSchema,
     [opType.InitUploadBatch]: initUploadBatchPacketSchema,
+    [opType.BootstrapUpload]: bootstrapUploadPacketSchema,
+    [opType.BootstrapUploadAck]: bootstrapUploadAckPacketSchema,
     [opType.Deny]: denyPacketSchema,
     [opType.AuthAck]: authAckPacketSchema,
     [opType.BatchAck]: batchAckPacketSchema,

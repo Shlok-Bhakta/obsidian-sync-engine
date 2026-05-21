@@ -49,6 +49,24 @@ describe("encodePacket / decodePacket", () => {
         expect(decodePacket(encodePacket(packet))).toEqual(packet);
     });
 
+    it("round-trips BootstrapUpload and BootstrapUploadAck", () => {
+        const upload = {
+            type: opType.BootstrapUpload as const,
+            bootstrapId: "bootstrap-1",
+            manifestSha256: "sha",
+            jsonl: "{}\n",
+        };
+        const ack = {
+            type: opType.BootstrapUploadAck as const,
+            bootstrapId: "bootstrap-1",
+            revision: "101",
+            files: 42,
+        };
+
+        expect(decodePacket(encodePacket(upload))).toEqual(upload);
+        expect(decodePacket(encodePacket(ack))).toEqual(ack);
+    });
+
     it("round-trips DocSync and DocSyncAck", () => {
         const doc = new Y.Doc();
         doc.getText("markdown").insert(0, "hello");
@@ -220,6 +238,22 @@ describe("decodeUpdateBatchJsonl", () => {
         const mutations = decodeUpdateBatchJsonl(jsonl);
         expect(mutations[0]?.contentBytes).toEqual(new Uint8Array([1, 2, 3]));
         expect(mutations[0]?.storageKind).toBe("bytea");
+    });
+
+    it("parses text UpsertFile content rows", () => {
+        const jsonl = JSON.stringify({
+            id: 1,
+            mutationId: "m-text",
+            operation: "UpsertFile",
+            path: "notes/a.md",
+            content: "hello bootstrap",
+            storageKind: "text",
+            isYjs: true,
+            created: 1,
+        });
+        const mutations = decodeUpdateBatchJsonl(jsonl);
+        expect(mutations[0]?.content).toBe("hello bootstrap");
+        expect(mutations[0]?.path).toBe("notes/a.md");
     });
 
     it("throws when path is missing", () => {

@@ -4,8 +4,10 @@ import { upgradeWebSocket, websocket } from "hono/bun";
 import { BootstrapStatus, opType, wsPacket } from "../../shared/types";
 import { decodePacket, decodePathToken, decodeUpdateBatchJsonl, encodePacket, PROTOCOL_VERSION } from "../../shared/protocol";
 import { buildBootstrapZip, BootstrapBuildResult } from "./bootstrap";
+import { putBootstrapBlob } from "./sync/bootstrapBlobUpload";
+import { acceptBootstrapSnapshot } from "./sync/bootstrapUpload";
 import { bootstrapDB } from "./db/MigrationRunner";
-import { rotateClientKey, validateClientKey } from "./security";
+import { authenticateClientKey, rotateClientKey, validateClientKey } from "./security";
 import { errorContext } from "../../shared/logger";
 import { log } from "./logger";
 import {
@@ -234,6 +236,11 @@ function authHeaderKey(request: Request): string {
   return request.headers.get("X-Client-Key") ?? "";
 }
 
+async function sha256Hex(value: string): Promise<string> {
+  const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return [...new Uint8Array(hash)].map(byte => byte.toString(16).padStart(2, "0")).join("");
+}
+
 async function requireBlobAuth(request: Request): Promise<Response | null> {
   const key = authHeaderKey(request);
   if (!await validateClientKey(key)) {
@@ -241,6 +248,17 @@ async function requireBlobAuth(request: Request): Promise<Response | null> {
   }
   return null;
 }
+
+app.post("/v1/auth/rotate-key", async c => {
+  const key = authHeaderKey(c.req.raw);
+  const rotated = await rotateClientKey(key);
+  if (!rotated.authenticated || !rotated.clientKey) {
+    log.warn("client key rotation denied");
+    return c.text("Client key is invalid", 401);
+  }
+  log.info("client key rotated by explicit request");
+  return c.json({ clientKey: rotated.clientKey });
+});
 
 app.put("/v1/blobs/:path", async c => {
   const denied = await requireBlobAuth(c.req.raw);
@@ -266,6 +284,68 @@ app.put("/v1/blobs/:path", async c => {
     contentSha256: metadata.contentSha256,
     revision: metadata.revision,
   });
+});
+
+app.put("/v1/bootstrap-upload/:bootstrapId/blobs/:path", async c => {
+  const denied = await requireBlobAuth(c.req.raw);
+  if (denied) {
+    log.warn("bootstrap blob upload denied", { status: denied.status });
+    return denied;
+  }
+  const bootstrapId = c.req.param("bootstrapId");
+  const path = decodePathToken(c.req.param("path"));
+  const contentSha256 = c.req.header("X-Content-Sha256") ?? null;
+  const body = c.req.raw.body;
+  if (!body) {
+    return new Response("Missing body", { status: 400 });
+  }
+  const result = await putBootstrapBlob(bootstrapId, path, body, contentSha256);
+  return c.json(result);
+});
+
+app.put("/v1/bootstrap-upload/:bootstrapId/manifest", async c => {
+  const denied = await requireBlobAuth(c.req.raw);
+  if (denied) {
+    log.warn("bootstrap manifest upload denied", { status: denied.status });
+    return denied;
+  }
+  const bootstrapId = c.req.param("bootstrapId");
+  const clientId = c.req.header("X-Client-Id") ?? "";
+  const manifestSha256 = c.req.header("X-Content-Sha256") ?? "";
+  if (!clientId) {
+    return c.text("Client id is required", 400);
+  }
+  if (!manifestSha256) {
+    return c.text("Bootstrap manifest hash is required", 400);
+  }
+  const jsonl = await c.req.text();
+  const actualManifestSha256 = await sha256Hex(jsonl);
+  if (actualManifestSha256 !== manifestSha256) {
+    return c.text("Bootstrap manifest hash mismatch", 400);
+  }
+  log.info("bootstrap manifest upload received", {
+    clientId,
+    bootstrapId,
+    manifestSha256,
+    bytes: jsonl.length,
+  });
+  const result = await acceptBootstrapSnapshot(
+    clientId,
+    bootstrapId,
+    decodeUpdateBatchJsonl(jsonl),
+  );
+  const client = findAuthenticatedClient(clientId);
+  if (client) {
+    client.lastPulledRevision = result.revision;
+    void pushChangesToOtherClients(client, result.revision);
+  }
+  log.info("bootstrap manifest upload acknowledged", {
+    clientId,
+    bootstrapId,
+    revision: result.revision,
+    files: result.files,
+  });
+  return c.json(result);
 });
 
 app.get("/v1/blobs/:path", async c => {
@@ -379,6 +459,15 @@ type Client = {
 
 const authenticatedClients = new Set<Client>();
 
+function findAuthenticatedClient(clientId: string): Client | null {
+  for (const client of authenticatedClients) {
+    if (client.clientId === clientId && client.isAuthenticated) {
+      return client;
+    }
+  }
+  return null;
+}
+
 function revisionFromServerPacket(packet: wsPacket): string | null {
   if (packet.type === opType.ChangeBatch) {
     return packet.serverRevision;
@@ -472,14 +561,7 @@ app.get(
           clientName: client.clientName,
         });
 
-        if (!client.isAuthenticated) {
-          if (data.type !== opType.Auth) {
-            log.warn("websocket rejected unauthenticated packet", { type: data.type });
-            const deny: wsPacket = { type: opType.Deny, message: "Client is not authenticated" };
-            ws.send(encodePacket(deny));
-            ws.close(1008, "Authenticate first");
-            return;
-          }
+        if (data.type === opType.Auth) {
           if (data.protocolVersion !== PROTOCOL_VERSION) {
             const direction = data.protocolVersion > PROTOCOL_VERSION ? "newer" : "older";
             const target = data.protocolVersion > PROTOCOL_VERSION ? "server" : "client";
@@ -496,7 +578,7 @@ app.get(
             return;
           }
 
-          const auth = await rotateClientKey(data.clientKey);
+          const auth = await authenticateClientKey(data.clientKey);
           if (!auth.authenticated || !auth.clientKey) {
             const deny: wsPacket = { type: opType.Deny, message: "Client key is invalid" };
             ws.send(encodePacket(deny));
@@ -524,7 +606,7 @@ app.get(
             clientId: client.clientId,
             clientName: client.clientName,
             lastPulledRevision: data.lastPulledRevision,
-            rotatedKey: auth.clientKey !== data.clientKey,
+            rotatedKey: false,
           });
 
           const ack: wsPacket = {
@@ -539,6 +621,14 @@ app.get(
               remainingMs: remainingMs(latestBootstrapStatus.expiresAt),
             }));
           }
+          return;
+        }
+
+        if (!client.isAuthenticated) {
+          log.warn("websocket rejected unauthenticated packet", { type: data.type });
+          const deny: wsPacket = { type: opType.Deny, message: "Client is not authenticated" };
+          ws.send(encodePacket(deny));
+          ws.close(1008, "Authenticate first");
           return;
         }
 
@@ -619,6 +709,41 @@ app.get(
             revision,
           });
           void pushChangesToOtherClients(client, revision);
+          return;
+        }
+
+        if (data.type === opType.BootstrapUpload) {
+          const actualManifestSha256 = await sha256Hex(data.jsonl);
+          if (actualManifestSha256 !== data.manifestSha256) {
+            throw new Error("Bootstrap manifest hash mismatch");
+          }
+          log.info("bootstrap upload received", {
+            clientId: client.clientId,
+            clientName: client.clientName,
+            bootstrapId: data.bootstrapId,
+            manifestSha256: data.manifestSha256,
+            bytes: data.jsonl.length,
+          });
+          const result = await acceptBootstrapSnapshot(
+            client.clientId,
+            data.bootstrapId,
+            decodeUpdateBatchJsonl(data.jsonl),
+          );
+          const ack: wsPacket = {
+            type: opType.BootstrapUploadAck,
+            bootstrapId: data.bootstrapId,
+            revision: result.revision,
+            files: result.files,
+          };
+          ws.send(encodePacket(ack));
+          client.lastPulledRevision = result.revision;
+          log.info("bootstrap upload acknowledged", {
+            clientId: client.clientId,
+            bootstrapId: data.bootstrapId,
+            revision: result.revision,
+            files: result.files,
+          });
+          void pushChangesToOtherClients(client, result.revision);
           return;
         }
 

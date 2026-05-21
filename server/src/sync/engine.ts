@@ -328,7 +328,7 @@ export async function registerClient(
   `;
 }
 
-async function applyMutation(tx: typeof sql, clientId: string, mutation: SyncMutation): Promise<string> {
+export async function applyMutation(tx: typeof sql, clientId: string, mutation: SyncMutation): Promise<string> {
   if (isPluginInternalPath(mutation.path) || (mutation.toPath && isPluginInternalPath(mutation.toPath))) {
     throw new Error(`Refusing to sync plugin-internal path: ${mutation.toPath ?? mutation.path}`);
   }

@@ -82,6 +82,7 @@ export default class SyncEngine extends Plugin {
 	yjsIndexer: VaultYjsIndexer;
 	syncClient: SyncClient;
 	bootstrapStatus: BootstrapStatus | null = null;
+	private bootstrapStatusBarEl: HTMLElement | null = null;
 	private bootstrapStatusListeners: Set<() => void> = new Set();
 	private pendingFileTimers: Map<Path, number> = new Map();
 	private configDirStats: Map<Path, string> = new Map();
@@ -108,6 +109,9 @@ export default class SyncEngine extends Plugin {
 		this.pruningDocs = new Set<Path>();
 		await this.db.open();
 		await this.yjsStateStore.open();
+		this.bootstrapStatusBarEl = this.addStatusBarItem();
+		this.bootstrapStatusBarEl.addClass("sync-engine-bootstrap-statusbar");
+		this.renderBootstrapStatusBar();
 		void this.captureBootConfigShas();
 		this.yjsIndexer = new VaultYjsIndexer(
 			this.app,
@@ -134,12 +138,7 @@ export default class SyncEngine extends Plugin {
 				await this.saveSettings();
 			},
 			(path) => this.docs.get(path),
-			(status) => {
-				this.bootstrapStatus = status;
-				for (const listener of this.bootstrapStatusListeners) {
-					listener();
-				}
-			},
+			(status) => this.setBootstrapStatus(status),
 			() => {
 				this.startConfigDirPoller();
 			},
@@ -654,6 +653,39 @@ export default class SyncEngine extends Plugin {
 	subscribeBootstrapStatus(listener: () => void): () => void {
 		this.bootstrapStatusListeners.add(listener);
 		return () => this.bootstrapStatusListeners.delete(listener);
+	}
+
+	private setBootstrapStatus(status: BootstrapStatus): void {
+		this.bootstrapStatus = status;
+		this.renderBootstrapStatusBar();
+		for (const listener of this.bootstrapStatusListeners) {
+			listener();
+		}
+	}
+
+	private renderBootstrapStatusBar(): void {
+		if (!this.bootstrapStatusBarEl) {
+			return;
+		}
+		const status = this.bootstrapStatus;
+		if (!status || !["building", "uploading", "complete", "failed"].includes(status.status)) {
+			this.bootstrapStatusBarEl.setText("");
+			this.bootstrapStatusBarEl.hide();
+			return;
+		}
+		this.bootstrapStatusBarEl.show();
+		if (status.status === "failed") {
+			this.bootstrapStatusBarEl.setText(`Sync bootstrap failed: ${status.message ?? "Unknown error"}`);
+			return;
+		}
+		if (status.status === "complete") {
+			this.bootstrapStatusBarEl.setText("Sync bootstrap complete");
+			return;
+		}
+		const total = status.progressTotal ?? 0;
+		const current = status.progressCurrent ?? 0;
+		const percent = total > 0 ? Math.min(100, Math.floor((current / total) * 100)) : 0;
+		this.bootstrapStatusBarEl.setText(`Sync bootstrap ${percent}%`);
 	}
 
 	async generateVaultLink(): Promise<void> {

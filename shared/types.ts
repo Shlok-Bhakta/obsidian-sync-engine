@@ -56,8 +56,10 @@ export type DocSyncResult = {
 
 export type BootstrapStatusValue =
     | "building"
+    | "uploading"
     | "ready"
     | "downloaded"
+    | "complete"
     | "expired"
     | "failed";
 
@@ -65,6 +67,9 @@ export type BootstrapStatus = {
     type: opType.BootstrapStatus;
     status: BootstrapStatusValue;
     vaultName: string;
+    phase?: string;
+    progressCurrent?: number;
+    progressTotal?: number;
     downloadUrl?: string;
     expiresAt?: number;
     remainingMs?: number;
@@ -79,6 +84,8 @@ export enum opType {
     Update = "Update",
     UpdateBatch = "UpdateBatch",
     InitUploadBatch = "InitUploadBatch",
+    BootstrapUpload = "BootstrapUpload",
+    BootstrapUploadAck = "BootstrapUploadAck",
     PullSince = "PullSince",
     InitRequired = "InitRequired",
     ChangeBatch = "ChangeBatch",
@@ -111,6 +118,18 @@ export type wsPacket =
         type: opType.InitUploadBatch;
         segmentId: string;
         changes: SyncMutation[];
+    }
+    | {
+        type: opType.BootstrapUpload;
+        bootstrapId: string;
+        manifestSha256: string;
+        jsonl: string;
+    }
+    | {
+        type: opType.BootstrapUploadAck;
+        bootstrapId: string;
+        revision: Revision;
+        files: number;
     }
     | {
         type: opType.BatchAck;
