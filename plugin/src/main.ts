@@ -1,4 +1,4 @@
-import { MarkdownView, Notice, Plugin, TAbstractFile, TFile, TFolder } from 'obsidian';
+import { MarkdownView, Notice, Platform, Plugin, TAbstractFile, TFile, TFolder } from 'obsidian';
 import * as Y from 'yjs';
 import {DEFAULT_SETTINGS, SyncEngineSettings, SyncEngineSettingTab} from "./settings";
 import { JsonlOutboxStore, OutboxStore } from 'db/db';
@@ -16,7 +16,7 @@ import { errorContext } from "../../shared/logger";
 import { log } from "./logger";
 
 const INLINE_BYTES_LIMIT = 64 * 1024;
-const CONFIG_DIR_POLL_MS = 2000;
+const CONFIG_DIR_POLL_MS = Platform.isMobile ? 30_000 : 2000;
 type ConfigDirScanMode = "baseline" | "enqueue";
 
 function generateClientId(): string {
@@ -87,6 +87,8 @@ export default class SyncEngine extends Plugin {
 	private pendingFileTimers: Map<Path, number> = new Map();
 	private configDirStats: Map<Path, string> = new Map();
 	private remoteEditorDispatches: Set<EditorView> = new Set();
+	private configDirPollerStarted = false;
+	private yjsIndexerStarted = false;
 	/** Content hashes of syncable config files on disk before the first startup pull. */
 	private bootConfigSha = new Map<Path, string>();
 	/** Last config file bytes applied from the server during startup/live pull. */
@@ -141,6 +143,9 @@ export default class SyncEngine extends Plugin {
 			(status) => this.setBootstrapStatus(status),
 			() => {
 				this.startConfigDirPoller();
+				if (!Platform.isMobile) {
+					this.startYjsIndexer();
+				}
 			},
 			(path, bytes) => {
 				void this.recordRemoteConfigApplied(path, bytes);
@@ -311,6 +316,10 @@ export default class SyncEngine extends Plugin {
 	}
 
 	private startConfigDirPoller(): void {
+		if (this.configDirPollerStarted) {
+			return;
+		}
+		this.configDirPollerStarted = true;
 		void this.scanConfigDirForChanges("baseline");
 		this.registerInterval(window.setInterval(() => {
 			void this.scanConfigDirForChanges("enqueue");
@@ -318,6 +327,9 @@ export default class SyncEngine extends Plugin {
 	}
 
 	private async scanConfigDirForChanges(mode: ConfigDirScanMode): Promise<void> {
+		if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+			return;
+		}
 		if (this.syncClient?.isApplyingRemoteChanges()) {
 			return;
 		}
@@ -365,6 +377,14 @@ export default class SyncEngine extends Plugin {
 			files.push(...await this.listConfigDirFiles(folder));
 		}
 		return files;
+	}
+
+	private startYjsIndexer(): void {
+		if (this.yjsIndexerStarted) {
+			return;
+		}
+		this.yjsIndexerStarted = true;
+		this.yjsIndexer.start();
 	}
 
 	private async enqueueLocalPathDelete(path: string): Promise<void> {

@@ -12,6 +12,7 @@ import { outboxData } from "../../../shared/types";
 
 class MemoryStateStore {
     states = new Map<string, Uint8Array>();
+    hashes = new Map<string, string>();
 
     async get(path: string): Promise<Uint8Array | null> {
         return this.states.get(path) ?? null;
@@ -19,6 +20,10 @@ class MemoryStateStore {
 
     async put(path: string, state: Uint8Array): Promise<void> {
         this.states.set(path, new Uint8Array(state));
+    }
+
+    async putContentHash(path: string, hash: string): Promise<void> {
+        this.hashes.set(path, hash);
     }
 
     async delete(_path: string, _isFolder = false): Promise<void> {}

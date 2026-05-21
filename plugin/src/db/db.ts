@@ -60,6 +60,7 @@ export class JsonlOutboxStore implements OutboxStore {
     private activeBytes = 0;
     private isOpen = false;
     private queue: Promise<void> = Promise.resolve();
+    private metaDirty = false;
 
     constructor(private readonly app: App, manifest: PluginManifest) {
         this.dir = normalizePath(`${app.vault.configDir}/plugins/${manifest.id}/outbox`);
@@ -88,6 +89,7 @@ export class JsonlOutboxStore implements OutboxStore {
 
     async close(): Promise<void> {
         await this.runExclusive(async () => {
+            await this.writeMetaIfDirty();
             this.isOpen = false;
         });
     }
@@ -106,7 +108,7 @@ export class JsonlOutboxStore implements OutboxStore {
             await this.app.vault.adapter.append(this.activePath, line);
             this.activeRecords++;
             this.activeBytes += line.length;
-            await this.writeMeta();
+            this.metaDirty = true;
             log.debug("outbox row appended", {
                 rowId: id,
                 operation: row.operation,
@@ -249,6 +251,13 @@ export class JsonlOutboxStore implements OutboxStore {
 
     private async writeMeta(): Promise<void> {
         await this.app.vault.adapter.write(this.metaPath, JSON.stringify(this.meta));
+        this.metaDirty = false;
+    }
+
+    private async writeMetaIfDirty(): Promise<void> {
+        if (this.metaDirty) {
+            await this.writeMeta();
+        }
     }
 
     private async refreshActiveStats(): Promise<void> {
@@ -331,6 +340,7 @@ export class JsonlOutboxStore implements OutboxStore {
         await this.app.vault.adapter.write(this.activePath, "");
         this.activeRecords = 0;
         this.activeBytes = 0;
+        this.metaDirty = true;
         await this.writeMeta();
         log.debug("outbox active segment sealed", { segmentId: String(segmentId), pendingPath });
     }

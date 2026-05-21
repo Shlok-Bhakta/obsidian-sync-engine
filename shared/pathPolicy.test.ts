@@ -28,4 +28,9 @@ describe("path policy", () => {
         expect(shouldSyncPath(".git/objects/pack/file.idx")).toBe(false);
         expect(shouldSyncPath(".obsidian/plugins/hot-reload/.git/objects/pack/file.idx")).toBe(false);
     });
+
+    it("does not sync local sync engine state", () => {
+        expect(shouldSyncPath(".sync-engine-state/obsidian-sync-engine/yjs/notes/test.md.state")).toBe(false);
+        expect(shouldSyncPath(".sync-engine-state/obsidian-sync-engine/yjs/notes/test.md.state.sha256")).toBe(false);
+    });
 });

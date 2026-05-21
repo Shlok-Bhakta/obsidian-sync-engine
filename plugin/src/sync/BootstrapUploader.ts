@@ -122,6 +122,7 @@ export class BootstrapUploader {
                     yjsState = docStateFromContent(content, Y);
                     await this.stateStore.put(entry.path, yjsState);
                 }
+                await this.stateStore.putContentHash(entry.path, await sha256Hex(new TextEncoder().encode(content)));
                 changes.push({
                     mutationId: crypto.randomUUID(),
                     operation: "UpsertFile",

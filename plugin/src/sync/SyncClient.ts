@@ -26,6 +26,7 @@ const CONNECT_BACKOFF_MAX_MS = 60000;
 const WS_WAIT_TIMEOUT_MS = 60_000;
 const INLINE_BYTES_LIMIT = 64 * 1024;
 const FAILURE_NOTICE_THROTTLE_MS = 60_000;
+const REVISION_SAVE_DEBOUNCE_MS = 1000;
 
 function sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
@@ -103,6 +104,8 @@ export class SyncClient {
     private catchUpPromise: Promise<void> | null = null;
     private pendingPullResponses = 0;
     private lastFailureNoticeAt = 0;
+    private pendingLastPulledRevision: string | null = null;
+    private revisionFlushTimer: number | null = null;
     private readonly vaultMutator: VaultMutator;
     private readonly yjsApplicator: YjsApplicator;
     private readonly bootstrapUploader: BootstrapUploader;
@@ -203,6 +206,13 @@ export class SyncClient {
             window.clearInterval(this.pollInterval);
             this.pollInterval = null;
         }
+        if (this.revisionFlushTimer !== null) {
+            globalThis.clearTimeout(this.revisionFlushTimer);
+            this.revisionFlushTimer = null;
+        }
+        void this.flushPendingLastPulledRevision().catch(error => {
+            this.log.error("failed to flush last pulled revision on stop", errorContext(error));
+        });
         this.closeSocket();
     }
 
@@ -412,6 +422,7 @@ export class SyncClient {
         this.drainLivePushBacklog();
         await this.livePushPromise.catch(() => {});
         await this.catchUpToServer(openWs);
+        await this.flushPendingLastPulledRevision();
         this.log.info("startup sync complete", { lastPulledRevision: this.lastPulledRevision });
         this.onStartupSynced();
     }
@@ -581,6 +592,7 @@ export class SyncClient {
                         yjsState = docStateFromContent(content, Y);
                         await this.stateStore.put(entry.path, yjsState);
                     }
+                    await this.stateStore.putContentHash(entry.path, await sha256Hex(new TextEncoder().encode(content)));
                     changes.push({
                         mutationId: crypto.randomUUID(),
                         operation: "UpsertFile",
@@ -1025,6 +1037,28 @@ export class SyncClient {
             return;
         }
         this.lastPulledRevision = revision;
+        this.pendingLastPulledRevision = revision;
+        if (this.revisionFlushTimer !== null) {
+            return;
+        }
+        this.revisionFlushTimer = globalThis.setTimeout(() => {
+            this.revisionFlushTimer = null;
+            void this.flushPendingLastPulledRevision().catch(error => {
+                this.log.error("failed to persist last pulled revision", errorContext(error));
+            });
+        }, REVISION_SAVE_DEBOUNCE_MS) as unknown as number;
+    }
+
+    private async flushPendingLastPulledRevision(): Promise<void> {
+        if (this.revisionFlushTimer !== null) {
+            globalThis.clearTimeout(this.revisionFlushTimer);
+            this.revisionFlushTimer = null;
+        }
+        const revision = this.pendingLastPulledRevision;
+        if (!revision) {
+            return;
+        }
+        this.pendingLastPulledRevision = null;
         await this.onLastPulledRevisionChanged(revision);
     }
 

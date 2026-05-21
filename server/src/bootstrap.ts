@@ -65,6 +65,11 @@ function isVaultRootPath(path: string): boolean {
   return path === "/" || path === ".";
 }
 
+async function sha256Hex(bytes: Uint8Array): Promise<string> {
+  const hash = await crypto.subtle.digest("SHA-256", bytes);
+  return [...new Uint8Array(hash)].map(byte => byte.toString(16).padStart(2, "0")).join("");
+}
+
 function randomClientName(): string {
   const adjective = adjectives[Math.floor(Math.random() * adjectives.length)] ?? adjectives[0];
   const noun = nouns[Math.floor(Math.random() * nouns.length)] ?? nouns[0];
@@ -274,8 +279,9 @@ export async function buildBootstrapZip(request: BootstrapBuildRequest): Promise
       await writeFileBytes(target, bytes);
 
       if (row.isYjs && row.yjsState && row.path.endsWith(".md")) {
-        const statePath = join(vaultRoot, request.configDir, "plugins", request.pluginId, "yjs-state", `${row.path}.state`);
+        const statePath = join(vaultRoot, ".sync-engine-state", request.pluginId, "yjs", `${row.path}.state`);
         await writeFileBytes(statePath, row.yjsState);
+        await writeFileBytes(`${statePath}.sha256`, new TextEncoder().encode(await sha256Hex(bytes)));
       }
     }
 

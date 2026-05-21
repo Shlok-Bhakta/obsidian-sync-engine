@@ -71,6 +71,7 @@ class QueueOutboxStore extends MemoryOutboxStore {
 
 class MemoryYjsStateStore {
     states = new Map<string, Uint8Array>();
+    hashes = new Map<string, string>();
 
     async get(path: string): Promise<Uint8Array | null> {
         return this.states.get(path) ?? null;
@@ -78,6 +79,10 @@ class MemoryYjsStateStore {
 
     async put(path: string, state: Uint8Array): Promise<void> {
         this.states.set(path, new Uint8Array(state));
+    }
+
+    async putContentHash(path: string, hash: string): Promise<void> {
+        this.hashes.set(path, hash);
     }
 }
 
@@ -847,60 +852,67 @@ describe("SyncClient initial snapshot", () => {
     });
 
     it("does not regress lastPulledRevision when a stale live push finishes after a batch ack", async () => {
-        const persisted: string[] = [];
+        vi.useFakeTimers();
         const { client } = await makeClient({ "notes/existing.md": "before" });
-        const liveClient = client as unknown as {
-            startupSynced: boolean;
-            lastPulledRevision: string;
-            livePushPromise: Promise<void>;
-            handleLivePush: (packet: unknown) => void;
-            persistLastPulledRevision: (revision: string) => Promise<void>;
-            applyServerChanges: (changes: unknown[]) => Promise<void>;
-        };
-        const originalApply = liveClient.applyServerChanges.bind(liveClient);
-        let releaseApply!: () => void;
-        const applyBlocked = new Promise<void>(resolve => {
-            releaseApply = () => resolve();
-        });
-        let applyEntered = false;
-        liveClient.applyServerChanges = vi.fn(async changes => {
-            applyEntered = true;
-            await applyBlocked;
-            return originalApply(changes);
-        });
-        const onRevisionChanged = vi.fn(async (revision: string) => {
-            persisted.push(revision);
-        });
-        (client as unknown as { onLastPulledRevisionChanged: typeof onRevisionChanged }).onLastPulledRevisionChanged = onRevisionChanged;
+        try {
+            const persisted: string[] = [];
+            const liveClient = client as unknown as {
+                startupSynced: boolean;
+                lastPulledRevision: string;
+                livePushPromise: Promise<void>;
+                handleLivePush: (packet: unknown) => void;
+                persistLastPulledRevision: (revision: string) => Promise<void>;
+                applyServerChanges: (changes: unknown[]) => Promise<void>;
+            };
+            const originalApply = liveClient.applyServerChanges.bind(liveClient);
+            let releaseApply!: () => void;
+            const applyBlocked = new Promise<void>(resolve => {
+                releaseApply = () => resolve();
+            });
+            let applyEntered = false;
+            liveClient.applyServerChanges = vi.fn(async changes => {
+                applyEntered = true;
+                await applyBlocked;
+                return originalApply(changes);
+            });
+            const onRevisionChanged = vi.fn(async (revision: string) => {
+                persisted.push(revision);
+            });
+            (client as unknown as { onLastPulledRevisionChanged: typeof onRevisionChanged }).onLastPulledRevisionChanged = onRevisionChanged;
 
-        liveClient.startupSynced = true;
-        liveClient.lastPulledRevision = "1";
+            liveClient.startupSynced = true;
+            liveClient.lastPulledRevision = "1";
 
-        liveClient.handleLivePush({
-            type: opType.ChangeBatch,
-            fromRevision: "1",
-            serverRevision: "2",
-            changes: [{
-                mutationId: "remote-1",
-                operation: "UpsertFile",
-                path: "notes/existing.md",
-                content: "after",
-                storageKind: "text",
-                isFolder: false,
-                isYjs: false,
-                created: Date.now(),
-                revision: "2",
-                clientId: "other-client",
-            }],
-        });
-        await vi.waitFor(() => expect(applyEntered).toBe(true));
+            liveClient.handleLivePush({
+                type: opType.ChangeBatch,
+                fromRevision: "1",
+                serverRevision: "2",
+                changes: [{
+                    mutationId: "remote-1",
+                    operation: "UpsertFile",
+                    path: "notes/existing.md",
+                    content: "after",
+                    storageKind: "text",
+                    isFolder: false,
+                    isYjs: false,
+                    created: Date.now(),
+                    revision: "2",
+                    clientId: "other-client",
+                }],
+            });
+            await vi.waitFor(() => expect(applyEntered).toBe(true));
 
-        await liveClient.persistLastPulledRevision("3");
-        releaseApply();
-        await liveClient.livePushPromise;
+            await liveClient.persistLastPulledRevision("3");
+            releaseApply();
+            await liveClient.livePushPromise;
 
-        expect(liveClient.lastPulledRevision).toBe("3");
-        expect(persisted).toEqual(["3"]);
+            expect(liveClient.lastPulledRevision).toBe("3");
+            expect(persisted).toEqual([]);
+            await vi.advanceTimersByTimeAsync(1000);
+            expect(persisted).toEqual(["3"]);
+        } finally {
+            vi.useRealTimers();
+        }
     });
 
     it("waitForAuthAck ignores bootstrap status packets before AuthAck", async () => {

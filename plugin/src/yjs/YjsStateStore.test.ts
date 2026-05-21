@@ -23,6 +23,18 @@ class MemoryAdapter {
         return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
     }
 
+    async read(path: string): Promise<string> {
+        const bytes = this.files.get(path);
+        if (!bytes) {
+            throw new Error(`ENOENT: ${path}`);
+        }
+        return new TextDecoder().decode(bytes);
+    }
+
+    async write(path: string, data: string): Promise<void> {
+        this.files.set(normalizePath(path), new TextEncoder().encode(data));
+    }
+
     async writeBinary(path: string, data: ArrayBuffer): Promise<void> {
         const bytes = new Uint8Array(data);
         await this.onWriteBinary?.(path, bytes);
@@ -99,7 +111,7 @@ function makeStore(): { store: YjsStateStore; adapter: MemoryAdapter; yjsDir: st
         },
     } as unknown as App;
     const store = new YjsStateStore(app, manifest);
-    const yjsDir = normalizePath(".obsidian/plugins/obsidian-sync-engine/yjs-state");
+    const yjsDir = normalizePath(".sync-engine-state/obsidian-sync-engine/yjs");
     return { store, adapter, yjsDir };
 }
 

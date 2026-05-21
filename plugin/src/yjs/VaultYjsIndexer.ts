@@ -1,7 +1,6 @@
 import { App, TAbstractFile, TFile, TFolder } from "obsidian";
 import * as Y from "yjs";
 import { docStateFromContent } from "../../../shared/yjsSeed";
-import { MARKDOWN_FIELD } from "../../../shared/yjsSeed";
 import { YjsStateStore } from "./YjsStateStore";
 import { errorContext } from "../../../shared/logger";
 import { log } from "../logger";
@@ -10,6 +9,15 @@ const BATCH_SIZE = 25;
 
 function sleep(ms: number): Promise<void> {
     return new Promise(resolve => window.setTimeout(resolve, ms));
+}
+
+function exactArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+    return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+}
+
+async function sha256Hex(bytes: Uint8Array): Promise<string> {
+    const hash = await crypto.subtle.digest("SHA-256", exactArrayBuffer(bytes));
+    return [...new Uint8Array(hash)].map(byte => byte.toString(16).padStart(2, "0")).join("");
 }
 
 export class VaultYjsIndexer {
@@ -44,11 +52,13 @@ export class VaultYjsIndexer {
             return;
         }
         const content = await this.app.vault.read(file);
-        const state = await this.store.get(file.path);
-        if (state && this.contentFromState(state) === content) {
+        const contentHash = await sha256Hex(new TextEncoder().encode(content));
+        const cachedHash = await this.store.getContentHash(file.path);
+        if (cachedHash === contentHash && await this.store.has(file.path)) {
             return;
         }
         await this.store.put(file.path, docStateFromContent(content, Y));
+        await this.store.putContentHash(file.path, contentHash);
         log.debug("indexed Yjs state", { path: file.path, chars: content.length });
     }
 
@@ -82,11 +92,4 @@ export class VaultYjsIndexer {
         log.info("Yjs vault scan complete", { processed });
     }
 
-    private contentFromState(state: Uint8Array): string {
-        const doc = new Y.Doc();
-        Y.applyUpdateV2(doc, state);
-        const content = doc.getText(MARKDOWN_FIELD).toJSON();
-        doc.destroy();
-        return content;
-    }
 }

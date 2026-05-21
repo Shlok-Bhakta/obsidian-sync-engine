@@ -1261,7 +1261,8 @@ describeIntegration("sync engine postgres integration", () => {
     try {
       const centralNames = await measure(latencies.bootstrapInspect, () => readStoredZipCentralDirectory(built.zipPath));
       expect(centralNames).toContain(`Sample Vault Bootstrap/${typingPath}`);
-      expect(centralNames).toContain(`Sample Vault Bootstrap/.obsidian/plugins/obsidian-sync-engine/yjs-state/${typingPath}.state`);
+      expect(centralNames).toContain(`Sample Vault Bootstrap/.sync-engine-state/obsidian-sync-engine/yjs/${typingPath}.state`);
+      expect(centralNames).toContain(`Sample Vault Bootstrap/.sync-engine-state/obsidian-sync-engine/yjs/${typingPath}.state.sha256`);
       expect(centralNames).toContain("Sample Vault Bootstrap/.obsidian/plugins/obsidian-sync-engine/data.json");
       expect(built.snapshotRevision).toBe(await getServerRevision());
       expect(built.zipBytes).toBeGreaterThan(sample.totalBytes);
@@ -1420,7 +1421,8 @@ describeIntegration("sync engine postgres integration", () => {
       expect(entries.get("Bootstrap Vault/.obsidian/workspace.json")).toEqual(new TextEncoder().encode('{"pane":"left"}'));
       expect(entries.get("Bootstrap Vault/assets/photo.bin")).toEqual(new Uint8Array([0, 1, 2, 255]));
       expect(new TextDecoder().decode(entries.get("Bootstrap Vault/.obsidian/plugins/obsidian-sync-engine/main.js"))).toBe("// bootstrap plugin");
-      expect(entries.get("Bootstrap Vault/.obsidian/plugins/obsidian-sync-engine/yjs-state/notes/test.md.state")?.byteLength).toBeGreaterThan(0);
+      expect(entries.get("Bootstrap Vault/.sync-engine-state/obsidian-sync-engine/yjs/notes/test.md.state")?.byteLength).toBeGreaterThan(0);
+      expect(new TextDecoder().decode(entries.get("Bootstrap Vault/.sync-engine-state/obsidian-sync-engine/yjs/notes/test.md.state.sha256"))).toBe(await sha256Hex("bootstrap note"));
       expect(new TextDecoder().decode(entries.get("Bootstrap Vault/.obsidian/plugins/obsidian-sync-engine/outbox/active.jsonl"))).toBe("");
       expect(new TextDecoder().decode(entries.get("Bootstrap Vault/.obsidian/plugins/obsidian-sync-engine/outbox/meta.json"))).toBe('{"nextRowId":1,"nextSegmentId":1}');
       const data = JSON.parse(new TextDecoder().decode(entries.get("Bootstrap Vault/.obsidian/plugins/obsidian-sync-engine/data.json")));

@@ -14,6 +14,15 @@ export type YjsApplicatorOptions = {
     flushOpenYjsChanges?: (path: string) => Promise<void>;
 };
 
+function exactArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+    return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+}
+
+async function sha256Hex(bytes: Uint8Array): Promise<string> {
+    const hash = await crypto.subtle.digest("SHA-256", exactArrayBuffer(bytes));
+    return [...new Uint8Array(hash)].map(byte => byte.toString(16).padStart(2, "0")).join("");
+}
+
 export class YjsApplicator {
     private readonly getDocSync: (path: string) => DocSync | undefined;
     private readonly onOpenYjsContent: (path: string, content: string) => Promise<boolean>;
@@ -44,6 +53,7 @@ export class YjsApplicator {
         }
         await this.upsertYjsTextFile(normalized, content);
         await this.options.stateStore.put(normalized, state);
+        await this.options.stateStore.putContentHash(normalized, await sha256Hex(new TextEncoder().encode(content)));
     }
 
     async applyState(path: string, state: Uint8Array): Promise<void> {
@@ -55,12 +65,14 @@ export class YjsApplicator {
                 const content = openDoc.applyRemoteUpdate(state);
                 await this.upsertYjsTextFile(normalized, content);
                 await this.options.stateStore.put(normalized, Y.encodeStateAsUpdateV2(openDoc.getYdoc()));
+                await this.options.stateStore.putContentHash(normalized, await sha256Hex(new TextEncoder().encode(content)));
                 return;
             }
 
             const content = yjsContentFromState(state);
             await this.upsertYjsTextFile(normalized, content);
             await this.options.stateStore.put(normalized, state);
+            await this.options.stateStore.putContentHash(normalized, await sha256Hex(new TextEncoder().encode(content)));
             await openDoc.replaceState(state);
             return;
         }
@@ -68,12 +80,14 @@ export class YjsApplicator {
         const content = yjsContentFromState(state);
         await this.upsertYjsTextFile(normalized, content);
         await this.options.stateStore.put(normalized, state);
+        await this.options.stateStore.putContentHash(normalized, await sha256Hex(new TextEncoder().encode(content)));
     }
 
     async refreshState(path: string, content: string, yjsState?: Uint8Array): Promise<void> {
         const state = yjsState ?? docStateFromContent(content, Y);
         const normalized = normalizePath(path);
         await this.options.stateStore.put(normalized, state);
+        await this.options.stateStore.putContentHash(normalized, await sha256Hex(new TextEncoder().encode(content)));
         const openDoc = this.getDocSync(normalized);
         if (openDoc) {
             await openDoc.replaceState(state);
@@ -108,8 +122,10 @@ export class YjsApplicator {
         if (existing) {
             return existing;
         }
-        const state = docStateFromContent(await this.options.readVaultContent(path), Y);
+        const content = await this.options.readVaultContent(path);
+        const state = docStateFromContent(content, Y);
         await this.options.stateStore.put(path, state);
+        await this.options.stateStore.putContentHash(path, await sha256Hex(new TextEncoder().encode(content)));
         return state;
     }
 }
