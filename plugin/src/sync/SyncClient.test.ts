@@ -87,6 +87,11 @@ class MemoryYjsStateStore {
 }
 
 class FakeWebSocket extends EventTarget {
+    static readonly CONNECTING = 0;
+    static readonly OPEN = 1;
+    static readonly CLOSING = 2;
+    static readonly CLOSED = 3;
+
     sent: string[] = [];
     readyState = 1;
 
@@ -954,6 +959,59 @@ describe("SyncClient initial snapshot", () => {
             type: opType.AuthAck,
             serverRevision: "9",
         });
+    });
+
+    it("restarts startup sync when the live websocket closes after startup", async () => {
+        const originalWebSocket = globalThis.WebSocket;
+        const createdSockets: FakeWebSocket[] = [];
+        class TestWebSocket extends FakeWebSocket {
+            constructor(_url: string) {
+                super();
+                createdSockets.push(this);
+            }
+        }
+        globalThis.WebSocket = TestWebSocket as unknown as typeof WebSocket;
+        try {
+            const { client } = await makeClient({ "notes/existing.md": "before" });
+            const testClient = client as unknown as {
+                ensureSocket: () => Promise<FakeWebSocket>;
+                runStartupSync: () => Promise<void>;
+                startupSyncPromise: Promise<void> | null;
+                startupSynced: boolean;
+            };
+            let finishStartupSync!: () => void;
+            testClient.runStartupSync = vi.fn(() => new Promise<void>(resolve => {
+                finishStartupSync = resolve;
+            }));
+
+            const ws = await testClient.ensureSocket();
+            expect(createdSockets).toEqual([ws]);
+            testClient.startupSynced = true;
+
+            ws.close();
+
+            expect(testClient.startupSynced).toBe(false);
+            expect(testClient.runStartupSync).toHaveBeenCalledTimes(1);
+            expect(testClient.startupSyncPromise).not.toBeNull();
+
+            finishStartupSync();
+            await testClient.startupSyncPromise;
+        } finally {
+            globalThis.WebSocket = originalWebSocket;
+        }
+    });
+
+    it("marks startup sync stale when closing a socket directly", async () => {
+        const { client } = await makeClient({ "notes/existing.md": "before" });
+        const testClient = client as unknown as {
+            closeSocket: () => void;
+            startupSynced: boolean;
+        };
+        testClient.startupSynced = true;
+
+        testClient.closeSocket();
+
+        expect(testClient.startupSynced).toBe(false);
     });
 
     it("does not close the websocket when refreshing blob auth during startup sync", async () => {

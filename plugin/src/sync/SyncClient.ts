@@ -1214,6 +1214,7 @@ export class SyncClient {
             if (this.ws === nextWs) {
                 this.ws = null;
                 this.authenticated = false;
+                this.startupSynced = false;
                 this.connectSoon();
             }
             this.log.debug("websocket closed");
@@ -1358,12 +1359,14 @@ export class SyncClient {
     }
 
     private closeSocket(): void {
+        const ws = this.ws;
+        this.ws = null;
+        this.startupSynced = false;
         this.authenticated = false;
         this.authPromise = null;
-        if (this.ws && this.ws.readyState !== WebSocket.CLOSED) {
-            this.log.debug("closing websocket", { readyState: this.ws.readyState });
-            this.ws.close();
+        if (ws && ws.readyState !== WebSocket.CLOSED) {
+            this.log.debug("closing websocket", { readyState: ws.readyState });
+            ws.close();
         }
-        this.ws = null;
     }
 }
