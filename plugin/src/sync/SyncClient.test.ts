@@ -131,6 +131,7 @@ async function makeClient(
         getDocSync?: (path: string) => DocSync | undefined;
         onOpenYjsContent?: (path: string, content: string) => Promise<boolean>;
         flushOpenYjsChanges?: (path: string) => Promise<void>;
+        syncConfigDir?: boolean;
     } = {},
 ): Promise<{
     client: SyncClient;
@@ -250,6 +251,7 @@ async function makeClient(
             clientKey: "obs_sync_test",
             clientName: "Client",
             lastPulledRevision: "0",
+            syncConfigDir: options.syncConfigDir ?? true,
         },
         undefined,
         undefined,
@@ -313,6 +315,20 @@ describe("SyncClient initial snapshot", () => {
         });
         expect(readYjsContent(note!.yjsState!)).toBe("unloaded note");
         expect(stateStore.states.get("notes/unloaded.md")).toEqual(note?.yjsState);
+    });
+
+    it("excludes config directory files from snapshots when config sync is disabled", async () => {
+        const { client } = await makeClient({
+            "notes/existing.md": "existing note",
+            ".obsidian/workspace.json": "{}",
+        }, new MemoryYjsStateStore(), new MemoryOutboxStore(), { syncConfigDir: false });
+
+        const changes = await (client as unknown as { readVaultSnapshot: () => Promise<outboxData[]> }).readVaultSnapshot();
+        const paths = changes.map(change => change.path);
+
+        expect(paths).toContain("notes/existing.md");
+        expect(paths).not.toContain(".obsidian");
+        expect(paths).not.toContain(".obsidian/workspace.json");
     });
 
     it("skips large files that fail blob upload while still building the initial snapshot", async () => {

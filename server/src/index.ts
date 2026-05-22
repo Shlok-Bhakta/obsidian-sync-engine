@@ -12,6 +12,7 @@ import { errorContext } from "../../shared/logger";
 import { log } from "./logger";
 import {
   acceptMutations,
+  changeBatchPacket,
   getBlobMetadata,
   getServerRevision,
   handleDocSync,
@@ -502,7 +503,7 @@ async function pushChangesToOtherClients(sender: Client, revision: string): Prom
     target.pushPromise = target.pushPromise.catch(() => {}).then(async () => {
       try {
         const fromRevision = target.lastPulledRevision;
-        const packet = await handlePull({ type: opType.PullSince, revision: fromRevision });
+        const packet = await changeBatchPacket(fromRevision);
         target.socket!.send(encodePacket(packet));
         const pushedRevision = revisionFromServerPacket(packet);
         if (pushedRevision && BigInt(pushedRevision) > BigInt(target.lastPulledRevision)) {

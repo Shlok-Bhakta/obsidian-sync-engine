@@ -109,7 +109,7 @@ function setup(initialContent: string): {
 }
 
 describe("DocSync editor typing", () => {
-    it("records each typed character as an outbox YjsUpdate and persists final state", async () => {
+    it("records each typed character as an outbox YjsUpdate and checkpoints on explicit persist", async () => {
         const { docSync, outbox, stateStore } = setup("");
         let editorDoc = "";
 
@@ -125,6 +125,8 @@ describe("DocSync editor typing", () => {
         expect(outbox.rows).toHaveLength(5);
         expect(outbox.rows.every(row => row.operation === "YjsUpdate" && row.path === PATH)).toBe(true);
         expect(outbox.rows.every(row => row.data && row.data.length > 0)).toBe(true);
+        expect(stateStore.states.get(PATH)).toBeUndefined();
+        await docSync.persistState();
         expect(decodeContent(stateStore.states.get(PATH)!)).toBe("hello");
     });
 
@@ -149,6 +151,7 @@ describe("DocSync editor typing", () => {
         expect(editorDoc).toHaveLength(1000);
         expect(outbox.rows).toHaveLength(1000);
         expect(docSync.getYdoc().getText(MARKDOWN_FIELD).toString()).toBe(input);
+        await docSync.persistState();
         expect(decodeContent(stateStore.states.get(PATH)!)).toBe(input);
     });
 
@@ -166,6 +169,7 @@ describe("DocSync editor typing", () => {
 
         expect(update.nextDoc).toBe("asdfasdfasdf");
         expect(docSync.getYdoc().getText(MARKDOWN_FIELD).toString()).toBe(update.nextDoc);
+        await docSync.persistState();
         expect(decodeContent(stateStore.states.get(PATH)!)).toBe(update.nextDoc);
     });
 
@@ -179,6 +183,7 @@ describe("DocSync editor typing", () => {
         expect(update.nextDoc).toBe("title\n\nbody line 1\nbody line 2");
         expect(outbox.rows).toHaveLength(1);
         expect(outbox.rows[0]?.data).toEqual(row.data);
+        await docSync.persistState();
         expect(decodeContent(stateStore.states.get(PATH)!)).toBe(update.nextDoc);
     });
 
@@ -191,6 +196,7 @@ describe("DocSync editor typing", () => {
 
         expect(update.nextDoc).toBe("hello");
         expect(outbox.rows).toHaveLength(1);
+        await docSync.persistState();
         expect(decodeContent(stateStore.states.get(PATH)!)).toBe("hello");
     });
 
@@ -202,6 +208,7 @@ describe("DocSync editor typing", () => {
         await tick();
 
         expect(update.nextDoc).toBe("hello new world");
+        await docSync.persistState();
         expect(decodeContent(stateStore.states.get(PATH)!)).toBe("hello new world");
     });
 
@@ -217,6 +224,7 @@ describe("DocSync editor typing", () => {
 
         expect(update.nextDoc).toBe("Hello world!");
         expect(outbox.rows).toHaveLength(1);
+        await docSync.persistState();
         expect(decodeContent(stateStore.states.get(PATH)!)).toBe("Hello world!");
     });
 
@@ -232,6 +240,7 @@ describe("DocSync editor typing", () => {
         await tick();
 
         expect(update.nextDoc).toBe("Say hello there again!");
+        await docSync.persistState();
         expect(decodeContent(stateStore.states.get(PATH)!)).toBe(update.nextDoc);
     });
 
@@ -246,6 +255,7 @@ describe("DocSync editor typing", () => {
         await tick();
 
         expect(content).toBe("hello from another device");
+        await docSync.persistState();
         expect(decodeContent(stateStore.states.get(PATH)!)).toBe("hello from another device");
     });
 
@@ -260,6 +270,7 @@ describe("DocSync editor typing", () => {
 
         expect(replaced).toBe(false);
         expect(docSync.getYdoc().getText(MARKDOWN_FIELD).toString()).toBe("qwertyuio");
+        await docSync.persistState();
         expect(decodeContent(stateStore.states.get(PATH)!)).toBe("qwertyuio");
     });
 });

@@ -23,6 +23,7 @@ export const defaultCompactionConfig: CompactionConfig = {
 };
 
 let compactionConfig: CompactionConfig = { ...defaultCompactionConfig };
+const CHANGE_BATCH_ROW_LIMIT = 500;
 
 export function setCompactionConfig(config: Partial<CompactionConfig>): void {
   compactionConfig = { ...compactionConfig, ...config };
@@ -282,7 +283,8 @@ export async function changeBatchPacket(fromRevision: string): Promise<Extract<w
     FROM sync_events e
     LEFT JOIN files f ON f.path = e.path
     WHERE e.revision > ${fromRevision}
-    ORDER BY e.revision ASC;
+    ORDER BY e.revision ASC
+    LIMIT ${CHANGE_BATCH_ROW_LIMIT};
   `;
   const serverRevision = rows.reduce((max, row) => {
     return BigInt(row.revision) > BigInt(max) ? row.revision : max;
@@ -351,6 +353,37 @@ export async function applyMutation(tx: typeof sql, clientId: string, mutation: 
       path: mutation.path,
     });
     return existing[0].revision;
+  }
+
+  if (
+    mutation.operation === "UpsertFile"
+    && mutation.storageKind === "lo"
+    && !mutation.contentBytes
+  ) {
+    const existingFile = await tx<{ contentOid: number | null }[]>`
+      SELECT content_oid AS "contentOid"
+      FROM files
+      WHERE path = ${mutation.path}
+      FOR UPDATE;
+    `;
+    if (!existingFile[0]?.contentOid) {
+      const current = await tx<RevisionRow[]>`
+        SELECT GREATEST(
+          COALESCE((SELECT MAX(revision) FROM sync_events), 0),
+          COALESCE((SELECT MAX(revision) FROM files), 0)
+        )::TEXT AS revision;
+      `;
+      const revision = latestRevisionFromRows(current);
+      log.warn("skipping large object metadata mutation without uploaded blob content", {
+        clientId,
+        mutationId: mutation.mutationId,
+        path: mutation.path,
+        byteSize: mutation.byteSize,
+        contentSha256: mutation.contentSha256,
+        revision,
+      });
+      return revision;
+    }
   }
 
   const inserted = await tx<RevisionRow[]>`

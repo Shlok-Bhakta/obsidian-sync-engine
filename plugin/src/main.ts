@@ -15,7 +15,7 @@ import { isPluginInternalPath, shouldSyncPath, shouldUseYjs } from "../../shared
 import { errorContext } from "../../shared/logger";
 import { log } from "./logger";
 
-const INLINE_BYTES_LIMIT = 64 * 1024;
+const INLINE_BYTES_LIMIT = 16 * 1024;
 const CONFIG_DIR_POLL_MS = Platform.isMobile ? 30_000 : 2000;
 type ConfigDirScanMode = "baseline" | "enqueue";
 
@@ -114,7 +114,9 @@ export default class SyncEngine extends Plugin {
 		this.bootstrapStatusBarEl = this.addStatusBarItem();
 		this.bootstrapStatusBarEl.addClass("sync-engine-bootstrap-statusbar");
 		this.renderBootstrapStatusBar();
-		void this.captureBootConfigShas();
+		if (this.settings.syncConfigDir) {
+			void this.captureBootConfigShas();
+		}
 		this.yjsIndexer = new VaultYjsIndexer(
 			this.app,
 			this.yjsStateStore,
@@ -142,7 +144,9 @@ export default class SyncEngine extends Plugin {
 			(path) => this.docs.get(path),
 			(status) => this.setBootstrapStatus(status),
 			() => {
-				this.startConfigDirPoller();
+				if (this.settings.syncConfigDir) {
+					this.startConfigDirPoller();
+				}
 				if (!Platform.isMobile) {
 					this.startYjsIndexer();
 				}
@@ -164,12 +168,12 @@ export default class SyncEngine extends Plugin {
 		}));
 		this.registerEvent(this.app.vault.on("create", file => {
 			log.debug("vault create event", { path: file.path, type: file instanceof TFolder ? "folder" : "file" });
-			void this.yjsIndexer.ensureFile(file);
+			void this.ensureYjsStateForExternalMarkdown(file);
 			void this.queueNonMarkdownUpsert(file);
 		}));
 		this.registerEvent(this.app.vault.on("modify", file => {
 			log.debug("vault modify event", { path: file.path, type: file instanceof TFolder ? "folder" : "file" });
-			void this.yjsIndexer.ensureFile(file);
+			void this.ensureYjsStateForExternalMarkdown(file);
 			void this.queueNonMarkdownUpsert(file);
 		}));
 		this.registerEvent(this.app.vault.on("delete", file => {
@@ -271,7 +275,11 @@ export default class SyncEngine extends Plugin {
 		let initialState = await this.yjsStateStore.get(pathID);
 		if (!initialState) {
 			initialState = docStateFromContent(initialContent, Y);
-			await this.yjsStateStore.put(pathID, initialState);
+			await this.yjsStateStore.putWithContentHash(
+				pathID,
+				initialState,
+				await sha256Hex(new TextEncoder().encode(initialContent)),
+			);
 			log.debug("seeded Yjs state for open document", { path: pathID, chars: initialContent.length });
 		}
 		const dsync = new DocSync(this.db, this.yjsStateStore, pathID, initialState);
@@ -281,7 +289,7 @@ export default class SyncEngine extends Plugin {
 	}
 
 	private async enqueueLocalDelete(file: TAbstractFile): Promise<void> {
-		if (this.syncClient?.isApplyingRemoteChanges(file.path) || !shouldSyncPath(file.path, this.app.vault.configDir, this.manifest.id)) {
+		if (this.syncClient?.isApplyingRemoteChanges(file.path) || !this.shouldSyncLocalPath(file.path)) {
 			return;
 		}
 		await this.db.putInOutbox({
@@ -298,8 +306,8 @@ export default class SyncEngine extends Plugin {
 	private async enqueueLocalRename(file: TAbstractFile, oldPath: string): Promise<void> {
 		if (
 			(this.syncClient?.isApplyingRemoteChanges(oldPath) || this.syncClient?.isApplyingRemoteChanges(file.path)) ||
-			!shouldSyncPath(oldPath, this.app.vault.configDir, this.manifest.id) ||
-			!shouldSyncPath(file.path, this.app.vault.configDir, this.manifest.id)
+			!this.shouldSyncLocalPath(oldPath) ||
+			!this.shouldSyncLocalPath(file.path)
 		) {
 			return;
 		}
@@ -335,7 +343,7 @@ export default class SyncEngine extends Plugin {
 		}
 		const seen = new Set<string>();
 		for (const path of await this.listConfigDirFiles(this.app.vault.configDir)) {
-			if (!shouldSyncPath(path, this.app.vault.configDir, this.manifest.id) || shouldUseYjs(path, this.app.vault.configDir)) {
+			if (!this.shouldSyncLocalPath(path) || shouldUseYjs(path, this.app.vault.configDir)) {
 				continue;
 			}
 			const stat = await this.app.vault.adapter.stat(path);
@@ -358,7 +366,7 @@ export default class SyncEngine extends Plugin {
 				continue;
 			}
 			this.configDirStats.delete(path);
-			if (mode === "enqueue" && shouldSyncPath(path, this.app.vault.configDir, this.manifest.id)) {
+			if (mode === "enqueue" && this.shouldSyncLocalPath(path)) {
 				void this.enqueueLocalPathDelete(path).catch(error => {
 					log.error("failed to enqueue config dir delete", { path, ...errorContext(error) });
 					new Notice(`Sync outbox write failed: ${errorMessage(error)}`);
@@ -387,8 +395,18 @@ export default class SyncEngine extends Plugin {
 		this.yjsIndexer.start();
 	}
 
+	private async ensureYjsStateForExternalMarkdown(file: TAbstractFile): Promise<void> {
+		if (!(file instanceof TFile) || file.extension !== "md") {
+			return;
+		}
+		if (this.docs.has(file.path) || this.pendingDocs.has(file.path)) {
+			return;
+		}
+		await this.yjsIndexer.ensureFile(file);
+	}
+
 	private async enqueueLocalPathDelete(path: string): Promise<void> {
-		if (this.syncClient?.isApplyingRemoteChanges(path) || !shouldSyncPath(path, this.app.vault.configDir, this.manifest.id)) {
+		if (this.syncClient?.isApplyingRemoteChanges(path) || !this.shouldSyncLocalPath(path)) {
 			return;
 		}
 		await this.db.putInOutbox({
@@ -490,7 +508,7 @@ export default class SyncEngine extends Plugin {
 			!(file instanceof TFile) ||
 			this.isConfigDirPath(file.path) ||
 			shouldUseYjs(file.path, this.app.vault.configDir) ||
-			!shouldSyncPath(file.path, this.app.vault.configDir, this.manifest.id)
+			!this.shouldSyncLocalPath(file.path)
 		) {
 			return;
 		}
@@ -513,6 +531,9 @@ export default class SyncEngine extends Plugin {
 	}
 
 	private async captureBootConfigShas(): Promise<void> {
+		if (!this.settings.syncConfigDir) {
+			return;
+		}
 		for (const path of await this.listConfigDirFiles(this.app.vault.configDir)) {
 			if (!this.isSyncableConfigPath(path)) {
 				continue;
@@ -555,12 +576,13 @@ export default class SyncEngine extends Plugin {
 
 	private isSyncableConfigPath(path: string): boolean {
 		return this.isConfigDirPath(path)
+			&& this.settings.syncConfigDir
 			&& shouldSyncPath(path, this.app.vault.configDir, this.manifest.id)
 			&& !shouldUseYjs(path, this.app.vault.configDir);
 	}
 
 	private async queuePathUpsert(path: string): Promise<void> {
-		if (this.syncClient?.isApplyingRemoteChanges(path) || !shouldSyncPath(path, this.app.vault.configDir, this.manifest.id)) {
+		if (this.syncClient?.isApplyingRemoteChanges(path) || !this.shouldSyncLocalPath(path)) {
 			return;
 		}
 		const bytes = new Uint8Array(await this.app.vault.adapter.readBinary(path));
@@ -627,12 +649,22 @@ export default class SyncEngine extends Plugin {
 		return path === configDir || path.startsWith(`${configDir}/`);
 	}
 
+	private shouldSyncLocalPath(path: string): boolean {
+		return shouldSyncPath(path, this.app.vault.configDir, this.manifest.id)
+			&& (this.settings.syncConfigDir || !this.isConfigDirPath(path));
+	}
+
 	onunload() {
 		log.info("plugin unloading");
 		for (const timer of this.pendingFileTimers.values()) {
 			window.clearTimeout(timer);
 		}
 		this.pendingFileTimers.clear();
+		for (const [path, doc] of this.docs) {
+			void doc.persistState().catch(error => {
+				log.error("failed to persist open Yjs doc on unload", { path, ...errorContext(error) });
+			});
+		}
 		this.syncClient?.stop();
 		this.yjsIndexer?.stop();
 		void this.db.close().catch(error => {

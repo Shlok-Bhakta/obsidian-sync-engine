@@ -17,14 +17,12 @@ import { errorContext, Logger } from "../../../shared/logger";
 import { log as rootLog } from "../logger";
 import { readSocketMessage, waitForPacket, withTimeout } from "./SocketRequest";
 
-const FLUSH_DELAY_MS = 25;
-const EMPTY_BACKOFF_MS = 25;
+const FLUSH_DELAY_MS = 150;
 const ERROR_BACKOFF_MS = 2000;
-const IDLE_EMPTY_SEGMENTS = 40;
 const CONNECT_BACKOFF_INITIAL_MS = 5000;
 const CONNECT_BACKOFF_MAX_MS = 60000;
 const WS_WAIT_TIMEOUT_MS = 60_000;
-const INLINE_BYTES_LIMIT = 64 * 1024;
+const INLINE_BYTES_LIMIT = 16 * 1024;
 const FAILURE_NOTICE_THROTTLE_MS = 60_000;
 const REVISION_SAVE_DEBOUNCE_MS = 1000;
 
@@ -83,6 +81,7 @@ export class SyncClient {
     private clientId: string;
     private clientKey: string;
     private clientName: string;
+    private syncConfigDir: boolean;
     private lastPulledRevision: string;
     private lastUploadedRevisionHint: string;
     private draining = false;
@@ -130,6 +129,7 @@ export class SyncClient {
         this.clientId = settings.clientId;
         this.clientKey = settings.clientKey;
         this.clientName = settings.clientName;
+        this.syncConfigDir = settings.syncConfigDir;
         this.lastPulledRevision = settings.lastPulledRevision;
         this.lastUploadedRevisionHint = settings.lastPulledRevision;
         this.blobClient = new BlobClient(settings.backendUrl, settings.clientKey, () => this.refreshBlobAuth());
@@ -168,10 +168,20 @@ export class SyncClient {
         const configDir = this.app.vault.configDir.replace(/^\/+|\/+$/g, "");
         const normalized = normalizePath(path);
         return (
+            this.syncConfigDir
+            &&
             (normalized === configDir || normalized.startsWith(`${configDir}/`))
             && shouldSyncPath(normalized, this.app.vault.configDir, this.pluginId)
             && !shouldUseYjs(normalized, this.app.vault.configDir)
         );
+    }
+
+    private shouldSyncLocalPath(path: string): boolean {
+        const configDir = this.app.vault.configDir.replace(/^\/+|\/+$/g, "");
+        const normalized = normalizePath(path);
+        const isConfigPath = normalized === configDir || normalized.startsWith(`${configDir}/`);
+        return shouldSyncPath(normalized, this.app.vault.configDir, this.pluginId)
+            && (this.syncConfigDir || !isConfigPath);
     }
 
     start(): void {
@@ -225,6 +235,7 @@ export class SyncClient {
         this.clientId = settings.clientId;
         this.clientKey = settings.clientKey;
         this.clientName = settings.clientName;
+        this.syncConfigDir = settings.syncConfigDir;
         this.lastPulledRevision = settings.lastPulledRevision;
         this.lastUploadedRevisionHint = settings.lastPulledRevision;
         this.blobClient.update(settings.backendUrl, settings.clientKey);
@@ -309,7 +320,6 @@ export class SyncClient {
         this.draining = true;
         this.log.debug("outbox drain starting");
         try {
-            let emptyCount = 0;
             while (!this.stopped && this.startupSynced) {
                 let segment: OutboxSegment | null = null;
                 try {
@@ -319,18 +329,9 @@ export class SyncClient {
                     }
                     segment = await this.outbox.claimNextSegment(true);
                     if (!segment) {
-                        emptyCount++;
-                        if (emptyCount >= IDLE_EMPTY_SEGMENTS) {
-                            return;
-                        }
-                        await sleep(EMPTY_BACKOFF_MS);
-                        if (this.stopped || !this.startupSynced) {
-                            return;
-                        }
-                        continue;
+                        return;
                     }
 
-                    emptyCount = 0;
                     this.log.debug("claimed outbox segment", { segmentId: segment.id, segmentPath: segment.path });
                     await this.sendSegment(segment);
                     await this.outbox.completeSegment(segment);
@@ -665,7 +666,7 @@ export class SyncClient {
     private async listSnapshotPaths(): Promise<SnapshotPath[]> {
         const byPath = new Map<string, SnapshotPath>();
         for (const file of this.app.vault.getAllLoadedFiles()) {
-            if (!shouldSyncPath(file.path, this.app.vault.configDir, this.pluginId)) {
+            if (!this.shouldSyncLocalPath(file.path)) {
                 continue;
             }
             byPath.set(file.path, {
@@ -674,7 +675,9 @@ export class SyncClient {
             });
         }
         await this.addAdapterPaths("", byPath);
-        await this.addAdapterPaths(this.app.vault.configDir, byPath);
+        if (this.syncConfigDir) {
+            await this.addAdapterPaths(this.app.vault.configDir, byPath);
+        }
         return [...byPath.values()].sort((a, b) => {
             if (a.isFolder !== b.isFolder) {
                 return a.isFolder ? -1 : 1;
@@ -689,13 +692,13 @@ export class SyncClient {
         }
         const listed = await this.app.vault.adapter.list(dir);
         for (const folder of listed.folders) {
-            if (shouldSyncPath(folder, this.app.vault.configDir, this.pluginId)) {
+            if (this.shouldSyncLocalPath(folder)) {
                 byPath.set(folder, { path: folder, isFolder: true });
                 await this.addAdapterPaths(folder, byPath);
             }
         }
         for (const file of listed.files) {
-            if (shouldSyncPath(file, this.app.vault.configDir, this.pluginId)) {
+            if (this.shouldSyncLocalPath(file)) {
                 byPath.set(file, { path: file, isFolder: false });
             }
         }
@@ -734,7 +737,7 @@ export class SyncClient {
         }
         const snapshotPaths = new Set(packet.files.map(file => normalizePath(file.path)));
         const toDelete = [...this.app.vault.getFiles()]
-            .filter(file => shouldSyncPath(file.path, this.app.vault.configDir, this.pluginId) && !snapshotPaths.has(normalizePath(file.path)));
+            .filter(file => this.shouldSyncLocalPath(file.path) && !snapshotPaths.has(normalizePath(file.path)));
         const hasPendingChanges = await this.outbox.hasPendingChanges();
         this.log.warn("applying snapshot reset", {
             targetRevision: packet.targetRevision,
@@ -764,8 +767,8 @@ export class SyncClient {
         try {
             for (const change of changes) {
                 if (
-                    !shouldSyncPath(change.path, this.app.vault.configDir, this.pluginId) ||
-                    (change.toPath && !shouldSyncPath(change.toPath, this.app.vault.configDir, this.pluginId))
+                    !this.shouldSyncLocalPath(change.path) ||
+                    (change.toPath && !this.shouldSyncLocalPath(change.toPath))
                 ) {
                     this.log.warn("skipping ignored remote change", {
                         revision: change.revision,
@@ -834,7 +837,7 @@ export class SyncClient {
 
     private async deletePathsMissingFromSnapshot(paths: Set<string>): Promise<void> {
         const files = [...this.app.vault.getFiles()]
-            .filter(file => shouldSyncPath(file.path, this.app.vault.configDir, this.pluginId) && !paths.has(normalizePath(file.path)))
+            .filter(file => this.shouldSyncLocalPath(file.path) && !paths.has(normalizePath(file.path)))
             .sort((a, b) => b.path.length - a.path.length);
         await this.vaultMutator.runRemoteMutation(files.map(file => file.path), async () => {
             for (const file of files) {
@@ -852,8 +855,8 @@ export class SyncClient {
     private async prepareSegmentJsonl(ws: WebSocket, segment: OutboxSegment): Promise<string> {
         const inputRows = await this.outbox.readSegment(segment);
         const rows = inputRows.filter(row => {
-            const shouldKeep = shouldSyncPath(row.path, this.app.vault.configDir, this.pluginId) &&
-                (!row.toPath || shouldSyncPath(row.toPath, this.app.vault.configDir, this.pluginId));
+            const shouldKeep = this.shouldSyncLocalPath(row.path) &&
+                (!row.toPath || this.shouldSyncLocalPath(row.toPath));
             if (!shouldKeep) {
                 this.log.warn("dropping ignored outbox row", {
                     segmentId: segment.id,
@@ -1211,7 +1214,6 @@ export class SyncClient {
             if (this.ws === nextWs) {
                 this.ws = null;
                 this.authenticated = false;
-                this.startupSynced = false;
                 this.connectSoon();
             }
             this.log.debug("websocket closed");
@@ -1358,7 +1360,6 @@ export class SyncClient {
     private closeSocket(): void {
         this.authenticated = false;
         this.authPromise = null;
-        this.startupSynced = false;
         if (this.ws && this.ws.readyState !== WebSocket.CLOSED) {
             this.log.debug("closing websocket", { readyState: this.ws.readyState });
             this.ws.close();

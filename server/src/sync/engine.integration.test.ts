@@ -761,6 +761,24 @@ describeIntegration("sync engine postgres integration", () => {
     expect(await getFile("assets/missing.bin")).toBeNull();
   });
 
+  it("skips large object mutations that do not have uploaded blob content", async () => {
+    const revision = await acceptMutations(CLIENT_A, [{
+      mutationId: crypto.randomUUID(),
+      operation: "UpsertFile",
+      path: "assets/missing-large.bin",
+      storageKind: "lo",
+      isYjs: false,
+      isFolder: false,
+      byteSize: 5,
+      contentSha256: "sha-missing-large",
+      created: Date.now(),
+    }]);
+
+    expect(revision).toBe(await getServerRevision());
+    expect(await getFile("assets/missing-large.bin")).toBeNull();
+    expect(await listSyncEvents("assets/missing-large.bin")).toHaveLength(0);
+  });
+
   it("accepts an HTTP blob upload larger than Bun's default 128 MiB request limit", async () => {
     const samplePath = join(SAMPLE_VAULT_PATH, ...SAMPLE_LARGE_PDF_PATH.split("/"));
     const hasSample = await pathExists(samplePath);
@@ -1439,6 +1457,57 @@ describeIntegration("sync engine postgres integration", () => {
     }
   });
 
+  it("skips corrupt large object rows when building a bootstrap zip", async () => {
+    await seedMarkdownFile(CLIENT_A, NOTE_PATH, "bootstrap note");
+    await sql`
+      INSERT INTO files (
+        path,
+        content,
+        content_bytes,
+        content_oid,
+        storage_kind,
+        byte_size,
+        content_sha256,
+        yjs_state,
+        is_folder,
+        is_yjs,
+        deleted,
+        revision,
+        updated_at
+      )
+      VALUES (
+        'Images/Pasted image 20220906172538.png',
+        NULL,
+        NULL,
+        NULL,
+        'lo',
+        12345,
+        'sha-corrupt',
+        NULL,
+        FALSE,
+        FALSE,
+        FALSE,
+        0,
+        NOW()
+      );
+    `;
+
+    const built = await buildBootstrapZip({
+      vaultName: "Bootstrap Vault",
+      backendUrl: "https://sync.example.test",
+      configDir: ".obsidian",
+      pluginId: "obsidian-sync-engine",
+    });
+
+    try {
+      const entries = await readStoredZip(built.zipPath);
+      expect(new TextDecoder().decode(entries.get("Bootstrap Vault/notes/test.md"))).toBe("bootstrap note");
+      expect(entries.has("Bootstrap Vault/Images/Pasted image 20220906172538.png")).toBe(false);
+    } finally {
+      await built.cleanup();
+    }
+  });
+
   it("snapshot is served when pull revision is behind compacted_revision", async () => {
     setCompactionConfig({ count: 2, bytes: 1 });
 
@@ -1586,6 +1655,33 @@ describeIntegration("sync engine postgres integration", () => {
     } finally {
       peerA.close();
       peerB.close();
+    }
+  });
+
+  it("websocket batch acks large object metadata when uploaded blob content is missing", async () => {
+    const peer = new TestPeer("ws-missing-blob-client", "obs_sync_seed", "0");
+    await peer.connect();
+
+    try {
+      const path = "Images/Pasted image 20220906174701.png";
+      peer.send(updateBatch("missing-blob-segment", [{
+        mutationId: crypto.randomUUID(),
+        operation: "UpsertFile",
+        path,
+        storageKind: "lo",
+        isYjs: false,
+        isFolder: false,
+        byteSize: 12345,
+        contentSha256: "sha-missing-websocket-blob",
+        created: Date.now(),
+      }]));
+
+      const ack = await peer.waitFor(packet => packet.type === opType.BatchAck && packet.segmentId === "missing-blob-segment");
+      expect(ack.type).toBe(opType.BatchAck);
+      expect(await getFile(path)).toBeNull();
+      expect(await listSyncEvents(path)).toHaveLength(0);
+    } finally {
+      peer.close();
     }
   });
 

@@ -9,6 +9,18 @@ import { log } from "../logger";
 
 // one stop shop for all the document syncing needs
 
+const CHECKPOINT_DEBOUNCE_MS = 2000;
+const CHECKPOINT_MAX_LOCAL_EDITS = 100;
+
+function exactArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+    return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+}
+
+async function sha256Hex(bytes: Uint8Array): Promise<string> {
+    const hash = await crypto.subtle.digest("SHA-256", exactArrayBuffer(bytes));
+    return [...new Uint8Array(hash)].map(byte => byte.toString(16).padStart(2, "0")).join("");
+}
+
 export class DocSync {
     private db: OutboxStore;
     private ydoc = new Y.Doc();
@@ -16,6 +28,9 @@ export class DocSync {
     private openedTime = Date.now();
     private localRevision = 0;
     private localEditRevision = 0;
+    private checkpointTimer: ReturnType<typeof setTimeout> | null = null;
+    private checkpointPromise: Promise<void> = Promise.resolve();
+    private editsSinceCheckpoint = 0;
 
 
     constructor(
@@ -29,6 +44,10 @@ export class DocSync {
     }
 
     public destroy(){
+        if (this.checkpointTimer !== null) {
+            clearTimeout(this.checkpointTimer);
+            this.checkpointTimer = null;
+        }
         this.ydoc.destroy();
     }
     public getTimeOpened(){
@@ -48,7 +67,21 @@ export class DocSync {
     }
 
     public async persistState(): Promise<void> {
-        await this.stateStore.put(this.path, Y.encodeStateAsUpdateV2(this.ydoc));
+        if (this.checkpointTimer !== null) {
+            clearTimeout(this.checkpointTimer);
+            this.checkpointTimer = null;
+        }
+        const state = Y.encodeStateAsUpdateV2(this.ydoc);
+        const contentHash = await sha256Hex(new TextEncoder().encode(this.ytext.toJSON()));
+        if ("putWithContentHash" in this.stateStore && typeof this.stateStore.putWithContentHash === "function") {
+            await this.stateStore.putWithContentHash(this.path, state, contentHash);
+        } else {
+            await this.stateStore.put(this.path, state);
+            if ("putContentHash" in this.stateStore && typeof this.stateStore.putContentHash === "function") {
+                await this.stateStore.putContentHash(this.path, contentHash);
+            }
+        }
+        this.editsSinceCheckpoint = 0;
     }
 
     public async replaceState(state: Uint8Array): Promise<void> {
@@ -132,11 +165,15 @@ export class DocSync {
         }, "user changes");
         this.localRevision++;
         this.localEditRevision++;
+        this.editsSinceCheckpoint++;
         row.data = Y.encodeStateAsUpdateV2(this.ydoc, before);
-        return Promise.all([
-            this.db.putInOutbox(row),
-            this.persistState(),
-        ]).then(() => undefined).catch(error => {
+        const outboxWrite = this.db.putInOutbox(row).then(() => undefined);
+        if (this.editsSinceCheckpoint >= CHECKPOINT_MAX_LOCAL_EDITS) {
+            void this.flushCheckpointSoon(0);
+        } else {
+            this.scheduleCheckpoint();
+        }
+        return outboxWrite.catch(error => {
             const err = error instanceof Error ? error : new Error(String(error));
             log.error("failed to write update to outbox", { path: this.path, mutationId: row.mutationId, ...errorContext(err) });
             onError?.(err);
@@ -147,9 +184,38 @@ export class DocSync {
     public applyRemoteUpdate(update: Uint8Array): string {
         Y.applyUpdateV2(this.ydoc, update);
         this.localRevision++;
-        void this.persistState().catch(error => {
+        void this.flushCheckpointSoon(0).catch(error => {
             log.error("failed to persist remote Yjs state", { path: this.path, ...errorContext(error) });
         });
         return this.ytext.toJSON();
+    }
+
+    private scheduleCheckpoint(): void {
+        if (this.checkpointTimer !== null) {
+            return;
+        }
+        this.checkpointTimer = setTimeout(() => {
+            this.checkpointTimer = null;
+            void this.flushCheckpointSoon(0).catch(error => {
+                log.error("failed to persist debounced Yjs state", { path: this.path, ...errorContext(error) });
+            });
+        }, CHECKPOINT_DEBOUNCE_MS);
+        (this.checkpointTimer as { unref?: () => void }).unref?.();
+    }
+
+    private flushCheckpointSoon(delayMs: number): Promise<void> {
+        if (this.checkpointTimer !== null) {
+            clearTimeout(this.checkpointTimer);
+            this.checkpointTimer = null;
+        }
+        this.checkpointPromise = this.checkpointPromise
+            .catch(() => {})
+            .then(async () => {
+                if (delayMs > 0) {
+                    await new Promise(resolve => setTimeout(resolve, delayMs));
+                }
+                await this.persistState();
+            });
+        return this.checkpointPromise;
     }
 }

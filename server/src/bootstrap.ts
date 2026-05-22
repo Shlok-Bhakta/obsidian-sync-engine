@@ -6,6 +6,7 @@ import { ServerFileRow, compactMaterializedSyncEvents, getServerRevision } from 
 import { readLargeObject } from "./db/largeObject";
 import { mintNewClientKey } from "./security";
 import { shouldSyncPath } from "../../shared/pathPolicy";
+import { log } from "./logger";
 
 const adjectives = [
   "brisk",
@@ -268,7 +269,13 @@ export async function buildBootstrapZip(request: BootstrapBuildRequest): Promise
       let bytes: Uint8Array;
       if (row.storageKind === "lo") {
         if (!row.contentOid) {
-          throw new Error(`Large object file is missing content OID: ${row.path}`);
+          log.warn("skipping bootstrap file with missing large object content", {
+            path: row.path,
+            byteSize: row.byteSize,
+            contentSha256: row.contentSha256,
+            revision: row.revision,
+          });
+          continue;
         }
         bytes = await readLargeObject(row.contentOid);
       } else if (row.storageKind === "bytea") {

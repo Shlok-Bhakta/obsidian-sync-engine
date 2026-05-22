@@ -43,6 +43,18 @@ export class YjsStateStore {
         });
     }
 
+    async putWithContentHash(vaultPath: string, state: Uint8Array, hash: string): Promise<void> {
+        return this.runSerialized(async () => {
+            const statePath = this.statePathFor(vaultPath);
+            await this.ensureDirectory(dirname(statePath));
+            await this.app.vault.adapter.writeBinary(statePath, state.buffer.slice(
+                state.byteOffset,
+                state.byteOffset + state.byteLength,
+            ));
+            await this.app.vault.adapter.write(this.contentHashPathFor(vaultPath), hash);
+        });
+    }
+
     async getContentHash(vaultPath: string): Promise<string | null> {
         const path = this.contentHashPathFor(vaultPath);
         if (!(await this.app.vault.adapter.exists(path))) {

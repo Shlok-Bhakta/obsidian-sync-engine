@@ -7,6 +7,7 @@ export interface SyncEngineSettings {
 	clientKey: string;
 	clientName: string;
 	lastPulledRevision: string;
+	syncConfigDir: boolean;
 }
 
 export const DEFAULT_SETTINGS: SyncEngineSettings = {
@@ -15,6 +16,7 @@ export const DEFAULT_SETTINGS: SyncEngineSettings = {
 	clientKey: 'To Be Generated',
 	clientName: 'Obsidian',
 	lastPulledRevision: '0',
+	syncConfigDir: false,
 }
 
 export class SyncEngineSettingTab extends PluginSettingTab {
@@ -55,7 +57,8 @@ export class SyncEngineSettingTab extends PluginSettingTab {
 			this.hasUnsavedChanges =
 				this.pendingSettings.backendUrl !== this.plugin.settings.backendUrl ||
 				this.pendingSettings.clientKey !== this.plugin.settings.clientKey ||
-				this.pendingSettings.clientName !== this.plugin.settings.clientName;
+				this.pendingSettings.clientName !== this.plugin.settings.clientName ||
+				this.pendingSettings.syncConfigDir !== this.plugin.settings.syncConfigDir;
 
 			if (saveButtonEl) {
 				saveButtonEl.setText(this.hasUnsavedChanges ? "Save settings" : "Saved");
@@ -120,6 +123,16 @@ export class SyncEngineSettingTab extends PluginSettingTab {
 				.setValue(this.pendingSettings.clientKey)
 				.onChange((value) => {
 					this.pendingSettings.clientKey = value;
+					refresh();
+				}));
+
+		new Setting(containerEl)
+			.setName("Sync Obsidian config files")
+			.setDesc("When enabled, a small subset of non-Markdown files under the vault config directory is synced. Leave disabled on mobile for lower startup and polling cost.")
+			.addToggle(toggle => toggle
+				.setValue(this.pendingSettings.syncConfigDir)
+				.onChange(value => {
+					this.pendingSettings.syncConfigDir = value;
 					refresh();
 				}));
 
