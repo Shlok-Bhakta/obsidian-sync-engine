@@ -506,9 +506,6 @@ async function pushChangesToOtherClients(sender: Client, revision: string): Prom
         const packet = await changeBatchPacket(fromRevision);
         target.socket!.send(encodePacket(packet));
         const pushedRevision = revisionFromServerPacket(packet);
-        if (pushedRevision && BigInt(pushedRevision) > BigInt(target.lastPulledRevision)) {
-          target.lastPulledRevision = pushedRevision;
-        }
         log.info("pushed changes to websocket client", {
           senderClientId: sender.clientId,
           targetClientId: target.clientId,
@@ -703,7 +700,6 @@ app.get(
           const revision = await acceptMutations(client.clientId, decodeUpdateBatchJsonl(data.jsonl));
           const ack: wsPacket = { type: opType.BatchAck, segmentId: data.segmentId, revision };
           ws.send(encodePacket(ack));
-          client.lastPulledRevision = revision;
           log.info("update batch acknowledged", {
             clientId: client.clientId,
             segmentId: data.segmentId,

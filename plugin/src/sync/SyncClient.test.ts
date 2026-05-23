@@ -28,6 +28,7 @@ class QueueOutboxStore extends MemoryOutboxStore {
     claimed = 0;
     completed = 0;
     released = 0;
+    private readonly claimedRows = new Map<string, outboxData[]>();
 
     constructor(private readonly segments: { segment: OutboxSegment; rows: outboxData[] }[]) {
         super();
@@ -39,6 +40,7 @@ class QueueOutboxStore extends MemoryOutboxStore {
             return null;
         }
         this.claimed++;
+        this.claimedRows.set(next.segment.id, next.rows);
         return next.segment;
     }
 
@@ -47,17 +49,7 @@ class QueueOutboxStore extends MemoryOutboxStore {
     }
 
     async readSegment(segment: OutboxSegment): Promise<outboxData[]> {
-        if (segment.id === "segment") {
-            return [{
-                mutationId: "kept",
-                operation: "UpsertFile",
-                path: ".obsidian/workspace.json",
-                contentBytes: new TextEncoder().encode("{}"),
-                storageKind: "bytea",
-                created: 2,
-            }];
-        }
-        return [];
+        return this.claimedRows.get(segment.id) ?? [];
     }
 
     async completeSegment(_segment: OutboxSegment): Promise<void> {
@@ -1275,10 +1267,12 @@ describe("SyncClient initial snapshot", () => {
                 livePushPromise: Promise<void>;
                 drainOutbox: () => Promise<void>;
                 sendSegment: (_segment: OutboxSegment) => Promise<void>;
+                catchUpToServer: () => Promise<void>;
             };
             testClient.startupSynced = true;
             testClient.livePushPromise = liveBlocked;
             testClient.sendSegment = vi.fn(async () => {});
+            testClient.catchUpToServer = vi.fn(async () => {});
 
             const drain = testClient.drainOutbox();
             await Promise.resolve();
@@ -1294,5 +1288,90 @@ describe("SyncClient initial snapshot", () => {
         } finally {
             vi.useRealTimers();
         }
+    });
+
+    it("catches up missed remote Yjs edits immediately after uploading an offline open-document edit", async () => {
+        const path = "notes/existing.md";
+        const files = { [path]: "" };
+        const stateStore = new MemoryYjsStateStore();
+        const initialState = docStateFromContent("", Y);
+        await stateStore.put(path, initialState);
+        const openDoc = new DocSync(
+            new MemoryOutboxStore(),
+            stateStore as unknown as YjsStateStore,
+            path,
+            initialState,
+            true,
+        );
+        const localRow: outboxData = {
+            mutationId: "offline-local",
+            operation: "YjsUpdate",
+            path,
+            data: new Uint8Array(),
+            created: 1,
+        };
+        await openDoc.applyChanges(
+            EditorState.create({ doc: "" }).update({ changes: { from: 0, insert: "hello" } }).changes,
+            localRow,
+        );
+
+        const remoteDoc = new Y.Doc();
+        Y.applyUpdateV2(remoteDoc, initialState);
+        const beforeRemote = Y.encodeStateVector(remoteDoc);
+        remoteDoc.getText(MARKDOWN_FIELD).insert(0, "world");
+        const remoteUpdate = Y.encodeStateAsUpdateV2(remoteDoc, beforeRemote);
+        remoteDoc.destroy();
+
+        const outbox = new QueueOutboxStore([{
+            segment: { id: "segment", path: "pending.jsonl" },
+            rows: [localRow],
+        }]);
+        const applied: string[] = [];
+        const { client } = await makeClient(files, stateStore, outbox, {
+            getDocSync: requested => requested === path ? openDoc : undefined,
+            onOpenYjsContent: async (_path, content) => {
+                applied.push(content);
+                return true;
+            },
+        });
+        const testClient = client as unknown as {
+            startupSynced: boolean;
+            lastPulledRevision: string;
+            drainOutbox: () => Promise<void>;
+            sendSegment: (_segment: OutboxSegment) => Promise<void>;
+            catchUpToServer: () => Promise<void>;
+            applyChangeBatch: (packet: unknown) => Promise<void>;
+        };
+        testClient.startupSynced = true;
+        testClient.lastPulledRevision = "1";
+        testClient.sendSegment = vi.fn(async () => {});
+        const catchUp = vi.fn(async () => {
+            await testClient.applyChangeBatch({
+                type: opType.ChangeBatch,
+                fromRevision: "1",
+                serverRevision: "2",
+                changes: [{
+                    mutationId: "remote-while-offline",
+                    operation: "YjsUpdate",
+                    path,
+                    data: remoteUpdate,
+                    created: Date.now(),
+                    revision: "2",
+                    clientId: "desktop-client",
+                }],
+            });
+        });
+        testClient.catchUpToServer = catchUp;
+
+        await testClient.drainOutbox();
+
+        const merged = openDoc.getYdoc().getText(MARKDOWN_FIELD).toString();
+        expect(catchUp).toHaveBeenCalledTimes(1);
+        expect(merged).toContain("hello");
+        expect(merged).toContain("world");
+        expect(applied).toEqual([merged]);
+        expect(testClient.lastPulledRevision).toBe("2");
+        expect(outbox.completed).toBe(1);
+        openDoc.destroy();
     });
 });

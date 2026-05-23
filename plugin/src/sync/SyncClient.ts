@@ -336,6 +336,11 @@ export class SyncClient {
                     await this.sendSegment(segment);
                     await this.outbox.completeSegment(segment);
                     this.log.debug("completed outbox segment", { segmentId: segment.id });
+                    await this.livePushPromise.catch(() => {});
+                    if (this.stopped || !this.startupSynced) {
+                        return;
+                    }
+                    await this.catchUpToServer();
                     await sleep(0);
                 } catch (error) {
                     this.log.error("failed to drain outbox", {

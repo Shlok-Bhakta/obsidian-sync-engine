@@ -1633,7 +1633,7 @@ describeIntegration("sync engine postgres integration", () => {
     expect(BigInt(r2)).toBeGreaterThan(BigInt(r1));
   });
 
-  it("websocket fan-out advances the target cursor after each live push", async () => {
+  it("websocket fan-out keeps prior changes until the target explicitly pulls", async () => {
     const peerB = new TestPeer("ws-client-b", "obs_sync_seed", "0");
     await peerB.connect();
     const peerA = new TestPeer("ws-client-a", peerB.clientKey, "0");
@@ -1649,7 +1649,7 @@ describeIntegration("sync engine postgres integration", () => {
       await peerA.waitFor(packet => packet.type === opType.BatchAck && packet.segmentId === "segment-2");
       const secondPush = await peerB.waitFor(packet => packet.type === opType.ChangeBatch || packet.type === opType.SnapshotReset);
 
-      expect(serverPacketPaths(secondPush)).toEqual(["notes/b.md"]);
+      expect(serverPacketPaths(secondPush)).toEqual(["notes/a.md", "notes/b.md"]);
     } finally {
       peerA.close();
       peerB.close();
