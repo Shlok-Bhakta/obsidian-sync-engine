@@ -1,6 +1,6 @@
 import { sql } from "bun";
 import { bootstrapDB } from "../db/MigrationRunner";
-import { registerClient } from "../sync/engine";
+import { flushScheduledYjsCompaction, registerClient } from "../sync/engine";
 
 export async function canConnectToDatabase(): Promise<boolean> {
   try {
@@ -17,6 +17,7 @@ export async function setupIntegrationDb(): Promise<void> {
 }
 
 export async function resetIntegrationData(): Promise<void> {
+  await flushScheduledYjsCompaction();
   await sql`TRUNCATE TABLE sync_events, files, bootstrap_blobs, clients, client_keys RESTART IDENTITY CASCADE;`;
   await sql`
     UPDATE server_meta

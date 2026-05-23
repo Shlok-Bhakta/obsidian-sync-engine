@@ -4,7 +4,7 @@ import { EditorState } from "@codemirror/state";
 import { TFile, TFolder } from "obsidian";
 import { docStateFromContent, MARKDOWN_FIELD } from "../../../shared/yjsSeed";
 import { opType, outboxData } from "../../../shared/types";
-import { encodePacket } from "../../../shared/protocol";
+import { decodeUpdateBatchJsonl, encodePacket } from "../../../shared/protocol";
 import { SyncClient } from "./SyncClient";
 import { DocSync } from "../yjs/DocSync";
 import { YjsStateStore } from "../yjs/YjsStateStore";
@@ -412,6 +412,64 @@ describe("SyncClient initial snapshot", () => {
 
         expect(jsonl).toContain(".obsidian/workspace.json");
         expect(jsonl).not.toContain("data.json");
+    });
+
+    it("uploads open-document Yjs updates without a pre-upload DocSync round trip", async () => {
+        const path = "notes/existing.md";
+        const baseState = docStateFromContent("hello", Y);
+        const doc = new Y.Doc();
+        Y.applyUpdateV2(doc, baseState);
+        const beforeFirst = Y.encodeStateVector(doc);
+        doc.getText(MARKDOWN_FIELD).insert(5, " world");
+        const first = Y.encodeStateAsUpdateV2(doc, beforeFirst);
+        const beforeSecond = Y.encodeStateVector(doc);
+        doc.getText(MARKDOWN_FIELD).insert(11, "!");
+        const second = Y.encodeStateAsUpdateV2(doc, beforeSecond);
+        const finalState = Y.encodeStateAsUpdateV2(doc);
+        doc.destroy();
+
+        const openDoc = new DocSync(
+            new MemoryOutboxStore(),
+            new MemoryYjsStateStore() as unknown as YjsStateStore,
+            path,
+            finalState,
+            true,
+        );
+        const outbox = new MemoryOutboxStore([
+            {
+                mutationId: "first",
+                operation: "YjsUpdate",
+                path,
+                data: first,
+                created: 1,
+            },
+            {
+                mutationId: "second",
+                operation: "YjsUpdate",
+                path,
+                data: second,
+                created: 2,
+            },
+        ]);
+        const { client } = await makeClient({ [path]: "hello world!" }, new MemoryYjsStateStore(), outbox, {
+            getDocSync: requested => requested === path ? openDoc : undefined,
+        });
+        const ws = { send: vi.fn() } as unknown as WebSocket;
+
+        const jsonl = await (client as unknown as {
+            prepareSegmentJsonl: (socket: WebSocket, segment: OutboxSegment) => Promise<string>;
+        }).prepareSegmentJsonl(ws, { id: "segment", path: "pending.jsonl" });
+
+        expect(ws.send).not.toHaveBeenCalled();
+        const rows = decodeUpdateBatchJsonl(jsonl);
+        expect(rows).toHaveLength(1);
+        expect(rows[0]?.operation).toBe("YjsUpdate");
+        const materialized = new Y.Doc();
+        Y.applyUpdateV2(materialized, baseState);
+        Y.applyUpdateV2(materialized, rows[0]!.data!);
+        expect(materialized.getText(MARKDOWN_FIELD).toString()).toBe("hello world!");
+        materialized.destroy();
+        openDoc.destroy();
     });
 
     it("waits for startup sync before requesting a bootstrap link", async () => {

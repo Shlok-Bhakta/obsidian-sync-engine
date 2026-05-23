@@ -31,6 +31,7 @@ export class DocSync {
     private checkpointTimer: ReturnType<typeof setTimeout> | null = null;
     private checkpointPromise: Promise<void> = Promise.resolve();
     private editsSinceCheckpoint = 0;
+    private serverSyncedState = false;
 
 
     constructor(
@@ -38,8 +39,10 @@ export class DocSync {
         private readonly stateStore: YjsStateStore,
         private readonly path: string,
         initialState: Uint8Array,
+        initialServerSyncedState = false,
     ) {
         this.db = db;
+        this.serverSyncedState = initialServerSyncedState;
         Y.applyUpdateV2(this.ydoc, initialState);
     }
 
@@ -64,6 +67,10 @@ export class DocSync {
 
     public hasLocalEdits(): boolean {
         return this.localEditRevision > 0;
+    }
+
+    public hasServerSyncedState(): boolean {
+        return this.serverSyncedState;
     }
 
     public async persistState(): Promise<void> {
@@ -91,6 +98,7 @@ export class DocSync {
         this.ytext = this.ydoc.getText(MARKDOWN_FIELD);
         this.localRevision++;
         this.localEditRevision = 0;
+        this.serverSyncedState = true;
         await this.persistState();
     }
 
@@ -139,6 +147,7 @@ export class DocSync {
                 if (expectedBefore.length > 0) {
                     this.ytext.insert(0, expectedBefore);
                 }
+                this.serverSyncedState = false;
             }
             for (const { fromA, toA, insertText } of changes.reverse()) {
                 const deletelen = toA - fromA;
@@ -161,6 +170,7 @@ export class DocSync {
                 if (expectedAfter.length > 0) {
                     this.ytext.insert(0, expectedAfter);
                 }
+                this.serverSyncedState = false;
             }
         }, "user changes");
         this.localRevision++;
@@ -184,6 +194,7 @@ export class DocSync {
     public applyRemoteUpdate(update: Uint8Array): string {
         Y.applyUpdateV2(this.ydoc, update);
         this.localRevision++;
+        this.serverSyncedState = true;
         void this.flushCheckpointSoon(0).catch(error => {
             log.error("failed to persist remote Yjs state", { path: this.path, ...errorContext(error) });
         });

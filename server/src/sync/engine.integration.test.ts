@@ -8,6 +8,7 @@ import { decodePacket, encodePacket, encodePathToken, encodeUpdateBatchJsonl, PR
 import { shouldSyncPath, shouldUseYjs } from "../../../shared/pathPolicy";
 import {
   acceptMutations,
+  compactYjsEvents,
   countYjsEvents,
   getCompactedRevision,
   getBlobMetadata,
@@ -34,7 +35,6 @@ import {
   stateFromMarkdown,
   uploadYjsEdit,
 } from "../test/yjsHarness";
-import { applyYjsPayload } from "../yjs/apply";
 import { buildBootstrapZip } from "../bootstrap";
 import { putBootstrapBlob } from "./bootstrapBlobUpload";
 import { acceptBootstrapSnapshot } from "./bootstrapUpload";
@@ -1015,12 +1015,8 @@ describeIntegration("sync engine postgres integration", () => {
     expect(pull.type).toBe(opType.ChangeBatch);
     if (pull.type === opType.ChangeBatch) {
       const yjsChange = pull.changes.find(change => change.operation === "YjsUpdate");
-      expect(yjsChange?.yjsState).toBeInstanceOf(Uint8Array);
-      expect(yjsChange?.yjsState?.length).toBeGreaterThan(0);
-      const materialized = new Y.Doc();
-      Y.applyUpdateV2(materialized, yjsChange!.yjsState!);
-      expect(readDoc(materialized)).toBe("hello world");
-      materialized.destroy();
+      expect(yjsChange?.yjsState).toBeUndefined();
+      expect(yjsChange?.data).toBeInstanceOf(Uint8Array);
     }
   });
 
@@ -1356,6 +1352,7 @@ describeIntegration("sync engine postgres integration", () => {
       appendToDoc(doc, ch);
       await uploadYjsEdit(CLIENT_A, NOTE_PATH, doc, crypto.randomUUID());
     }
+    await compactYjsEvents();
 
     const fileBeforeCompact = await getFile(NOTE_PATH);
     expect(fileBeforeCompact?.content).toBe("line1234");
@@ -1518,6 +1515,7 @@ describeIntegration("sync engine postgres integration", () => {
       appendToDoc(doc, suffix);
       await uploadYjsEdit(CLIENT_A, NOTE_PATH, doc, crypto.randomUUID());
     }
+    await compactYjsEvents();
 
     const revisionBeforePull = "1";
     const pull = await handlePull({ type: opType.PullSince, revision: revisionBeforePull });

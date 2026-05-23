@@ -17,7 +17,7 @@ import { errorContext, Logger } from "../../../shared/logger";
 import { log as rootLog } from "../logger";
 import { readSocketMessage, waitForPacket, withTimeout } from "./SocketRequest";
 
-const FLUSH_DELAY_MS = 150;
+const FLUSH_DELAY_MS = 16;
 const ERROR_BACKOFF_MS = 2000;
 const CONNECT_BACKOFF_INITIAL_MS = 5000;
 const CONNECT_BACKOFF_MAX_MS = 60000;
@@ -880,10 +880,28 @@ export class SyncClient {
         )];
 
         const coalesced = new Map<string, SyncMutation>();
-        if (yjsPaths.length > 0) {
+        const docSyncPaths: string[] = [];
+        for (const path of yjsPaths) {
+            const pathRows = rows.filter(row => row.operation === "YjsUpdate" && row.path === path);
+            const updates = pathRows.map(row => row.data).filter((data): data is Uint8Array => data instanceof Uint8Array);
+            const openDoc = this.getDocSync(path);
+            if (openDoc?.hasServerSyncedState() && updates.length === pathRows.length && updates.length > 0) {
+                coalesced.set(path, {
+                    mutationId: crypto.randomUUID(),
+                    operation: "YjsUpdate",
+                    path,
+                    data: updates.length === 1 ? updates[0] : Y.mergeUpdatesV2(updates),
+                    created: Math.max(...pathRows.map(row => row.created)),
+                });
+            } else {
+                docSyncPaths.push(path);
+            }
+        }
+
+        if (docSyncPaths.length > 0) {
             this.log.debug("coalescing Yjs updates before upload", {
                 segmentId: segment.id,
-                paths: yjsPaths,
+                paths: docSyncPaths,
             });
             const resolved: {
                 path: string;
@@ -894,7 +912,7 @@ export class SyncClient {
                 openDoc?: DocSync;
             }[] = [];
 
-            for (const path of yjsPaths) {
+            for (const path of docSyncPaths) {
                 const pathRows = rows.filter(row => row.operation === "YjsUpdate" && row.path === path);
                 const { doc, destroy } = await this.yjsApplicator.resolveYdoc(path);
                 resolved.push({

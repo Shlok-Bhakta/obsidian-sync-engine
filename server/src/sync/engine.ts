@@ -24,6 +24,9 @@ export const defaultCompactionConfig: CompactionConfig = {
 
 let compactionConfig: CompactionConfig = { ...defaultCompactionConfig };
 const CHANGE_BATCH_ROW_LIMIT = 500;
+const COMPACTION_SCHEDULE_DELAY_MS = 1000;
+let compactionTimer: ReturnType<typeof setTimeout> | null = null;
+let compactionPromise: Promise<void> | null = null;
 
 export function setCompactionConfig(config: Partial<CompactionConfig>): void {
   compactionConfig = { ...compactionConfig, ...config };
@@ -31,6 +34,36 @@ export function setCompactionConfig(config: Partial<CompactionConfig>): void {
 
 export function resetCompactionConfig(): void {
   compactionConfig = { ...defaultCompactionConfig };
+  if (compactionTimer) {
+    clearTimeout(compactionTimer);
+    compactionTimer = null;
+  }
+}
+
+export function flushScheduledYjsCompaction(): void {
+  if (compactionTimer) {
+    clearTimeout(compactionTimer);
+    compactionTimer = null;
+  }
+}
+
+export function scheduleYjsCompaction(): void {
+  if (compactionTimer || compactionPromise) {
+    return;
+  }
+  compactionTimer = setTimeout(() => {
+    compactionTimer = null;
+    compactionPromise = compactYjsEvents()
+      .catch(error => {
+        log.error("background Yjs compaction failed", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      })
+      .finally(() => {
+        compactionPromise = null;
+      });
+  }, COMPACTION_SCHEDULE_DELAY_MS);
+  compactionTimer.unref?.();
 }
 
 type RevisionRow = {
@@ -272,16 +305,12 @@ export async function changeBatchPacket(fromRevision: string): Promise<Extract<w
       e.byte_size::TEXT AS "byteSize",
       e.content_sha256 AS "contentSha256",
       e.payload,
-      CASE
-        WHEN e.operation = 'YjsUpdate' AND f.deleted = FALSE THEN f.yjs_state
-        ELSE NULL
-      END AS "yjsState",
+      NULL::BYTEA AS "yjsState",
       e.compacted,
       e.is_folder AS "isFolder",
       e.is_yjs AS "isYjs",
       EXTRACT(EPOCH FROM e.created_at) * 1000 AS "createdAt"
     FROM sync_events e
-    LEFT JOIN files f ON f.path = e.path
     WHERE e.revision > ${fromRevision}
     ORDER BY e.revision ASC
     LIMIT ${CHANGE_BATCH_ROW_LIMIT};
@@ -780,7 +809,9 @@ export async function acceptMutations(clientId: string, mutations: SyncMutation[
     return latest;
   });
 
-  await compactYjsEvents();
+  if (mutations.some(mutation => mutation.operation === "YjsUpdate")) {
+    scheduleYjsCompaction();
+  }
   log.info("mutation batch accepted", { clientId, revision });
   return revision;
 }
