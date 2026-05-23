@@ -168,8 +168,10 @@ export default class SyncEngine extends Plugin {
 		}));
 		this.registerEvent(this.app.vault.on("create", file => {
 			log.debug("vault create event", { path: file.path, type: file instanceof TFolder ? "folder" : "file" });
-			void this.ensureYjsStateForExternalMarkdown(file);
-			void this.queueNonMarkdownUpsert(file);
+			void this.enqueueLocalCreate(file).catch(error => {
+				log.error("failed to enqueue local create", { path: file.path, ...errorContext(error) });
+				new Notice(`Sync outbox write failed: ${errorMessage(error)}`);
+			});
 		}));
 		this.registerEvent(this.app.vault.on("modify", file => {
 			log.debug("vault modify event", { path: file.path, type: file instanceof TFolder ? "folder" : "file" });
@@ -289,6 +291,7 @@ export default class SyncEngine extends Plugin {
 	}
 
 	private async enqueueLocalDelete(file: TAbstractFile): Promise<void> {
+		this.cancelPendingPathUpserts(file.path, file instanceof TFolder);
 		if (this.syncClient?.isApplyingRemoteChanges(file.path) || !this.shouldSyncLocalPath(file.path)) {
 			return;
 		}
@@ -304,6 +307,8 @@ export default class SyncEngine extends Plugin {
 	}
 
 	private async enqueueLocalRename(file: TAbstractFile, oldPath: string): Promise<void> {
+		this.cancelPendingPathUpserts(oldPath, file instanceof TFolder);
+		this.cancelPendingPathUpserts(file.path, file instanceof TFolder);
 		if (
 			(this.syncClient?.isApplyingRemoteChanges(oldPath) || this.syncClient?.isApplyingRemoteChanges(file.path)) ||
 			!this.shouldSyncLocalPath(oldPath) ||
@@ -321,6 +326,51 @@ export default class SyncEngine extends Plugin {
 		});
 		log.info("queued local rename", { oldPath, path: file.path, isFolder: file instanceof TFolder });
 		this.syncClient.wakeSoon();
+	}
+
+	private async enqueueLocalCreate(file: TAbstractFile): Promise<void> {
+		if (this.syncClient?.isApplyingRemoteChanges(file.path) || !this.shouldSyncLocalPath(file.path)) {
+			return;
+		}
+		if (file instanceof TFolder) {
+			await this.db.putInOutbox({
+				mutationId: crypto.randomUUID(),
+				operation: "CreateFolder",
+				path: file.path,
+				isFolder: true,
+				created: Date.now(),
+			});
+			log.info("queued local folder create", { path: file.path });
+			this.syncClient.wakeSoon();
+			return;
+		}
+		if (!(file instanceof TFile)) {
+			return;
+		}
+		if (shouldUseYjs(file.path, this.app.vault.configDir)) {
+			const content = await this.app.vault.read(file);
+			const yjsState = docStateFromContent(content, Y);
+			await this.yjsStateStore.putWithContentHash(
+				file.path,
+				yjsState,
+				await sha256Hex(new TextEncoder().encode(content)),
+			);
+			await this.db.putInOutbox({
+				mutationId: crypto.randomUUID(),
+				operation: "UpsertFile",
+				path: file.path,
+				content,
+				yjsState,
+				isFolder: false,
+				isYjs: true,
+				storageKind: "text",
+				created: Date.now(),
+			});
+			log.info("queued local markdown create", { path: file.path, chars: content.length });
+			this.syncClient.wakeSoon();
+			return;
+		}
+		this.queuePathUpsertDebounced(file.path);
 	}
 
 	private startConfigDirPoller(): void {
@@ -528,6 +578,16 @@ export default class SyncEngine extends Plugin {
 			});
 		}, 500);
 		this.pendingFileTimers.set(path, timer);
+	}
+
+	private cancelPendingPathUpserts(path: string, includeDescendants = false): void {
+		const prefix = `${path}/`;
+		for (const [pendingPath, timer] of this.pendingFileTimers) {
+			if (pendingPath === path || (includeDescendants && pendingPath.startsWith(prefix))) {
+				window.clearTimeout(timer);
+				this.pendingFileTimers.delete(pendingPath);
+			}
+		}
 	}
 
 	private async captureBootConfigShas(): Promise<void> {

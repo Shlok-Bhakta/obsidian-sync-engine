@@ -9,10 +9,11 @@ type OutboxMeta = {
     nextSegmentId: number;
 };
 
-type EncodedOutboxRow = Omit<outboxData, "data" | "contentBytes"> & {
+type EncodedOutboxRow = Omit<outboxData, "data" | "contentBytes" | "yjsState"> & {
     id: number;
     data?: string;
     contentBytes?: string;
+    yjsState?: string;
 };
 
 export type OutboxSegment = {
@@ -103,6 +104,7 @@ export class JsonlOutboxStore implements OutboxStore {
                 id,
                 data: row.data ? bytesToBase64(row.data) : undefined,
                 contentBytes: row.contentBytes ? bytesToBase64(row.contentBytes) : undefined,
+                yjsState: row.yjsState ? bytesToBase64(row.yjsState) : undefined,
             };
             const line = `${JSON.stringify(storedRow)}\n`;
             await this.app.vault.adapter.append(this.activePath, line);
@@ -172,6 +174,7 @@ export class JsonlOutboxStore implements OutboxStore {
                     ...encoded,
                     data: encoded.data ? base64ToBytes(encoded.data) : undefined,
                     contentBytes: encoded.contentBytes ? base64ToBytes(encoded.contentBytes) : undefined,
+                    yjsState: encoded.yjsState ? base64ToBytes(encoded.yjsState) : undefined,
                 });
             } catch (error) {
                 log.error("skipping corrupt outbox line", { line: index + 1, path: segment.path, ...errorContext(error) });
