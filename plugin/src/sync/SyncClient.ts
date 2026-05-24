@@ -255,12 +255,12 @@ export class SyncClient {
         this.connectSoon();
     }
 
-    async uploadBlob(path: string, bytes: Uint8Array): Promise<{ byteSize: number; contentSha256: string }> {
+    async uploadBlob(path: string, bytes: Uint8Array): Promise<{ blobUploadId: string; byteSize: number; contentSha256: string }> {
         await this.ensureAuthenticatedSocket();
         const contentSha256 = await sha256Hex(bytes);
         this.log.debug("uploading blob", { path, byteSize: bytes.byteLength, contentSha256 });
-        await this.blobClient.upload(path, bytes, contentSha256);
-        return { byteSize: bytes.byteLength, contentSha256 };
+        const upload = await this.blobClient.upload(path, bytes, contentSha256, this.clientId);
+        return { blobUploadId: upload.uploadId, byteSize: bytes.byteLength, contentSha256 };
     }
 
     async generateBootstrapLink(vaultName: string, configDir: string, pluginId: string): Promise<void> {
@@ -593,12 +593,7 @@ export class SyncClient {
                     const content = loaded instanceof TFile
                         ? await this.app.vault.read(loaded)
                         : await this.app.vault.adapter.read(entry.path);
-                    let yjsState = await this.stateStore.get(entry.path);
-                    if (!yjsState) {
-                        yjsState = docStateFromContent(content, Y);
-                        await this.stateStore.put(entry.path, yjsState);
-                    }
-                    await this.stateStore.putContentHash(entry.path, await sha256Hex(new TextEncoder().encode(content)));
+                    const { yjsState } = await this.localMarkdownState(entry.path, content);
                     changes.push({
                         mutationId: crypto.randomUUID(),
                         operation: "UpsertFile",
@@ -626,7 +621,17 @@ export class SyncClient {
                 };
                 if (contentBytes.byteLength > INLINE_BYTES_LIMIT) {
                     try {
-                        await this.blobClient.upload(entry.path, contentBytes, base.contentSha256!);
+                        const upload = await this.blobClient.upload(
+                            entry.path,
+                            contentBytes,
+                            base.contentSha256!,
+                            this.clientId,
+                        );
+                        changes.push({
+                            ...base,
+                            storageKind: "lo",
+                            blobUploadId: upload.uploadId,
+                        });
                     } catch (error) {
                         this.skippedInitialSnapshotPaths.add(normalizePath(entry.path));
                         this.log.error("skipping large file during initial snapshot after blob upload failure", {
@@ -639,10 +644,6 @@ export class SyncClient {
                         );
                         continue;
                     }
-                    changes.push({
-                        ...base,
-                        storageKind: "lo",
-                    });
                 } else {
                     changes.push({
                         ...base,
@@ -654,6 +655,17 @@ export class SyncClient {
         }
 
         return changes;
+    }
+
+    private async localMarkdownState(path: string, content: string): Promise<{ yjsState: Uint8Array; contentHash: string }> {
+        const contentHash = await sha256Hex(new TextEncoder().encode(content));
+        const cachedHash = await this.stateStore.getContentHash(path);
+        let yjsState = await this.stateStore.get(path);
+        if (!yjsState || cachedHash !== contentHash) {
+            yjsState = docStateFromContent(content, Y);
+            await this.stateStore.putWithContentHash(path, yjsState, contentHash);
+        }
+        return { yjsState, contentHash };
     }
 
     private async shouldUploadFirstSyncOverSnapshot(packet: Extract<wsPacket, { type: opType.SnapshotReset }>): Promise<boolean> {
@@ -741,8 +753,7 @@ export class SyncClient {
             return;
         }
         const snapshotPaths = new Set(packet.files.map(file => normalizePath(file.path)));
-        const toDelete = [...this.app.vault.getFiles()]
-            .filter(file => this.shouldSyncLocalPath(file.path) && !snapshotPaths.has(normalizePath(file.path)));
+        const toDelete = await this.localPathsMissingFromSnapshot(snapshotPaths);
         const hasPendingChanges = await this.outbox.hasPendingChanges();
         this.log.warn("applying snapshot reset", {
             targetRevision: packet.targetRevision,
@@ -841,15 +852,26 @@ export class SyncClient {
     }
 
     private async deletePathsMissingFromSnapshot(paths: Set<string>): Promise<void> {
-        const files = [...this.app.vault.getFiles()]
-            .filter(file => this.shouldSyncLocalPath(file.path) && !paths.has(normalizePath(file.path)))
-            .sort((a, b) => b.path.length - a.path.length);
-        await this.vaultMutator.runRemoteMutation(files.map(file => file.path), async () => {
-            for (const file of files) {
-                await this.app.fileManager.trashFile(file);
-                await this.stateStore.delete(file.path);
+        const entries = await this.localPathsMissingFromSnapshot(paths);
+        await this.vaultMutator.runRemoteMutation(entries.map(entry => entry.path), async () => {
+            for (const entry of entries) {
+                await this.vaultMutator.deletePath(entry.path);
             }
         });
+    }
+
+    private async localPathsMissingFromSnapshot(paths: Set<string>): Promise<SnapshotPath[]> {
+        return (await this.listSnapshotPaths())
+            .filter(entry => this.shouldSyncLocalPath(entry.path) && !paths.has(normalizePath(entry.path)))
+            .sort((a, b) => {
+                if (a.path.length !== b.path.length) {
+                    return b.path.length - a.path.length;
+                }
+                if (a.isFolder !== b.isFolder) {
+                    return a.isFolder ? 1 : -1;
+                }
+                return b.path.localeCompare(a.path);
+            });
     }
 
     private async readVaultContent(path: string): Promise<string> {
@@ -993,9 +1015,11 @@ export class SyncClient {
                 let storageKind = row.storageKind;
                 let contentSha256 = row.contentSha256;
                 let byteSize = row.byteSize;
+                let blobUploadId = row.blobUploadId;
                 if (row.operation === "UpsertFile" && contentBytes && contentBytes.byteLength > INLINE_BYTES_LIMIT) {
                     contentSha256 = contentSha256 ?? await sha256Hex(contentBytes);
-                    await this.blobClient.upload(row.path, contentBytes, contentSha256);
+                    const upload = await this.blobClient.upload(row.path, contentBytes, contentSha256, this.clientId);
+                    blobUploadId = upload.uploadId;
                     byteSize = contentBytes.byteLength;
                     contentBytes = undefined;
                     storageKind = "lo";
@@ -1011,6 +1035,7 @@ export class SyncClient {
                     isFolder: row.isFolder,
                     isYjs: row.isYjs,
                     storageKind,
+                    blobUploadId,
                     byteSize,
                     contentSha256,
                     created: row.created,

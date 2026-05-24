@@ -9,6 +9,13 @@ type BlobResponse = {
     arrayBuffer: ArrayBuffer;
 };
 
+export type BlobUploadResponse = {
+    uploadId: string;
+    path: string;
+    byteSize: number;
+    contentSha256: string | null;
+};
+
 function toHttpUrl(backendUrl: string): string {
     const url = new URL(backendUrl);
     url.protocol = url.protocol === "wss:" ? "https:" : url.protocol === "ws:" ? "http:" : url.protocol;
@@ -39,19 +46,24 @@ export class BlobClient {
         this.clientKey = clientKey;
     }
 
-    async upload(path: string, bytes: Uint8Array, sha256: string): Promise<void> {
+    async upload(path: string, bytes: Uint8Array, sha256: string, clientId: string): Promise<BlobUploadResponse> {
         log.debug("blob upload request", { path, byteSize: bytes.byteLength, sha256 });
-        let response = await this.uploadOnce(path, bytes, sha256);
+        let response = await this.uploadOnce(path, bytes, sha256, clientId);
         if (response.status === 401 && this.refreshAuth) {
             log.warn("blob upload unauthorized; refreshing auth", { path });
             this.clientKey = await this.refreshAuth();
-            response = await this.uploadOnce(path, bytes, sha256);
+            response = await this.uploadOnce(path, bytes, sha256, clientId);
         }
         if (response.status < 200 || response.status >= 300) {
             log.error("blob upload failed", { path, status: response.status, body: response.text });
             throw new Error(`Blob upload failed for ${path}: ${response.status} ${response.text}`);
         }
-        log.info("blob upload complete", { path, byteSize: bytes.byteLength, sha256 });
+        const upload = JSON.parse(response.text) as BlobUploadResponse;
+        if (!upload.uploadId) {
+            throw new Error(`Blob upload failed for ${path}: response missing uploadId`);
+        }
+        log.info("blob upload complete", { path, uploadId: upload.uploadId, byteSize: bytes.byteLength, sha256 });
+        return upload;
     }
 
     async download(path: string): Promise<Uint8Array> {
@@ -71,7 +83,7 @@ export class BlobClient {
         return bytes;
     }
 
-    private uploadOnce(path: string, bytes: Uint8Array, sha256: string): Promise<BlobResponse> {
+    private uploadOnce(path: string, bytes: Uint8Array, sha256: string, clientId: string): Promise<BlobResponse> {
         return requestUrl({
             url: `${this.baseUrl}/v1/blobs/${encodePathToken(path)}`,
             method: "PUT",
@@ -80,6 +92,7 @@ export class BlobClient {
                 "Authorization": `Bearer ${this.clientKey}`,
                 "Content-Type": "application/octet-stream",
                 "X-Content-Sha256": sha256,
+                "X-Client-Id": clientId,
             },
             body: exactArrayBuffer(bytes),
         }).catch(error => {

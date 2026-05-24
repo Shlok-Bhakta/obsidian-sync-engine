@@ -16,8 +16,10 @@ describe("path policy", () => {
         expect(shouldSyncPath(".obsidian/plugins/obsidian-sync-engine/data.json")).toBe(false);
         expect(shouldSyncPath(".obsidian/plugins/obsidian-sync-engine/yjs-state/notes/test.md.state")).toBe(false);
         expect(shouldSyncPath(".obsidian/plugins/obsidian-sync-engine/outbox/active.jsonl")).toBe(false);
+        expect(shouldSyncPath(".obsidian/plugins/obsidian-sync-engine/bootstrap/manifest.json")).toBe(false);
         expect(isPluginInternalPath(".obsidian/plugins/obsidian-sync-engine/main.js")).toBe(false);
         expect(isPluginInternalPath(".obsidian/plugins/obsidian-sync-engine/data.json")).toBe(true);
+        expect(isPluginInternalPath(".obsidian/plugins/obsidian-sync-engine/bootstrap/manifest.json")).toBe(true);
     });
 
     it("does not sync Obsidian trash", () => {

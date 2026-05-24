@@ -31,6 +31,26 @@ class MemoryYjsStateStore {
 		this.states.set(path, new Uint8Array(state));
 		this.hashes.set(path, hash);
 	}
+
+	async get(path: string): Promise<Uint8Array | null> {
+		return this.states.get(path) ?? null;
+	}
+
+	async has(path: string): Promise<boolean> {
+		return this.states.has(path);
+	}
+
+	async getContentHash(path: string): Promise<string | null> {
+		return this.hashes.get(path) ?? null;
+	}
+
+	async put(path: string, state: Uint8Array): Promise<void> {
+		this.states.set(path, new Uint8Array(state));
+	}
+
+	async putContentHash(path: string, hash: string): Promise<void> {
+		this.hashes.set(path, hash);
+	}
 }
 
 function readYjsContent(state: Uint8Array): string {
@@ -140,6 +160,66 @@ describe("SyncEngine local CRUD enqueueing", () => {
 		expect(outbox.rows[0]?.yjsState).toBeInstanceOf(Uint8Array);
 		expect(readYjsContent(outbox.rows[0]!.yjsState!)).toBe("draft");
 		expect(yjsStateStore.states.get("Notes/new.md")).toEqual(outbox.rows[0]?.yjsState);
+		expect(wakeSoon).toHaveBeenCalledTimes(1);
+	});
+
+	it("rebuilds stale persisted Yjs state when opening a markdown document", async () => {
+		const { plugin, yjsStateStore } = makeHarness();
+		yjsStateStore.states.set("Notes/open.md", new Uint8Array());
+		yjsStateStore.hashes.set("Notes/open.md", "stale-hash");
+
+		await (plugin as unknown as {
+			newDoc: (path: string, content: string) => Promise<unknown>;
+		}).newDoc("Notes/open.md", "current text");
+
+		const stored = yjsStateStore.states.get("Notes/open.md");
+		expect(stored).toBeInstanceOf(Uint8Array);
+		expect(readYjsContent(stored!)).toBe("current text");
+		expect(yjsStateStore.hashes.get("Notes/open.md")).not.toBe("stale-hash");
+	});
+
+	it("queues closed markdown modifies as Yjs updates", async () => {
+		const { plugin, outbox, yjsStateStore, wakeSoon } = makeHarness({
+			"Notes/existing.md": "hello world",
+		});
+		const previous = new Y.Doc();
+		previous.getText(MARKDOWN_FIELD).insert(0, "hello");
+		const previousState = Y.encodeStateAsUpdateV2(previous);
+		previous.destroy();
+		yjsStateStore.states.set("Notes/existing.md", previousState);
+		yjsStateStore.hashes.set("Notes/existing.md", "old-hash");
+
+		await (plugin as unknown as {
+			queueExternalMarkdownChange: (file: TFile) => Promise<void>;
+		}).queueExternalMarkdownChange(makeFile("Notes/existing.md"));
+
+		expect(outbox.rows).toHaveLength(1);
+		expect(outbox.rows[0]).toMatchObject({
+			operation: "YjsUpdate",
+			path: "Notes/existing.md",
+		});
+		expect(outbox.rows[0]?.data).toBeInstanceOf(Uint8Array);
+		expect(readYjsContent(yjsStateStore.states.get("Notes/existing.md")!)).toBe("hello world");
+		expect(wakeSoon).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not enqueue a duplicate closed markdown update when content hash is unchanged", async () => {
+		const { plugin, outbox, wakeSoon } = makeHarness({
+			"Notes/new.md": "draft",
+		});
+		const testPlugin = plugin as unknown as {
+			enqueueLocalCreate: (file: TFile) => Promise<void>;
+			queueExternalMarkdownChange: (file: TFile) => Promise<void>;
+		};
+
+		await testPlugin.enqueueLocalCreate(makeFile("Notes/new.md"));
+		await testPlugin.queueExternalMarkdownChange(makeFile("Notes/new.md"));
+
+		expect(outbox.rows).toHaveLength(1);
+		expect(outbox.rows[0]).toMatchObject({
+			operation: "UpsertFile",
+			path: "Notes/new.md",
+		});
 		expect(wakeSoon).toHaveBeenCalledTimes(1);
 	});
 

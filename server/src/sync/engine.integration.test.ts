@@ -799,6 +799,7 @@ describeIntegration("sync engine postgres integration", () => {
         "Authorization": `Bearer ${auth.clientKey}`,
         "Content-Type": "application/octet-stream",
         "X-Content-Sha256": "sha-over-128mb",
+        "X-Client-Id": CLIENT_A,
       },
       body,
     });
@@ -806,14 +807,17 @@ describeIntegration("sync engine postgres integration", () => {
     expect(response.status).not.toBe(413);
     expect(response.status).toBeGreaterThanOrEqual(200);
     expect(response.status).toBeLessThan(300);
-    const uploaded = await response.json() as { byteSize: number; contentSha256: string };
+    const uploaded = await response.json() as { uploadId: string; byteSize: number; contentSha256: string };
+    expect(uploaded.uploadId.startsWith("blob_")).toBeTrue();
     expect(uploaded.byteSize).toBe(byteSize);
+    expect(await getBlobMetadata(path)).toBeNull();
 
     await acceptMutations(CLIENT_A, [{
       mutationId: crypto.randomUUID(),
       operation: "UpsertFile",
       path,
       storageKind: "lo",
+      blobUploadId: uploaded.uploadId,
       isYjs: false,
       byteSize,
       contentSha256: "sha-over-128mb",
@@ -1015,7 +1019,7 @@ describeIntegration("sync engine postgres integration", () => {
     expect(pull.type).toBe(opType.ChangeBatch);
     if (pull.type === opType.ChangeBatch) {
       const yjsChange = pull.changes.find(change => change.operation === "YjsUpdate");
-      expect(yjsChange?.yjsState).toBeUndefined();
+      expect(yjsChange?.yjsState).toBeInstanceOf(Uint8Array);
       expect(yjsChange?.data).toBeInstanceOf(Uint8Array);
     }
   });

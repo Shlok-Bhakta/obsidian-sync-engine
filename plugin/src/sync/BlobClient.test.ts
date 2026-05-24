@@ -20,11 +20,21 @@ describe("BlobClient", () => {
     it("refreshes auth and retries uploads once after a 401", async () => {
         const requestMock = vi.spyOn(obsidian, "requestUrl")
             .mockResolvedValueOnce(requestResponse(401, "Client key is invalid"))
-            .mockResolvedValueOnce(requestResponse(200, "{}"));
+            .mockResolvedValueOnce(requestResponse(200, JSON.stringify({
+                uploadId: "blob_1",
+                path: "themes/AnuPpuccin/theme.css",
+                byteSize: 3,
+                contentSha256: "sha",
+            })));
         const refreshAuth = vi.fn(async () => "obs_sync_fresh");
         const client = new BlobClient("wss://sync.example.test/worker", "obs_sync_stale", refreshAuth);
 
-        await client.upload("themes/AnuPpuccin/theme.css", new Uint8Array([1, 2, 3]), "sha");
+        await expect(client.upload(
+            "themes/AnuPpuccin/theme.css",
+            new Uint8Array([1, 2, 3]),
+            "sha",
+            "obs_client_1",
+        )).resolves.toMatchObject({ uploadId: "blob_1" });
 
         expect(refreshAuth).toHaveBeenCalledTimes(1);
         expect(requestMock).toHaveBeenCalledTimes(2);
@@ -33,6 +43,7 @@ describe("BlobClient", () => {
         });
         expect((requestMock.mock.calls[0]?.[0] as obsidian.RequestUrlParam).headers).toMatchObject({
             Authorization: "Bearer obs_sync_stale",
+            "X-Client-Id": "obs_client_1",
         });
         expect((requestMock.mock.calls[1]?.[0] as obsidian.RequestUrlParam).headers).toMatchObject({
             Authorization: "Bearer obs_sync_fresh",

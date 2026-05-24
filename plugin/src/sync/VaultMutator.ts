@@ -1,6 +1,8 @@
 import { App, normalizePath, TFile, TFolder } from "obsidian";
 import { YjsStateStore } from "../yjs/YjsStateStore";
 
+type AdapterPathKind = "file" | "folder" | null;
+
 export type RemoteMutationScope = {
     paths?: string[];
     operation: () => Promise<void>;
@@ -33,8 +35,16 @@ export class VaultMutator {
 
     async ensureFolder(path: string): Promise<void> {
         const normalized = normalizePath(path);
-        if (!normalized || await this.app.vault.adapter.exists(normalized)) {
+        if (!normalized) {
             return;
+        }
+        const existingKind = await this.adapterPathKind(normalized);
+        if (existingKind === "folder") {
+            return;
+        }
+        if (existingKind === "file") {
+            await this.deleteAdapterPath(normalized, "file");
+            await this.stateStore.delete(normalized, false);
         }
         const parent = dirname(normalized);
         if (parent) {
@@ -100,23 +110,84 @@ export class VaultMutator {
         const existing = this.app.vault.getAbstractFileByPath(normalized);
         if (existing) {
             await this.app.fileManager.trashFile(existing);
+            await this.stateStore.delete(normalized, existing instanceof TFolder);
+            return;
         }
-        await this.stateStore.delete(normalized, existing instanceof TFolder);
+        const kind = await this.adapterPathKind(normalized);
+        if (kind) {
+            await this.deleteAdapterPath(normalized, kind);
+        }
+        await this.stateStore.delete(normalized, kind === "folder");
     }
 
     async renamePath(fromPath: string, toPath: string): Promise<void> {
         const normalizedFrom = normalizePath(fromPath);
         const normalizedTo = normalizePath(toPath);
         const existing = this.app.vault.getAbstractFileByPath(normalizedFrom);
-        if (!existing) {
+        const adapterKind = existing ? null : await this.adapterPathKind(normalizedFrom);
+        if (!existing && !adapterKind) {
+            await this.stateStore.rename(normalizedFrom, normalizedTo, false);
             return;
         }
         const parent = dirname(normalizedTo);
         if (parent) {
             await this.ensureFolder(parent);
         }
+        if (!existing) {
+            if (await this.app.vault.adapter.exists(normalizedTo)) {
+                const toKind = await this.adapterPathKind(normalizedTo);
+                if (toKind) {
+                    await this.deleteAdapterPath(normalizedTo, toKind);
+                }
+            }
+            await this.app.vault.adapter.rename(normalizedFrom, normalizedTo);
+            await this.stateStore.rename(normalizedFrom, normalizedTo, adapterKind === "folder");
+            return;
+        }
         await this.app.vault.rename(existing, normalizedTo);
         await this.stateStore.rename(normalizedFrom, normalizedTo, existing instanceof TFolder);
+    }
+
+    private async adapterPathKind(path: string): Promise<AdapterPathKind> {
+        if (!(await this.app.vault.adapter.exists(path))) {
+            return null;
+        }
+        try {
+            const stat = await this.app.vault.adapter.stat(path);
+            if (stat?.type === "folder") {
+                return "folder";
+            }
+            if (stat?.type === "file") {
+                return "file";
+            }
+        } catch {
+            // Some adapters throw for stale or partially loaded paths; list() below is the fallback.
+        }
+        try {
+            await this.app.vault.adapter.list(path);
+            return "folder";
+        } catch {
+            return "file";
+        }
+    }
+
+    private async deleteAdapterPath(path: string, kind: Exclude<AdapterPathKind, null>): Promise<void> {
+        if (kind === "folder") {
+            await this.deleteAdapterFolder(path);
+            return;
+        }
+        await this.app.vault.adapter.remove(path);
+    }
+
+    private async deleteAdapterFolder(path: string): Promise<void> {
+        const listed = await this.app.vault.adapter.list(path);
+        for (const file of listed.files) {
+            await this.app.vault.adapter.remove(file);
+        }
+        for (const folder of listed.folders) {
+            await this.deleteAdapterFolder(folder);
+        }
+        await this.app.vault.adapter.rmdir(path, true);
     }
 
     private beginRemote(paths: string[]): void {

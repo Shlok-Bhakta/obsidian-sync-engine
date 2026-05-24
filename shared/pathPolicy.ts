@@ -25,6 +25,9 @@ export function isPluginInternalPath(
     if (path === `${prefix}/outbox` || path.startsWith(`${prefix}/outbox/`)) {
         return true;
     }
+    if (path === `${prefix}/bootstrap` || path.startsWith(`${prefix}/bootstrap/`)) {
+        return true;
+    }
     return false;
 }
 

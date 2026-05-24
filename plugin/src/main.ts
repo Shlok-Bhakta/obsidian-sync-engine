@@ -121,6 +121,9 @@ export default class SyncEngine extends Plugin {
 			this.app,
 			this.yjsStateStore,
 			(path) => !shouldUseYjs(path, this.app.vault.configDir) || this.isPluginInternalPath(path),
+			async (change) => {
+				await this.queueIndexedMarkdownChange(change.path, change.content, change.yjsState);
+			},
 		);
 		this.syncClient = new SyncClient(
 			this.app,
@@ -175,7 +178,10 @@ export default class SyncEngine extends Plugin {
 		}));
 		this.registerEvent(this.app.vault.on("modify", file => {
 			log.debug("vault modify event", { path: file.path, type: file instanceof TFolder ? "folder" : "file" });
-			void this.ensureYjsStateForExternalMarkdown(file);
+			void this.queueExternalMarkdownChange(file).catch(error => {
+				log.error("failed to enqueue markdown modify", { path: file.path, ...errorContext(error) });
+				new Notice(`Sync outbox write failed: ${errorMessage(error)}`);
+			});
 			void this.queueNonMarkdownUpsert(file);
 		}));
 		this.registerEvent(this.app.vault.on("delete", file => {
@@ -274,13 +280,15 @@ export default class SyncEngine extends Plugin {
 	}
 
 	private async newDoc(pathID: Path, initialContent: string): Promise<DocSync> {
+		const contentHash = await sha256Hex(new TextEncoder().encode(initialContent));
+		const cachedHash = await this.yjsStateStore.getContentHash(pathID);
 		let initialState = await this.yjsStateStore.get(pathID);
-		if (!initialState) {
+		if (!initialState || cachedHash !== contentHash) {
 			initialState = docStateFromContent(initialContent, Y);
 			await this.yjsStateStore.putWithContentHash(
 				pathID,
 				initialState,
-				await sha256Hex(new TextEncoder().encode(initialContent)),
+				contentHash,
 			);
 			log.debug("seeded Yjs state for open document", { path: pathID, chars: initialContent.length });
 		}
@@ -445,14 +453,71 @@ export default class SyncEngine extends Plugin {
 		this.yjsIndexer.start();
 	}
 
-	private async ensureYjsStateForExternalMarkdown(file: TAbstractFile): Promise<void> {
+	private async queueExternalMarkdownChange(file: TAbstractFile): Promise<void> {
 		if (!(file instanceof TFile) || file.extension !== "md") {
 			return;
 		}
 		if (this.docs.has(file.path) || this.pendingDocs.has(file.path)) {
 			return;
 		}
-		await this.yjsIndexer.ensureFile(file);
+		if (this.syncClient?.isApplyingRemoteChanges(file.path) || !this.shouldSyncLocalPath(file.path)) {
+			return;
+		}
+		const previousState = await this.yjsStateStore.get(file.path);
+		const content = await this.app.vault.read(file);
+		const contentHash = await sha256Hex(new TextEncoder().encode(content));
+		if (previousState && await this.yjsStateStore.getContentHash(file.path) === contentHash) {
+			return;
+		}
+		const nextState = docStateFromContent(content, Y);
+		await this.yjsStateStore.putWithContentHash(
+			file.path,
+			nextState,
+			contentHash,
+		);
+		await this.queueIndexedMarkdownChange(file.path, content, nextState, previousState);
+	}
+
+	private async queueIndexedMarkdownChange(
+		path: string,
+		content: string,
+		yjsState: Uint8Array,
+		previousState: Uint8Array | null = null,
+	): Promise<void> {
+		if (this.syncClient?.isApplyingRemoteChanges(path) || !this.shouldSyncLocalPath(path)) {
+			return;
+		}
+		if (this.docs.has(path) || this.pendingDocs.has(path)) {
+			return;
+		}
+		if (previousState) {
+			const data = Y.diffUpdateV2(yjsState, Y.encodeStateVectorFromUpdateV2(previousState));
+			if (data.byteLength === 0) {
+				return;
+			}
+			await this.db.putInOutbox({
+				mutationId: crypto.randomUUID(),
+				operation: "YjsUpdate",
+				path,
+				data,
+				created: Date.now(),
+			});
+			log.info("queued closed markdown Yjs update", { path, bytes: data.byteLength });
+		} else {
+			await this.db.putInOutbox({
+				mutationId: crypto.randomUUID(),
+				operation: "UpsertFile",
+				path,
+				content,
+				yjsState,
+				isFolder: false,
+				isYjs: true,
+				storageKind: "text",
+				created: Date.now(),
+			});
+			log.info("queued closed markdown upsert", { path, chars: content.length });
+		}
+		this.syncClient.wakeSoon();
 	}
 
 	private async enqueueLocalPathDelete(path: string): Promise<void> {
@@ -671,6 +736,7 @@ export default class SyncEngine extends Plugin {
 				isFolder: false,
 				isYjs: false,
 				storageKind: "lo",
+				blobUploadId: metadata.blobUploadId,
 				byteSize: metadata.byteSize,
 				contentSha256: metadata.contentSha256,
 				created: Date.now(),

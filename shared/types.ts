@@ -21,6 +21,7 @@ export type SyncMutation = {
     isFolder?: boolean;
     isYjs?: boolean;
     storageKind?: "text" | "bytea" | "lo";
+    blobUploadId?: string;
     byteSize?: number;
     contentSha256?: string;
     created: number;

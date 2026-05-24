@@ -73,8 +73,39 @@ class MemoryYjsStateStore {
         this.states.set(path, new Uint8Array(state));
     }
 
+    async putWithContentHash(path: string, state: Uint8Array, hash: string): Promise<void> {
+        this.states.set(path, new Uint8Array(state));
+        this.hashes.set(path, hash);
+    }
+
+    async has(path: string): Promise<boolean> {
+        return this.states.has(path);
+    }
+
+    async getContentHash(path: string): Promise<string | null> {
+        return this.hashes.get(path) ?? null;
+    }
+
     async putContentHash(path: string, hash: string): Promise<void> {
         this.hashes.set(path, hash);
+    }
+
+    async delete(path: string): Promise<void> {
+        this.states.delete(path);
+        this.hashes.delete(path);
+    }
+
+    async rename(fromPath: string, toPath: string): Promise<void> {
+        const state = this.states.get(fromPath);
+        if (state) {
+            this.states.set(toPath, state);
+            this.states.delete(fromPath);
+        }
+        const hash = this.hashes.get(fromPath);
+        if (hash) {
+            this.hashes.set(toPath, hash);
+            this.hashes.delete(fromPath);
+        }
     }
 }
 
@@ -290,6 +321,49 @@ describe("SyncClient initial snapshot", () => {
         expect(note?.yjsState).toBeInstanceOf(Uint8Array);
         expect(readYjsContent(note!.yjsState!)).toBe("existing note");
         expect(stateStore.states.get("notes/existing.md")).toEqual(note?.yjsState);
+    });
+
+    it("rebuilds stale markdown yjsState while building an initial snapshot", async () => {
+        const staleState = docStateFromContent("old note", Y);
+        const stateStore = new MemoryYjsStateStore();
+        stateStore.states.set("notes/existing.md", staleState);
+        stateStore.hashes.set("notes/existing.md", "old-hash");
+        const { client } = await makeClient({
+            "notes/existing.md": "new note",
+        }, stateStore);
+
+        const changes = await (client as unknown as { readVaultSnapshot: () => Promise<outboxData[]> }).readVaultSnapshot();
+        const note = changes.find(change => change.path === "notes/existing.md");
+
+        expect(readYjsContent(note!.yjsState!)).toBe("new note");
+        expect(readYjsContent(stateStore.states.get("notes/existing.md")!)).toBe("new note");
+        expect(stateStore.hashes.get("notes/existing.md")).not.toBe("old-hash");
+    });
+
+    it("includes staged blob upload ids for large files in an initial snapshot", async () => {
+        const bytes = new Uint8Array((64 * 1024) + 1);
+        const { client } = await makeClient({
+            "assets/large.pdf": bytes,
+        });
+        const upload = vi.fn(async () => ({
+            uploadId: "blob_initial",
+            path: "assets/large.pdf",
+            byteSize: bytes.byteLength,
+            contentSha256: "sha-large",
+        }));
+        (client as unknown as { blobClient: { upload: typeof upload } }).blobClient.upload = upload;
+
+        const changes = await (client as unknown as { readVaultSnapshot: () => Promise<outboxData[]> }).readVaultSnapshot();
+        const large = changes.find(change => change.path === "assets/large.pdf");
+
+        expect(upload).toHaveBeenCalledWith("assets/large.pdf", bytes, expect.any(String), "client");
+        expect(large).toMatchObject({
+            operation: "UpsertFile",
+            storageKind: "lo",
+            blobUploadId: "blob_initial",
+            byteSize: bytes.byteLength,
+        });
+        expect(large?.contentBytes).toBeUndefined();
     });
 
     it("discovers initial vault files from the adapter when they are not loaded yet", async () => {

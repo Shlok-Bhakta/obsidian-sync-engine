@@ -11,6 +11,7 @@ import {
 } from "../yjs/apply";
 import { createLargeObject, readLargeObject, readLargeObjectRange, unlinkLargeObject } from "../db/largeObject";
 import { log } from "../logger";
+import { consumeStagedBlob, StagedBlobUpload } from "./blobUpload";
 
 export type CompactionConfig = {
   count: number;
@@ -305,12 +306,13 @@ export async function changeBatchPacket(fromRevision: string): Promise<Extract<w
       e.byte_size::TEXT AS "byteSize",
       e.content_sha256 AS "contentSha256",
       e.payload,
-      NULL::BYTEA AS "yjsState",
+      f.yjs_state AS "yjsState",
       e.compacted,
       e.is_folder AS "isFolder",
       e.is_yjs AS "isYjs",
       EXTRACT(EPOCH FROM e.created_at) * 1000 AS "createdAt"
     FROM sync_events e
+    LEFT JOIN files f ON f.path = e.path
     WHERE e.revision > ${fromRevision}
     ORDER BY e.revision ASC
     LIMIT ${CHANGE_BATCH_ROW_LIMIT};
@@ -384,35 +386,37 @@ export async function applyMutation(tx: typeof sql, clientId: string, mutation: 
     return existing[0].revision;
   }
 
-  if (
-    mutation.operation === "UpsertFile"
-    && mutation.storageKind === "lo"
-    && !mutation.contentBytes
-  ) {
-    const existingFile = await tx<{ contentOid: number | null }[]>`
-      SELECT content_oid AS "contentOid"
-      FROM files
-      WHERE path = ${mutation.path}
-      FOR UPDATE;
-    `;
-    if (!existingFile[0]?.contentOid) {
-      const current = await tx<RevisionRow[]>`
-        SELECT GREATEST(
-          COALESCE((SELECT MAX(revision) FROM sync_events), 0),
-          COALESCE((SELECT MAX(revision) FROM files), 0)
-        )::TEXT AS revision;
-      `;
-      const revision = latestRevisionFromRows(current);
-      log.warn("skipping large object metadata mutation without uploaded blob content", {
+  let stagedBlob: StagedBlobUpload | null = null;
+  if (mutation.operation === "UpsertFile" && mutation.storageKind === "lo" && mutation.blobUploadId) {
+    stagedBlob = await consumeStagedBlob(tx, clientId, mutation.blobUploadId, mutation.path);
+    if (!stagedBlob) {
+      log.warn("large object metadata mutation referenced missing staged blob", {
         clientId,
         mutationId: mutation.mutationId,
         path: mutation.path,
-        byteSize: mutation.byteSize,
-        contentSha256: mutation.contentSha256,
-        revision,
+        blobUploadId: mutation.blobUploadId,
       });
-      return revision;
     }
+  }
+
+  if (mutation.operation === "UpsertFile" && mutation.storageKind === "lo" && !mutation.contentBytes && !stagedBlob) {
+    const current = await tx<RevisionRow[]>`
+      SELECT GREATEST(
+        COALESCE((SELECT MAX(revision) FROM sync_events), 0),
+        COALESCE((SELECT MAX(revision) FROM files), 0)
+      )::TEXT AS revision;
+    `;
+    const revision = latestRevisionFromRows(current);
+    log.warn("skipping large object metadata mutation without uploaded blob content", {
+      clientId,
+      mutationId: mutation.mutationId,
+      path: mutation.path,
+      byteSize: mutation.byteSize,
+      contentSha256: mutation.contentSha256,
+      blobUploadId: mutation.blobUploadId,
+      revision,
+    });
+    return revision;
   }
 
   const inserted = await tx<RevisionRow[]>`
@@ -496,9 +500,13 @@ export async function applyMutation(tx: typeof sql, clientId: string, mutation: 
       FOR UPDATE;
     `;
     const previousOid = existingFile[0]?.contentOid ?? null;
-    const contentOid = storageKind === "lo" && mutation.contentBytes
-      ? (await createLargeObject(mutation.contentBytes, tx)).oid
+    const contentOid = storageKind === "lo"
+      ? stagedBlob?.contentOid ?? (mutation.contentBytes ? (await createLargeObject(mutation.contentBytes, tx)).oid : null)
       : null;
+    const byteSize = storageKind === "lo"
+      ? stagedBlob?.byteSize ?? mutation.byteSize ?? mutation.contentBytes?.byteLength ?? null
+      : mutation.byteSize ?? (mutation.contentBytes?.byteLength ?? (mutation.content ? new TextEncoder().encode(mutation.content).byteLength : null));
+    const contentSha256 = stagedBlob?.contentSha256 ?? mutation.contentSha256 ?? null;
     if (previousOid && (storageKind !== "lo" || contentOid)) {
       await unlinkLargeObject(previousOid, tx);
     }
@@ -524,8 +532,8 @@ export async function applyMutation(tx: typeof sql, clientId: string, mutation: 
         ${storageKind === "bytea" ? mutation.contentBytes ?? null : null},
         ${contentOid},
         ${storageKind},
-        ${mutation.byteSize ?? (mutation.contentBytes?.byteLength ?? (mutation.content ? new TextEncoder().encode(mutation.content).byteLength : null))},
-        ${mutation.contentSha256 ?? null},
+        ${byteSize},
+        ${contentSha256},
         ${yjsState},
         FALSE,
         ${isYjs},

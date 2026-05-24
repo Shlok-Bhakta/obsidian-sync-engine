@@ -17,10 +17,10 @@ import {
   getServerRevision,
   handleDocSync,
   handlePull,
-  putBlobFile,
   registerClient,
   streamBlobFile,
 } from "./sync/engine";
+import { stageBlobFile } from "./sync/blobUpload";
 
 await bootstrapDB();
 
@@ -272,18 +272,22 @@ app.put("/v1/blobs/:path", async c => {
   if (!body) {
     return c.text("Blob body is required", 400);
   }
-  const metadata = await putBlobFile(path, body, c.req.header("X-Content-Sha256") ?? null);
-  log.info("blob uploaded", {
+  const clientId = c.req.header("X-Client-Id");
+  if (!clientId) {
+    return c.text("X-Client-Id is required", 400);
+  }
+  const upload = await stageBlobFile(clientId, path, body, c.req.header("X-Content-Sha256") ?? null);
+  log.info("blob staged", {
     path,
-    byteSize: metadata.byteSize,
-    contentSha256: metadata.contentSha256,
-    revision: metadata.revision,
+    uploadId: upload.uploadId,
+    byteSize: upload.byteSize,
+    contentSha256: upload.contentSha256,
   });
   return c.json({
-    path: metadata.path,
-    byteSize: metadata.byteSize,
-    contentSha256: metadata.contentSha256,
-    revision: metadata.revision,
+    uploadId: upload.uploadId,
+    path: upload.path,
+    byteSize: upload.byteSize,
+    contentSha256: upload.contentSha256,
   });
 });
 

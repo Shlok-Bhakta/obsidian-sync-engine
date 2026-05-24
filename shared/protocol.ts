@@ -287,6 +287,7 @@ export function decodeUpdateBatchJsonl(jsonl: string): SyncMutation[] {
             isFolder: row.isFolder,
             isYjs: row.isYjs,
             storageKind: row.storageKind,
+            blobUploadId: row.blobUploadId,
             byteSize: row.byteSize,
             contentSha256: row.contentSha256,
             content: row.content,

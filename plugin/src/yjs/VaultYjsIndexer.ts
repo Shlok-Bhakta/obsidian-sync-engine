@@ -7,6 +7,13 @@ import { log } from "../logger";
 
 const BATCH_SIZE = 25;
 
+export type IndexedMarkdownChange = {
+    path: string;
+    content: string;
+    yjsState: Uint8Array;
+    contentHash: string;
+};
+
 function sleep(ms: number): Promise<void> {
     return new Promise(resolve => window.setTimeout(resolve, ms));
 }
@@ -28,6 +35,7 @@ export class VaultYjsIndexer {
         private readonly app: App,
         private readonly store: YjsStateStore,
         private readonly shouldIgnorePath: (path: string) => boolean,
+        private readonly onIndexedChange: (change: IndexedMarkdownChange) => Promise<void> = async () => {},
     ) {}
 
     start(): void {
@@ -57,8 +65,9 @@ export class VaultYjsIndexer {
         if (cachedHash === contentHash && await this.store.has(file.path)) {
             return;
         }
-        await this.store.put(file.path, docStateFromContent(content, Y));
-        await this.store.putContentHash(file.path, contentHash);
+        const yjsState = docStateFromContent(content, Y);
+        await this.store.putWithContentHash(file.path, yjsState, contentHash);
+        await this.onIndexedChange({ path: file.path, content, yjsState, contentHash });
         log.debug("indexed Yjs state", { path: file.path, chars: content.length });
     }
 

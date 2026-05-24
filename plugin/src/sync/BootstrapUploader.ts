@@ -117,12 +117,13 @@ export class BootstrapUploader {
                 const content = loaded instanceof TFile
                     ? await this.app.vault.read(loaded)
                     : await this.app.vault.adapter.read(entry.path);
+                const contentHash = await sha256Hex(new TextEncoder().encode(content));
+                const cachedHash = await this.stateStore.getContentHash(entry.path);
                 let yjsState = await this.stateStore.get(entry.path);
-                if (!yjsState) {
+                if (!yjsState || cachedHash !== contentHash) {
                     yjsState = docStateFromContent(content, Y);
-                    await this.stateStore.put(entry.path, yjsState);
+                    await this.stateStore.putWithContentHash(entry.path, yjsState, contentHash);
                 }
-                await this.stateStore.putContentHash(entry.path, await sha256Hex(new TextEncoder().encode(content)));
                 changes.push({
                     mutationId: crypto.randomUUID(),
                     operation: "UpsertFile",
