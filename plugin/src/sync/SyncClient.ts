@@ -1,7 +1,7 @@
 import { App, Notice, TFile, TFolder, normalizePath } from "obsidian";
 import * as Y from "yjs";
 import { OutboxSegment, OutboxStore } from "db/db";
-import { BootstrapStatus, opType, ServerChange, SyncMutation, wsPacket } from "../../../shared/types";
+import { BootstrapStatus, EditorPresence, EditorPresencePosition, opType, ServerChange, SyncMutation, wsPacket } from "../../../shared/types";
 import { decodePacket, encodePacket, encodeUpdateBatchJsonl, PROTOCOL_VERSION } from "../../../shared/protocol";
 import { docStateFromContent, MARKDOWN_FIELD } from "../../../shared/yjsSeed";
 import { buildUploadFromSyncedDoc, shouldApplyDocSyncCatchUp } from "../../../shared/yjsUpload";
@@ -65,6 +65,13 @@ function remoteChangePaths(change: ServerChange): string[] {
     return change.toPath ? [change.path, change.toPath] : [change.path];
 }
 
+function copyEditorPresencePosition(position: EditorPresencePosition): EditorPresencePosition {
+    return {
+        line: position.line,
+        ch: position.ch,
+    };
+}
+
 type SnapshotPath = {
     path: string;
     isFolder: boolean;
@@ -81,7 +88,6 @@ export class SyncClient {
     private clientId: string;
     private clientKey: string;
     private clientName: string;
-    private syncConfigDir: boolean;
     private lastPulledRevision: string;
     private lastUploadedRevisionHint: string;
     private draining = false;
@@ -121,15 +127,18 @@ export class SyncClient {
         private readonly onBootstrapStatus: (status: BootstrapStatus) => void = () => {},
         private readonly onStartupSynced: () => void = () => {},
         private readonly onRemoteConfigApplied: (path: string, bytes: Uint8Array) => void = () => {},
+        private readonly onRemotePluginFilesChanged: () => void = () => {},
         private readonly onOpenYjsContent: (path: string, content: string) => Promise<boolean> = async () => false,
         private readonly flushOpenYjsChanges: (path: string) => Promise<void> = async () => {},
+        private readonly onEditorPresence: (presence: EditorPresence) => void = () => {},
+        private readonly onEditorPresenceDisconnect: (clientId: string) => void = () => {},
+        private readonly onEditorPresenceReset: () => void = () => {},
         private readonly pluginId = "obsidian-sync-engine",
     ) {
         this.serverUrl = toWebSocketUrl(settings.backendUrl);
         this.clientId = settings.clientId;
         this.clientKey = settings.clientKey;
         this.clientName = settings.clientName;
-        this.syncConfigDir = settings.syncConfigDir;
         this.lastPulledRevision = settings.lastPulledRevision;
         this.lastUploadedRevisionHint = settings.lastPulledRevision;
         this.blobClient = new BlobClient(settings.backendUrl, settings.clientKey, () => this.refreshBlobAuth());
@@ -168,8 +177,6 @@ export class SyncClient {
         const configDir = this.app.vault.configDir.replace(/^\/+|\/+$/g, "");
         const normalized = normalizePath(path);
         return (
-            this.syncConfigDir
-            &&
             (normalized === configDir || normalized.startsWith(`${configDir}/`))
             && shouldSyncPath(normalized, this.app.vault.configDir, this.pluginId)
             && !shouldUseYjs(normalized, this.app.vault.configDir)
@@ -177,11 +184,14 @@ export class SyncClient {
     }
 
     private shouldSyncLocalPath(path: string): boolean {
+        const normalized = normalizePath(path);
+        return shouldSyncPath(normalized, this.app.vault.configDir, this.pluginId);
+    }
+
+    private isPluginConfigPath(path: string): boolean {
         const configDir = this.app.vault.configDir.replace(/^\/+|\/+$/g, "");
         const normalized = normalizePath(path);
-        const isConfigPath = normalized === configDir || normalized.startsWith(`${configDir}/`);
-        return shouldSyncPath(normalized, this.app.vault.configDir, this.pluginId)
-            && (this.syncConfigDir || !isConfigPath);
+        return normalized === `${configDir}/plugins` || normalized.startsWith(`${configDir}/plugins/`);
     }
 
     start(): void {
@@ -235,7 +245,6 @@ export class SyncClient {
         this.clientId = settings.clientId;
         this.clientKey = settings.clientKey;
         this.clientName = settings.clientName;
-        this.syncConfigDir = settings.syncConfigDir;
         this.lastPulledRevision = settings.lastPulledRevision;
         this.lastUploadedRevisionHint = settings.lastPulledRevision;
         this.blobClient.update(settings.backendUrl, settings.clientKey);
@@ -261,6 +270,32 @@ export class SyncClient {
         this.log.debug("uploading blob", { path, byteSize: bytes.byteLength, contentSha256 });
         const upload = await this.blobClient.upload(path, bytes, contentSha256, this.clientId);
         return { blobUploadId: upload.uploadId, byteSize: bytes.byteLength, contentSha256 };
+    }
+
+    sendEditorPresence(
+        path: string,
+        positions: Pick<EditorPresence, "from" | "to" | "head" | "anchor">,
+        color: string,
+    ): void {
+        const ws = this.ws;
+        if (!ws || ws.readyState !== WebSocket.OPEN || !this.authenticated) {
+            return;
+        }
+        try {
+            ws.send(encodePacket({
+                type: opType.EditorPresenceUpdate,
+                clientId: this.clientId,
+                clientName: this.clientName,
+                path,
+                from: copyEditorPresencePosition(positions.from),
+                to: copyEditorPresencePosition(positions.to),
+                head: copyEditorPresencePosition(positions.head),
+                anchor: copyEditorPresencePosition(positions.anchor),
+                color,
+            }));
+        } catch (error) {
+            this.log.warn("failed to send editor presence", { path, ...errorContext(error) });
+        }
     }
 
     async generateBootstrapLink(vaultName: string, configDir: string, pluginId: string): Promise<void> {
@@ -692,9 +727,7 @@ export class SyncClient {
             });
         }
         await this.addAdapterPaths("", byPath);
-        if (this.syncConfigDir) {
-            await this.addAdapterPaths(this.app.vault.configDir, byPath);
-        }
+        await this.addAdapterPaths(this.app.vault.configDir, byPath);
         return [...byPath.values()].sort((a, b) => {
             if (a.isFolder !== b.isFolder) {
                 return a.isFolder ? -1 : 1;
@@ -762,6 +795,7 @@ export class SyncClient {
             hasPendingChanges,
         });
         const isFirstSync = this.lastPulledRevision === "0";
+        let removedPluginFiles = false;
         if (toDelete.length > 0 && (hasPendingChanges || isFirstSync)) {
             const reason = isFirstSync ? "during first sync" : "while pending changes upload";
             new Notice(`Sync snapshot reset: preserving ${toDelete.length} local file(s) ${reason}`);
@@ -771,15 +805,20 @@ export class SyncClient {
                 reason,
             });
         } else if (toDelete.length > 0) {
+            removedPluginFiles = toDelete.some(entry => this.isPluginConfigPath(entry.path));
             new Notice(`Sync snapshot reset: removing ${toDelete.length} local file(s) not on server`);
             await this.deletePathsMissingFromSnapshot(snapshotPaths);
         }
-        await this.applyServerChanges(packet.files);
+        const appliedPluginFiles = await this.applyServerChanges(packet.files);
+        if (removedPluginFiles && !appliedPluginFiles) {
+            this.onRemotePluginFilesChanged();
+        }
         await this.persistLastPulledRevision(packet.targetRevision);
     }
 
-    private async applyServerChanges(changes: ServerChange[]): Promise<void> {
+    private async applyServerChanges(changes: ServerChange[]): Promise<boolean> {
         this.applyingRemote = true;
+        let remotePluginFilesChanged = false;
         try {
             for (const change of changes) {
                 if (
@@ -811,6 +850,7 @@ export class SyncClient {
                     });
                     continue;
                 }
+                const changePaths = remoteChangePaths(change);
                 await this.vaultMutator.runRemoteMutation(remoteChangePaths(change), async () => {
                     if (change.operation === "CreateFolder") {
                         await this.vaultMutator.ensureFolder(change.path);
@@ -845,10 +885,17 @@ export class SyncClient {
                         }
                     }
                 });
+                if (changePaths.some(path => this.isPluginConfigPath(path))) {
+                    remotePluginFilesChanged = true;
+                }
             }
         } finally {
             this.applyingRemote = false;
         }
+        if (remotePluginFilesChanged) {
+            this.onRemotePluginFilesChanged();
+        }
+        return remotePluginFilesChanged;
     }
 
     private async deletePathsMissingFromSnapshot(paths: Set<string>): Promise<void> {
@@ -1265,6 +1312,7 @@ export class SyncClient {
                 this.startupSynced = false;
                 this.connectSoon();
             }
+            this.onEditorPresenceReset();
             this.log.debug("websocket closed");
         });
         nextWs.addEventListener("message", event => {
@@ -1272,6 +1320,16 @@ export class SyncClient {
                 const msg = decodePacket(readSocketMessage(event));
                 if (msg.type === opType.BootstrapStatus) {
                     this.onBootstrapStatus(msg);
+                    return;
+                }
+                if (msg.type === opType.EditorPresenceUpdate) {
+                    if (msg.clientId !== this.clientId) {
+                        this.onEditorPresence(msg);
+                    }
+                    return;
+                }
+                if (msg.type === opType.EditorPresenceDisconnect) {
+                    this.onEditorPresenceDisconnect(msg.clientId);
                     return;
                 }
                 if (msg.type === opType.ChangeBatch || msg.type === opType.SnapshotReset) {

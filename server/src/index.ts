@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { upgradeWebSocket, websocket } from "hono/bun";
-import { BootstrapStatus, opType, wsPacket } from "../../shared/types";
+import { BootstrapStatus, EditorPresence, opType, wsPacket } from "../../shared/types";
 import { decodePacket, decodePathToken, decodeUpdateBatchJsonl, encodePacket, PROTOCOL_VERSION } from "../../shared/protocol";
 import { buildBootstrapZip, BootstrapBuildResult } from "./bootstrap";
 import { putBootstrapBlob } from "./sync/bootstrapBlobUpload";
@@ -488,6 +488,7 @@ function evictDuplicateClientConnection(client: Client): void {
     if (existing === client || existing.clientId !== client.clientId) {
       continue;
     }
+    broadcastPresenceDisconnect(existing);
     authenticatedClients.delete(existing);
     if (existing.socket) {
       authenticatedSockets.delete(existing.socket);
@@ -531,6 +532,53 @@ async function pushChangesToOtherClients(sender: Client, revision: string): Prom
     pushes.push(target.pushPromise);
   }
   await Promise.all(pushes);
+}
+
+function broadcastToOtherClients(sender: Client, packet: wsPacket): void {
+  const encoded = encodePacket(packet);
+  for (const target of authenticatedClients) {
+    if (target === sender || !target.socket || !target.isAuthenticated) {
+      continue;
+    }
+    try {
+      target.socket.send(encoded);
+    } catch (error) {
+      log.error("failed to broadcast websocket packet", {
+        packetType: packet.type,
+        senderClientId: sender.clientId,
+        targetClientId: target.clientId,
+        targetClientName: target.clientName,
+        ...errorContext(error),
+      });
+    }
+  }
+}
+
+function broadcastPresenceUpdate(sender: Client, data: Extract<wsPacket, { type: opType.EditorPresenceUpdate }>): void {
+  const presence: EditorPresence = {
+    clientId: sender.clientId,
+    clientName: sender.clientName,
+    path: data.path,
+    from: data.from,
+    to: data.to,
+    head: data.head,
+    anchor: data.anchor,
+    color: data.color,
+  };
+  broadcastToOtherClients(sender, {
+    type: opType.EditorPresenceUpdate,
+    ...presence,
+  });
+}
+
+function broadcastPresenceDisconnect(sender: Client): void {
+  if (!sender.clientId) {
+    return;
+  }
+  broadcastToOtherClients(sender, {
+    type: opType.EditorPresenceDisconnect,
+    clientId: sender.clientId,
+  });
 }
 
 app.get(
@@ -694,6 +742,11 @@ app.get(
           return;
         }
 
+        if (data.type === opType.EditorPresenceUpdate) {
+          broadcastPresenceUpdate(client, data);
+          return;
+        }
+
         if (data.type === opType.UpdateBatch) {
           log.info("update batch received", {
             clientId: client.clientId,
@@ -792,6 +845,9 @@ app.get(
         }
       },
       onClose: () => {
+        if (client.isAuthenticated) {
+          broadcastPresenceDisconnect(client);
+        }
         if (client.socket) {
           authenticatedSockets.delete(client.socket);
         }

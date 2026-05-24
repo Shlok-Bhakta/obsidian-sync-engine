@@ -4,7 +4,7 @@ import {DEFAULT_SETTINGS, SyncEngineSettings, SyncEngineSettingTab} from "./sett
 import { JsonlOutboxStore, OutboxStore } from 'db/db';
 import { EditorView, ViewUpdate } from "@codemirror/view";
 import { EditorSelection } from "@codemirror/state";
-import { BootstrapStatus, outboxData, Path } from "../../shared/types";
+import { BootstrapStatus, EditorPresence, EditorPresencePosition, outboxData, Path } from "../../shared/types";
 import { DocSync } from 'yjs/DocSync';
 import { SyncClient } from 'sync/SyncClient';
 import { editorViewFor, fileForEditorView } from 'utils/editorFile';
@@ -18,6 +18,14 @@ import { log } from "./logger";
 const INLINE_BYTES_LIMIT = 16 * 1024;
 const CONFIG_DIR_POLL_MS = Platform.isMobile ? 30_000 : 2000;
 type ConfigDirScanMode = "baseline" | "enqueue";
+type RemoteEditorPresence = EditorPresence & {
+	updatedAt: number;
+};
+type PresenceLayer = {
+	el: HTMLElement;
+	view: EditorView;
+	scrollHandler: () => void;
+};
 
 function generateClientId(): string {
 	return "obs_client_" + crypto.randomUUID();
@@ -66,6 +74,110 @@ function mapPositionThroughReplacement(position: number, from: number, to: numbe
 	return from + insertLength;
 }
 
+function parseRgb(value: string): { r: number; g: number; b: number } | null {
+	const hex = value.trim().match(/^#([0-9a-f]{3}|[0-9a-f]{6})$/i);
+	if (hex) {
+		const raw = hex[1] ?? "";
+		const full = raw.length === 3 ? raw.split("").map(char => char + char).join("") : raw;
+		return {
+			r: Number.parseInt(full.slice(0, 2), 16),
+			g: Number.parseInt(full.slice(2, 4), 16),
+			b: Number.parseInt(full.slice(4, 6), 16),
+		};
+	}
+	const rgb = value.match(/rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)/i);
+	if (!rgb) {
+		return null;
+	}
+	return {
+		r: Math.max(0, Math.min(255, Number(rgb[1]))),
+		g: Math.max(0, Math.min(255, Number(rgb[2]))),
+		b: Math.max(0, Math.min(255, Number(rgb[3]))),
+	};
+}
+
+function resolveCssColor(value: string): { r: number; g: number; b: number } | null {
+	if (typeof document === "undefined") {
+		return null;
+	}
+	const probe = document.createElement("span");
+	probe.style.color = value;
+	document.body.appendChild(probe);
+	const resolved = getComputedStyle(probe).color;
+	probe.remove();
+	return parseRgb(resolved);
+}
+
+function rgbToHsl({ r, g, b }: { r: number; g: number; b: number }): { h: number; s: number; l: number } {
+	const red = r / 255;
+	const green = g / 255;
+	const blue = b / 255;
+	const max = Math.max(red, green, blue);
+	const min = Math.min(red, green, blue);
+	const l = (max + min) / 2;
+	if (max === min) {
+		return { h: 0, s: 0, l };
+	}
+	const delta = max - min;
+	const s = l > 0.5 ? delta / (2 - max - min) : delta / (max + min);
+	const h = max === red
+		? (green - blue) / delta + (green < blue ? 6 : 0)
+		: max === green
+			? (blue - red) / delta + 2
+			: (red - green) / delta + 4;
+	return { h: h * 60, s, l };
+}
+
+function hslToRgb(h: number, s: number, l: number): { r: number; g: number; b: number } {
+	const chroma = (1 - Math.abs(2 * l - 1)) * s;
+	const x = chroma * (1 - Math.abs((h / 60) % 2 - 1));
+	const m = l - chroma / 2;
+	const [red, green, blue] =
+		h < 60 ? [chroma, x, 0] :
+		h < 120 ? [x, chroma, 0] :
+		h < 180 ? [0, chroma, x] :
+		h < 240 ? [0, x, chroma] :
+		h < 300 ? [x, 0, chroma] :
+		[chroma, 0, x];
+	return {
+		r: Math.round((red + m) * 255),
+		g: Math.round((green + m) * 255),
+		b: Math.round((blue + m) * 255),
+	};
+}
+
+function rgbToHex({ r, g, b }: { r: number; g: number; b: number }): string {
+	return `#${[r, g, b].map(channel => channel.toString(16).padStart(2, "0")).join("")}`;
+}
+
+function hashString(value: string): number {
+	let hash = 2166136261;
+	for (let index = 0; index < value.length; index++) {
+		hash ^= value.charCodeAt(index);
+		hash = Math.imul(hash, 16777619);
+	}
+	return hash >>> 0;
+}
+
+function presenceColorForName(clientName: string): string {
+	const accentValue = getComputedStyle(document.body).getPropertyValue("--interactive-accent").trim();
+	const accent = resolveCssColor(accentValue || "rgb(124, 58, 237)") ?? { r: 124, g: 58, b: 237 };
+	const base = rgbToHsl(accent);
+	const hue = hashString(clientName.trim() || "Peer") % 360;
+	const color = hslToRgb(hue, Math.max(0.55, base.s), Math.max(0.38, Math.min(0.68, base.l)));
+	return rgbToHex(color);
+}
+
+function textColorForBackground(color: string): string {
+	const rgb = parseRgb(color) ?? resolveCssColor(color) ?? { r: 0, g: 0, b: 0 };
+	const linear = [rgb.r, rgb.g, rgb.b].map(channel => {
+		const value = channel / 255;
+		return value <= 0.03928 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+	}) as [number, number, number];
+	const luminance = 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2];
+	return luminance > 0.48 ? "#000000" : "#ffffff";
+}
+
 async function sha256Hex(bytes: Uint8Array): Promise<string> {
 	const hash = await crypto.subtle.digest("SHA-256", exactArrayBuffer(bytes));
 	return [...new Uint8Array(hash)].map(byte => byte.toString(16).padStart(2, "0")).join("");
@@ -94,8 +206,14 @@ export default class SyncEngine extends Plugin {
 	/** Last config file bytes applied from the server during startup/live pull. */
 	private serverConfigBytes = new Map<Path, Uint8Array>();
 	private serverConfigSha = new Map<Path, string>();
+	private readonly remoteEditorPresences = new Map<string, RemoteEditorPresence>();
+	private remotePresenceLayer: PresenceLayer | null = null;
+	private presenceRenderFrame: number | null = null;
+	private lastSentPresenceKey = "";
+	private localPresenceColor = "#7c3aed";
 	async onload() {
 		await this.loadSettings();
+		this.cleanupStalePresenceDom();
 		log.info("plugin loading", {
 			vaultName: this.app.vault.getName(),
 			configDir: this.app.vault.configDir,
@@ -109,14 +227,13 @@ export default class SyncEngine extends Plugin {
 		this.pendingDocs = new Map<Path, Promise<DocSync>>();
 		this.editorChangeQueues = new Map<Path, Promise<void>>();
 		this.pruningDocs = new Set<Path>();
+		this.localPresenceColor = presenceColorForName(this.settings.clientName);
 		await this.db.open();
 		await this.yjsStateStore.open();
 		this.bootstrapStatusBarEl = this.addStatusBarItem();
 		this.bootstrapStatusBarEl.addClass("sync-engine-bootstrap-statusbar");
 		this.renderBootstrapStatusBar();
-		if (this.settings.syncConfigDir) {
-			void this.captureBootConfigShas();
-		}
+		void this.captureBootConfigShas();
 		this.yjsIndexer = new VaultYjsIndexer(
 			this.app,
 			this.yjsStateStore,
@@ -147,9 +264,7 @@ export default class SyncEngine extends Plugin {
 			(path) => this.docs.get(path),
 			(status) => this.setBootstrapStatus(status),
 			() => {
-				if (this.settings.syncConfigDir) {
-					this.startConfigDirPoller();
-				}
+				this.startConfigDirPoller();
 				if (!Platform.isMobile) {
 					this.startYjsIndexer();
 				}
@@ -157,8 +272,14 @@ export default class SyncEngine extends Plugin {
 			(path, bytes) => {
 				void this.recordRemoteConfigApplied(path, bytes);
 			},
+			() => {
+				new Notice("Plugin files updated. Reload Obsidian.");
+			},
 			(path, content) => this.applyRemoteYjsContentToOpenEditors(path, content),
 			(path) => this.flushEditorChangeQueue(path),
+			(presence) => this.setRemoteEditorPresence(presence),
+			(clientId) => this.removeRemoteEditorPresence(clientId),
+			() => this.clearRemoteEditorPresences(),
 			this.manifest.id,
 		);
 		this.app.workspace.onLayoutReady(() => {
@@ -168,6 +289,10 @@ export default class SyncEngine extends Plugin {
 
 		this.registerEvent(this.app.workspace.on("layout-change", () => {
 			void this.pruneClosedDocs();
+			this.scheduleRemotePresenceRender();
+		}));
+		this.registerEvent(this.app.workspace.on("active-leaf-change", () => {
+			this.scheduleRemotePresenceRender();
 		}));
 		this.registerEvent(this.app.vault.on("create", file => {
 			log.debug("vault create event", { path: file.path, type: file instanceof TFolder ? "folder" : "file" });
@@ -203,6 +328,8 @@ export default class SyncEngine extends Plugin {
 
 		this.addSettingTab(new SyncEngineSettingTab(this.app, this));
 		this.registerEditorExtension(this.makeEditorOutboxExtension());
+		this.registerEditorExtension(this.makeEditorPresenceSenderExtension());
+		this.registerDomEvent(window, "resize", () => this.scheduleRemotePresenceRender());
 	}
 
 	private makeEditorOutboxExtension(){
@@ -223,6 +350,248 @@ export default class SyncEngine extends Plugin {
 			}
 			this.queueEditorChange(update, pathID);
 		});
+	}
+
+	private makeEditorPresenceSenderExtension() {
+		return EditorView.updateListener.of((update: ViewUpdate) => {
+			if (this.remoteEditorDispatches.has(update.view)) {
+				return;
+			}
+			if (!update.selectionSet) {
+				return;
+			}
+			this.sendActiveEditorPresence();
+		});
+	}
+
+	private sendActiveEditorPresence(): void {
+		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+		if (!view?.file) {
+			return;
+		}
+		this.localPresenceColor = presenceColorForName(this.settings.clientName);
+		const positions = {
+			from: view.editor.getCursor("from"),
+			to: view.editor.getCursor("to"),
+			head: view.editor.getCursor("head"),
+			anchor: view.editor.getCursor("anchor"),
+		};
+		const presenceKey = JSON.stringify({
+			path: view.file.path,
+			...positions,
+			color: this.localPresenceColor,
+		});
+		if (presenceKey === this.lastSentPresenceKey) {
+			return;
+		}
+		this.lastSentPresenceKey = presenceKey;
+		this.syncClient.sendEditorPresence(
+			view.file.path,
+			positions,
+			this.localPresenceColor,
+		);
+	}
+
+	private setRemoteEditorPresence(presence: EditorPresence): void {
+		this.remoteEditorPresences.set(presence.clientId, {
+			...presence,
+			updatedAt: Date.now(),
+		});
+		this.scheduleRemotePresenceRender();
+	}
+
+	private removeRemoteEditorPresence(clientId: string): void {
+		if (!this.remoteEditorPresences.delete(clientId)) {
+			return;
+		}
+		this.scheduleRemotePresenceRender();
+	}
+
+	private clearRemoteEditorPresences(): void {
+		this.remoteEditorPresences.clear();
+		this.removePresenceLayer();
+	}
+
+	private scheduleRemotePresenceRender(): void {
+		if (this.presenceRenderFrame !== null) {
+			return;
+		}
+		this.presenceRenderFrame = requestAnimationFrame(() => {
+			this.presenceRenderFrame = null;
+			this.renderRemoteEditorPresences();
+		});
+	}
+
+	private renderRemoteEditorPresences(): void {
+		this.cleanupStalePresenceDom();
+		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+		const editorView = view ? editorViewFor(view.editor) : null;
+		const activePath = view?.file?.path;
+		if (!editorView || !activePath) {
+			this.removePresenceLayer();
+			return;
+		}
+		const presences = [...this.remoteEditorPresences.values()]
+			.filter(presence => presence.path === activePath);
+		if (presences.length === 0) {
+			this.removePresenceLayer();
+			return;
+		}
+		const layer = this.ensurePresenceLayer(editorView);
+		this.sizePresenceLayer(layer, editorView);
+		layer.replaceChildren();
+		for (const presence of presences) {
+			this.renderRemoteSelection(layer, editorView, presence);
+			this.renderRemoteCursor(layer, editorView, presence);
+		}
+	}
+
+	private ensurePresenceLayer(editorView: EditorView): HTMLElement {
+		if (
+			this.remotePresenceLayer?.view === editorView &&
+			this.remotePresenceLayer.el.parentElement === editorView.scrollDOM
+		) {
+			return this.remotePresenceLayer.el;
+		}
+		this.removePresenceLayer();
+		const layer = document.createElement("div");
+		layer.addClass("sync-engine-presence-layer");
+		const scrollHandler = () => this.scheduleRemotePresenceRender();
+		editorView.scrollDOM.addEventListener("scroll", scrollHandler, { passive: true });
+		editorView.scrollDOM.appendChild(layer);
+		this.remotePresenceLayer = { el: layer, view: editorView, scrollHandler };
+		return layer;
+	}
+
+	private sizePresenceLayer(layer: HTMLElement, editorView: EditorView): void {
+		layer.style.width = `${Math.max(editorView.scrollDOM.scrollWidth, editorView.scrollDOM.clientWidth)}px`;
+		layer.style.height = `${Math.max(editorView.scrollDOM.scrollHeight, editorView.scrollDOM.clientHeight)}px`;
+	}
+
+	private cleanupStalePresenceDom(): void {
+		for (const el of Array.from(document.querySelectorAll<HTMLElement>(".sync-engine-presence-layer"))) {
+			if (el !== this.remotePresenceLayer?.el) {
+				el.remove();
+			}
+		}
+		for (const el of Array.from(document.querySelectorAll<HTMLElement>(".sync-engine-remote-cursor, .sync-engine-remote-selection"))) {
+			if (!el.closest(".sync-engine-presence-layer")) {
+				el.remove();
+			}
+		}
+	}
+
+	private removePresenceLayer(): void {
+		if (!this.remotePresenceLayer) {
+			return;
+		}
+		this.remotePresenceLayer.view.scrollDOM.removeEventListener("scroll", this.remotePresenceLayer.scrollHandler);
+		this.remotePresenceLayer.el.remove();
+		this.remotePresenceLayer = null;
+	}
+
+	private renderRemoteSelection(layer: HTMLElement, editorView: EditorView, presence: RemoteEditorPresence): void {
+		const from = this.editorOffsetForPosition(editorView, presence.from);
+		const to = this.editorOffsetForPosition(editorView, presence.to);
+		if (from === to) {
+			return;
+		}
+		const startOffset = Math.min(from, to);
+		const endOffset = Math.max(from, to);
+		for (const visible of editorView.visibleRanges) {
+			const visibleStart = Math.max(startOffset, visible.from);
+			const visibleEnd = Math.min(endOffset, visible.to);
+			if (visibleStart >= visibleEnd) {
+				continue;
+			}
+			this.renderRemoteSelectionSegment(layer, editorView, presence, visibleStart, visibleEnd);
+		}
+	}
+
+	private renderRemoteSelectionSegment(
+		layer: HTMLElement,
+		editorView: EditorView,
+		presence: RemoteEditorPresence,
+		from: number,
+		to: number,
+	): void {
+		let range: Range;
+		try {
+			const start = editorView.domAtPos(from);
+			const end = editorView.domAtPos(to);
+			range = document.createRange();
+			range.setStart(start.node, start.offset);
+			range.setEnd(end.node, end.offset);
+		} catch {
+			return;
+		}
+		const scrollRect = editorView.scrollDOM.getBoundingClientRect();
+		for (const rect of Array.from(range.getClientRects())) {
+			if (rect.width <= 0 || rect.height <= 0) {
+				continue;
+			}
+			const highlight = document.createElement("div");
+			highlight.addClass("sync-engine-remote-selection");
+			highlight.style.setProperty("--sync-engine-presence-color", presence.color);
+			highlight.style.left = `${rect.left - scrollRect.left + editorView.scrollDOM.scrollLeft}px`;
+			highlight.style.top = `${rect.top - scrollRect.top + editorView.scrollDOM.scrollTop}px`;
+			highlight.style.width = `${rect.width}px`;
+			highlight.style.height = `${rect.height}px`;
+			layer.appendChild(highlight);
+		}
+	}
+
+	private renderRemoteCursor(layer: HTMLElement, editorView: EditorView, presence: RemoteEditorPresence): void {
+		const offset = this.editorOffsetForPosition(editorView, presence.head);
+		const coords = editorView.coordsAtPos(offset);
+		if (!coords) {
+			return;
+		}
+		const scrollRect = editorView.scrollDOM.getBoundingClientRect();
+		const left = coords.left - scrollRect.left + editorView.scrollDOM.scrollLeft;
+		const top = coords.top - scrollRect.top + editorView.scrollDOM.scrollTop;
+		const cursor = document.createElement("div");
+		cursor.addClass("sync-engine-remote-cursor");
+		cursor.style.setProperty("--sync-engine-presence-color", presence.color);
+		cursor.style.setProperty("--sync-engine-presence-foreground", textColorForBackground(presence.color));
+		cursor.style.left = `${left}px`;
+		cursor.style.top = `${top}px`;
+		cursor.style.height = `${Math.max(14, coords.bottom - coords.top)}px`;
+		const tag = document.createElement("div");
+		tag.addClass("sync-engine-remote-cursor__tag");
+		tag.textContent = presence.clientName || "Peer";
+		cursor.appendChild(tag);
+		layer.appendChild(cursor);
+		this.fitPresenceTag(editorView, cursor, tag, left, top);
+	}
+
+	private fitPresenceTag(
+		editorView: EditorView,
+		cursor: HTMLElement,
+		tag: HTMLElement,
+		cursorLeft: number,
+		cursorTop: number,
+	): void {
+		const visibleLeft = editorView.scrollDOM.scrollLeft + 6;
+		const visibleRight = editorView.scrollDOM.scrollLeft + editorView.scrollDOM.clientWidth - 6;
+		const width = tag.offsetWidth;
+		let tagLeft = 0;
+		if (cursorLeft + width > visibleRight) {
+			tagLeft = visibleRight - cursorLeft - width;
+		}
+		if (cursorLeft + tagLeft < visibleLeft) {
+			tagLeft = visibleLeft - cursorLeft;
+		}
+		tag.style.left = `${tagLeft}px`;
+		if (cursorTop - tag.offsetHeight - 2 < editorView.scrollDOM.scrollTop) {
+			cursor.addClass("sync-engine-remote-cursor--tag-below");
+		}
+	}
+
+	private editorOffsetForPosition(editorView: EditorView, position: EditorPresencePosition): number {
+		const lineNumber = Math.max(1, Math.min(editorView.state.doc.lines, position.line + 1));
+		const lineInfo = editorView.state.doc.line(lineNumber);
+		return Math.max(lineInfo.from, Math.min(lineInfo.to, lineInfo.from + position.ch));
 	}
 
 	private queueEditorChange(update: ViewUpdate, pathID: Path): void {
@@ -656,9 +1025,6 @@ export default class SyncEngine extends Plugin {
 	}
 
 	private async captureBootConfigShas(): Promise<void> {
-		if (!this.settings.syncConfigDir) {
-			return;
-		}
 		for (const path of await this.listConfigDirFiles(this.app.vault.configDir)) {
 			if (!this.isSyncableConfigPath(path)) {
 				continue;
@@ -701,7 +1067,6 @@ export default class SyncEngine extends Plugin {
 
 	private isSyncableConfigPath(path: string): boolean {
 		return this.isConfigDirPath(path)
-			&& this.settings.syncConfigDir
 			&& shouldSyncPath(path, this.app.vault.configDir, this.manifest.id)
 			&& !shouldUseYjs(path, this.app.vault.configDir);
 	}
@@ -776,8 +1141,7 @@ export default class SyncEngine extends Plugin {
 	}
 
 	private shouldSyncLocalPath(path: string): boolean {
-		return shouldSyncPath(path, this.app.vault.configDir, this.manifest.id)
-			&& (this.settings.syncConfigDir || !this.isConfigDirPath(path));
+		return shouldSyncPath(path, this.app.vault.configDir, this.manifest.id);
 	}
 
 	onunload() {
@@ -786,6 +1150,10 @@ export default class SyncEngine extends Plugin {
 			window.clearTimeout(timer);
 		}
 		this.pendingFileTimers.clear();
+		if (this.presenceRenderFrame !== null) {
+			cancelAnimationFrame(this.presenceRenderFrame);
+			this.presenceRenderFrame = null;
+		}
 		for (const [path, doc] of this.docs) {
 			void doc.persistState().catch(error => {
 				log.error("failed to persist open Yjs doc on unload", { path, ...errorContext(error) });
@@ -793,25 +1161,32 @@ export default class SyncEngine extends Plugin {
 		}
 		this.syncClient?.stop();
 		this.yjsIndexer?.stop();
+		this.clearRemoteEditorPresences();
 		void this.db.close().catch(error => {
 			log.error("failed to close outbox store", errorContext(error));
 		});
 	}
 
 	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData() as Partial<SyncEngineSettings>);
+		const loaded = await this.loadData() as (Partial<SyncEngineSettings> & { syncConfigDir?: unknown }) | null;
+		const { syncConfigDir: removedSyncConfigDir, ...persistedSettings } = loaded ?? {};
+		let shouldSave = removedSyncConfigDir !== undefined;
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, persistedSettings);
 		if (!this.settings.clientId.trim()) {
 			this.settings = {
 				...this.settings,
 				clientId: generateClientId(),
 			};
-			await this.saveSettings();
+			shouldSave = true;
 		}
 		if (!this.settings.lastPulledRevision.trim()) {
 			this.settings = {
 				...this.settings,
 				lastPulledRevision: "0",
 			};
+			shouldSave = true;
+		}
+		if (shouldSave) {
 			await this.saveSettings();
 		}
 	}

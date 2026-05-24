@@ -34,5 +34,6 @@ describe("path policy", () => {
     it("does not sync local sync engine state", () => {
         expect(shouldSyncPath(".sync-engine-state/obsidian-sync-engine/yjs/notes/test.md.state")).toBe(false);
         expect(shouldSyncPath(".sync-engine-state/obsidian-sync-engine/yjs/notes/test.md.state.sha256")).toBe(false);
+        expect(shouldSyncPath(".sync-engine-sync/wal/active.jsonl")).toBe(false);
     });
 });

@@ -151,6 +151,27 @@ describe("encodePacket / decodePacket", () => {
         expect(decodePacket(encodePacket(status))).toEqual(status);
     });
 
+    it("round-trips editor presence packets", () => {
+        const update: wsPacket = {
+            type: opType.EditorPresenceUpdate,
+            clientId: "client-a",
+            clientName: "Alice",
+            path: "notes/test.md",
+            from: { line: 3, ch: 4 },
+            to: { line: 3, ch: 12 },
+            head: { line: 3, ch: 12 },
+            anchor: { line: 3, ch: 4 },
+            color: "#7c3aed",
+        };
+        const disconnect: wsPacket = {
+            type: opType.EditorPresenceDisconnect,
+            clientId: "client-a",
+        };
+
+        expect(decodePacket(encodePacket(update))).toEqual(update);
+        expect(decodePacket(encodePacket(disconnect))).toEqual(disconnect);
+    });
+
     it("round-trips BYTEA file bodies", () => {
         const contentBytes = new Uint8Array([123, 34, 97, 34, 58, 49, 125]);
         const packet = {

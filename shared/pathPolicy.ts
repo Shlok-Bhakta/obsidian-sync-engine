@@ -34,6 +34,7 @@ export function isPluginInternalPath(
 export function isIgnoredVaultPath(path: string): boolean {
     return path === ".trash" || path.startsWith(".trash/")
         || path === ".sync-engine-state" || path.startsWith(".sync-engine-state/")
+        || path === ".sync-engine-sync" || path.startsWith(".sync-engine-sync/")
         || path.split("/").includes(".git");
 }
 

@@ -99,6 +99,28 @@ const bootstrapStatusPacketSchema = z.object({
     message: z.string().optional(),
 });
 
+const editorPresencePositionSchema = z.object({
+    line: z.number().int().nonnegative(),
+    ch: z.number().int().nonnegative(),
+});
+
+const editorPresenceUpdatePacketSchema = z.object({
+    type: z.literal(opType.EditorPresenceUpdate),
+    clientId: z.string(),
+    clientName: z.string(),
+    path: z.string().min(1),
+    from: editorPresencePositionSchema,
+    to: editorPresencePositionSchema,
+    head: editorPresencePositionSchema,
+    anchor: editorPresencePositionSchema,
+    color: z.string().min(1),
+});
+
+const editorPresenceDisconnectPacketSchema = z.object({
+    type: z.literal(opType.EditorPresenceDisconnect),
+    clientId: z.string().min(1),
+});
+
 const docSyncPathSchema = z.object({
     path: z.string().min(1),
     stateVector: z.instanceof(Uint8Array),
@@ -135,6 +157,8 @@ const packetSchemas: Record<string, z.ZodType<unknown>> = {
     [opType.SnapshotReset]: snapshotResetPacketSchema,
     [opType.BootstrapCreate]: bootstrapCreatePacketSchema,
     [opType.BootstrapStatus]: bootstrapStatusPacketSchema,
+    [opType.EditorPresenceUpdate]: editorPresenceUpdatePacketSchema,
+    [opType.EditorPresenceDisconnect]: editorPresenceDisconnectPacketSchema,
     [opType.DocSync]: docSyncPacketSchema,
     [opType.DocSyncAck]: docSyncAckPacketSchema,
 };

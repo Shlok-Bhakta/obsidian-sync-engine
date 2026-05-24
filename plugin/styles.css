@@ -86,3 +86,55 @@ If your plugin does not need CSS, delete this file.
 	margin-top: 8px;
 	font-size: var(--font-ui-small);
 }
+
+.sync-engine-presence-layer {
+	position: absolute;
+	top: 0;
+	left: 0;
+	overflow: visible;
+	pointer-events: none !important;
+	transform: translate3d(0, 0, 0);
+	will-change: transform;
+	z-index: 20;
+}
+
+.sync-engine-presence-layer * {
+	pointer-events: none !important;
+}
+
+.sync-engine-remote-selection {
+	position: absolute;
+	border-radius: 2px;
+	background: var(--sync-engine-presence-color);
+	opacity: 0.2;
+}
+
+.sync-engine-remote-cursor {
+	position: absolute;
+	width: 2px;
+	height: 1.25em;
+	overflow: visible;
+	background: var(--sync-engine-presence-color);
+	z-index: 2;
+}
+
+.sync-engine-remote-cursor__tag {
+	position: absolute;
+	top: -1.5em;
+	left: 0;
+	max-width: 140px;
+	overflow: hidden;
+	padding: 1px 5px;
+	border-radius: 4px;
+	background: var(--sync-engine-presence-color);
+	color: var(--sync-engine-presence-foreground);
+	font-size: var(--font-ui-smaller);
+	font-weight: 600;
+	line-height: 1.35;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.sync-engine-remote-cursor--tag-below .sync-engine-remote-cursor__tag {
+	top: calc(100% + 2px);
+}

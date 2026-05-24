@@ -55,6 +55,22 @@ export type DocSyncResult = {
     yjsState: Uint8Array;
 };
 
+export type EditorPresencePosition = {
+    line: number;
+    ch: number;
+};
+
+export type EditorPresence = {
+    clientId: string;
+    clientName: string;
+    path: Path;
+    from: EditorPresencePosition;
+    to: EditorPresencePosition;
+    head: EditorPresencePosition;
+    anchor: EditorPresencePosition;
+    color: string;
+};
+
 export type BootstrapStatusValue =
     | "building"
     | "uploading"
@@ -93,6 +109,8 @@ export enum opType {
     SnapshotReset = "SnapshotReset",
     BootstrapCreate = "BootstrapCreate",
     BootstrapStatus = "BootstrapStatus",
+    EditorPresenceUpdate = "EditorPresenceUpdate",
+    EditorPresenceDisconnect = "EditorPresenceDisconnect",
     Auth = "Auth",
     AuthAck = "AuthAck",
     Deny = "Deny",
@@ -164,6 +182,13 @@ export type wsPacket =
         pluginId: string;
     }
     | BootstrapStatus
+    | ({
+        type: opType.EditorPresenceUpdate;
+    } & EditorPresence)
+    | {
+        type: opType.EditorPresenceDisconnect;
+        clientId: string;
+    }
     | {
         type: opType.Auth;
         clientId: string;

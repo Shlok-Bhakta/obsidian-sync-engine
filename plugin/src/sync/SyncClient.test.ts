@@ -159,7 +159,7 @@ async function makeClient(
         getDocSync?: (path: string) => DocSync | undefined;
         onOpenYjsContent?: (path: string, content: string) => Promise<boolean>;
         flushOpenYjsChanges?: (path: string) => Promise<void>;
-        syncConfigDir?: boolean;
+        onRemotePluginFilesChanged?: () => void;
     } = {},
 ): Promise<{
     client: SyncClient;
@@ -279,7 +279,6 @@ async function makeClient(
             clientKey: "obs_sync_test",
             clientName: "Client",
             lastPulledRevision: "0",
-            syncConfigDir: options.syncConfigDir ?? true,
         },
         undefined,
         undefined,
@@ -287,6 +286,7 @@ async function makeClient(
         undefined,
         undefined,
         undefined,
+        options.onRemotePluginFilesChanged,
         options.onOpenYjsContent,
         options.flushOpenYjsChanges,
     );
@@ -386,20 +386,6 @@ describe("SyncClient initial snapshot", () => {
         });
         expect(readYjsContent(note!.yjsState!)).toBe("unloaded note");
         expect(stateStore.states.get("notes/unloaded.md")).toEqual(note?.yjsState);
-    });
-
-    it("excludes config directory files from snapshots when config sync is disabled", async () => {
-        const { client } = await makeClient({
-            "notes/existing.md": "existing note",
-            ".obsidian/workspace.json": "{}",
-        }, new MemoryYjsStateStore(), new MemoryOutboxStore(), { syncConfigDir: false });
-
-        const changes = await (client as unknown as { readVaultSnapshot: () => Promise<outboxData[]> }).readVaultSnapshot();
-        const paths = changes.map(change => change.path);
-
-        expect(paths).toContain("notes/existing.md");
-        expect(paths).not.toContain(".obsidian");
-        expect(paths).not.toContain(".obsidian/workspace.json");
     });
 
     it("skips large files that fail blob upload while still building the initial snapshot", async () => {
@@ -815,6 +801,86 @@ describe("SyncClient initial snapshot", () => {
         expect(files["notes/existing.md"]).toBe("stale local");
         expect(openDoc.getYdoc().getText(MARKDOWN_FIELD).toString()).toBe("server materialized");
         expect(readYjsContent(stateStore.states.get("notes/existing.md")!)).toBe("server materialized");
+    });
+
+    it("notifies once when remote plugin files change", async () => {
+        const files: Record<string, string | Uint8Array> = {};
+        const onRemotePluginFilesChanged = vi.fn();
+        const { client } = await makeClient(files, new MemoryYjsStateStore(), new MemoryOutboxStore(), {
+            onRemotePluginFilesChanged,
+        });
+        const testClient = client as unknown as {
+            lastPulledRevision: string;
+            applyChangeBatch: (packet: unknown) => Promise<void>;
+        };
+        testClient.lastPulledRevision = "1";
+
+        await testClient.applyChangeBatch({
+            type: opType.ChangeBatch,
+            fromRevision: "1",
+            serverRevision: "3",
+            changes: [
+                {
+                    mutationId: "remote-plugin-main",
+                    operation: "UpsertFile",
+                    path: ".obsidian/plugins/example/main.js",
+                    contentBytes: new TextEncoder().encode("module.exports = {};"),
+                    isFolder: false,
+                    isYjs: false,
+                    storageKind: "bytea",
+                    created: Date.now(),
+                    revision: "2",
+                    clientId: "other-client",
+                },
+                {
+                    mutationId: "remote-plugin-manifest",
+                    operation: "UpsertFile",
+                    path: ".obsidian/plugins/example/manifest.json",
+                    contentBytes: new TextEncoder().encode("{}"),
+                    isFolder: false,
+                    isYjs: false,
+                    storageKind: "bytea",
+                    created: Date.now(),
+                    revision: "3",
+                    clientId: "other-client",
+                },
+            ],
+        });
+
+        expect(files[".obsidian/plugins/example/main.js"]).toEqual(new TextEncoder().encode("module.exports = {};"));
+        expect(onRemotePluginFilesChanged).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not notify for echoed local plugin file changes", async () => {
+        const onRemotePluginFilesChanged = vi.fn();
+        const { client } = await makeClient({}, new MemoryYjsStateStore(), new MemoryOutboxStore(), {
+            onRemotePluginFilesChanged,
+        });
+        const testClient = client as unknown as {
+            lastPulledRevision: string;
+            applyChangeBatch: (packet: unknown) => Promise<void>;
+        };
+        testClient.lastPulledRevision = "1";
+
+        await testClient.applyChangeBatch({
+            type: opType.ChangeBatch,
+            fromRevision: "1",
+            serverRevision: "2",
+            changes: [{
+                mutationId: "local-plugin-main",
+                operation: "UpsertFile",
+                path: ".obsidian/plugins/example/main.js",
+                contentBytes: new TextEncoder().encode("local"),
+                isFolder: false,
+                isYjs: false,
+                storageKind: "bytea",
+                created: Date.now(),
+                revision: "2",
+                clientId: "client",
+            }],
+        });
+
+        expect(onRemotePluginFilesChanged).not.toHaveBeenCalled();
     });
 
     it("merges a full remote Yjs state into an open document with pending local edits", async () => {
