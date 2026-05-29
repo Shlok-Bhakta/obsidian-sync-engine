@@ -180,4 +180,44 @@ describe("YjsApplicator", () => {
         expect(applied).toEqual([merged]);
         expect(readYjsContent(stateStore.states.get("notes/a.md")!)).toBe(merged);
     });
+
+    it("rebases stale open-document edits onto an independent remote full state", async () => {
+        const files = { "notes/a.md": "base" };
+        const stateStore = new MemoryStateStore();
+        const localSeed = docStateFromContent("base", Y);
+        await stateStore.put("notes/a.md", localSeed);
+        const openDoc = new DocSync(
+            new MemoryOutbox(),
+            stateStore as unknown as YjsStateStore,
+            "notes/a.md",
+            localSeed,
+        );
+        const localEdit = EditorState.create({ doc: "base" }).update({
+            changes: { from: 4, insert: " local" },
+        });
+        await openDoc.applyChanges(localEdit.changes, {
+            mutationId: crypto.randomUUID(),
+            operation: "YjsUpdate",
+            path: "notes/a.md",
+            data: new Uint8Array(),
+            created: Date.now(),
+        });
+
+        const applied: string[] = [];
+        const applicator = makeApplicator(files, stateStore, {
+            getDocSync: path => path === "notes/a.md" ? openDoc : undefined,
+            onOpenYjsContent: async (_path, content) => {
+                applied.push(content);
+                return true;
+            },
+        });
+        const remoteState = docStateFromContent("base remote", Y);
+
+        await applicator.applyState("notes/a.md", remoteState);
+
+        expect(applied).toEqual(["base remote local"]);
+        expect(openDoc.getYdoc().getText(MARKDOWN_FIELD).toString()).toBe("base remote local");
+        expect(readYjsContent(stateStore.states.get("notes/a.md")!)).toBe("base remote local");
+        expect(openDoc.hasServerSyncedState()).toBe(false);
+    });
 });

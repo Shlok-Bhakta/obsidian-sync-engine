@@ -19,8 +19,7 @@ import { readSocketMessage, waitForPacket, withTimeout } from "./SocketRequest";
 
 const FLUSH_DELAY_MS = 16;
 const ERROR_BACKOFF_MS = 2000;
-const CONNECT_BACKOFF_INITIAL_MS = 5000;
-const CONNECT_BACKOFF_MAX_MS = 60000;
+const CONNECT_RETRY_DELAY_MS = 2000;
 const WS_WAIT_TIMEOUT_MS = 60_000;
 const INLINE_BYTES_LIMIT = 16 * 1024;
 const FAILURE_NOTICE_THROTTLE_MS = 60_000;
@@ -212,7 +211,7 @@ export class SyncClient {
                 return;
             }
             this.connectSoon();
-        }, 5000);
+        }, CONNECT_RETRY_DELAY_MS);
     }
 
     stop(): void {
@@ -535,8 +534,7 @@ export class SyncClient {
 
     private recordConnectionFailure(error: unknown): void {
         this.failedConnectAttempts++;
-        const exponent = Math.min(this.failedConnectAttempts - 1, 6);
-        const delay = Math.min(CONNECT_BACKOFF_INITIAL_MS * (2 ** exponent), CONNECT_BACKOFF_MAX_MS);
+        const delay = CONNECT_RETRY_DELAY_MS;
         this.nextConnectAt = Date.now() + delay;
         this.log.warn("sync client connection failed; retrying", {
             retryInMs: delay,
@@ -959,7 +957,12 @@ export class SyncClient {
             const pathRows = rows.filter(row => row.operation === "YjsUpdate" && row.path === path);
             const updates = pathRows.map(row => row.data).filter((data): data is Uint8Array => data instanceof Uint8Array);
             const openDoc = this.getDocSync(path);
-            if (openDoc?.hasServerSyncedState() && updates.length === pathRows.length && updates.length > 0) {
+            if (
+                openDoc?.hasServerSyncedState() &&
+                updates.length === pathRows.length &&
+                updates.length > 0 &&
+                updates.every(update => update.byteLength > 0)
+            ) {
                 coalesced.set(path, {
                     mutationId: crypto.randomUUID(),
                     operation: "YjsUpdate",

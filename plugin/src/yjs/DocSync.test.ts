@@ -4,7 +4,7 @@ import * as Y from "yjs";
 import { OutboxSegment, OutboxStore } from "../db/db";
 import { outboxData } from "../../../shared/types";
 import { docStateFromContent, MARKDOWN_FIELD } from "../../../shared/yjsSeed";
-import { DocSync } from "./DocSync";
+import { DocSync, rebaseLocalTextChange } from "./DocSync";
 import { YjsStateStore } from "./YjsStateStore";
 
 const PATH = "notes/typing.md";
@@ -109,6 +109,14 @@ function setup(initialContent: string): {
 }
 
 describe("DocSync editor typing", () => {
+    it("rebases a local append onto a newer remote text without duplicating the base", () => {
+        expect(rebaseLocalTextChange("base", "base local", "base remote")).toBe("base remote local");
+    });
+
+    it("falls back to local text for overlapping replacements instead of merging two full seeds", () => {
+        expect(rebaseLocalTextChange("base", "BASE", "base remote")).toBe("BASE");
+    });
+
     it("records each typed character as an outbox YjsUpdate and checkpoints on explicit persist", async () => {
         const { docSync, outbox, stateStore } = setup("");
         let editorDoc = "";

@@ -62,7 +62,9 @@ export class YjsApplicator {
         const openDoc = this.getDocSync(normalized);
         if (openDoc) {
             if (openDoc.hasLocalEdits()) {
-                const content = openDoc.applyRemoteUpdate(state);
+                const content = openDoc.hasServerSyncedState()
+                    ? openDoc.applyRemoteUpdate(state)
+                    : await openDoc.rebaseLocalChangesOntoRemoteState(state);
                 await this.upsertYjsTextFile(normalized, content);
                 await this.options.stateStore.put(normalized, Y.encodeStateAsUpdateV2(openDoc.getYdoc()));
                 await this.options.stateStore.putContentHash(normalized, await sha256Hex(new TextEncoder().encode(content)));

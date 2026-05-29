@@ -860,18 +860,19 @@ export default class SyncEngine extends Plugin {
 			return;
 		}
 		if (previousState) {
-			const data = Y.diffUpdateV2(yjsState, Y.encodeStateVectorFromUpdateV2(previousState));
-			if (data.byteLength === 0) {
+			const previousVector = Y.encodeStateVectorFromUpdateV2(previousState);
+			const changed = Y.diffUpdateV2(yjsState, previousVector).byteLength > 0;
+			if (!changed) {
 				return;
 			}
 			await this.db.putInOutbox({
 				mutationId: crypto.randomUUID(),
 				operation: "YjsUpdate",
 				path,
-				data,
+				data: new Uint8Array(),
 				created: Date.now(),
 			});
-			log.info("queued closed markdown Yjs update", { path, bytes: data.byteLength });
+			log.info("queued closed markdown Yjs resync", { path, chars: content.length });
 		} else {
 			await this.db.putInOutbox({
 				mutationId: crypto.randomUUID(),

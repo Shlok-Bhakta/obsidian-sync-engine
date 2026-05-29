@@ -524,6 +524,47 @@ describe("SyncClient initial snapshot", () => {
         openDoc.destroy();
     });
 
+    it("rebases empty closed-document resync markers through DocSync before upload", async () => {
+        const path = "notes/existing.md";
+        const stateStore = new MemoryYjsStateStore();
+        await stateStore.put(path, docStateFromContent("base local", Y));
+        const outbox = new MemoryOutboxStore([{
+            mutationId: "closed-resync",
+            operation: "YjsUpdate",
+            path,
+            data: new Uint8Array(),
+            created: 1,
+        }]);
+        const { client } = await makeClient({ [path]: "base local" }, stateStore, outbox);
+        const remoteState = docStateFromContent("base remote", Y);
+        const requestDocSync = vi.fn(async () => ({
+            type: opType.DocSyncAck,
+            paths: [{
+                path,
+                data: new Uint8Array(),
+                stateVector: Y.encodeStateVectorFromUpdateV2(remoteState),
+                yjsState: remoteState,
+            }],
+        }));
+        (client as unknown as {
+            requestDocSync: typeof requestDocSync;
+        }).requestDocSync = requestDocSync;
+
+        const jsonl = await (client as unknown as {
+            prepareSegmentJsonl: (socket: WebSocket, segment: OutboxSegment) => Promise<string>;
+        }).prepareSegmentJsonl({ send: vi.fn() } as unknown as WebSocket, { id: "segment", path: "pending.jsonl" });
+
+        expect(requestDocSync).toHaveBeenCalledTimes(1);
+        const rows = decodeUpdateBatchJsonl(jsonl);
+        expect(rows).toHaveLength(1);
+        expect(rows[0]?.operation).toBe("YjsUpdate");
+        const materialized = new Y.Doc();
+        Y.applyUpdateV2(materialized, remoteState);
+        Y.applyUpdateV2(materialized, rows[0]!.data!);
+        expect(materialized.getText(MARKDOWN_FIELD).toString()).toBe("base local");
+        materialized.destroy();
+    });
+
     it("waits for startup sync before requesting a bootstrap link", async () => {
         const { client } = await makeClient({
             "notes/existing.md": "existing note",
@@ -1202,6 +1243,35 @@ describe("SyncClient initial snapshot", () => {
         testClient.closeSocket();
 
         expect(testClient.startupSynced).toBe(false);
+    });
+
+    it("uses a flat two-second reconnect delay after repeated startup failures", async () => {
+        vi.useFakeTimers();
+        vi.setSystemTime(new Date("2026-05-28T12:00:00Z"));
+        try {
+            const { client } = await makeClient({ "notes/existing.md": "before" });
+            const testClient = client as unknown as {
+                recordConnectionFailure: (error: unknown) => void;
+                nextConnectAt: number;
+                failedConnectAttempts: number;
+            };
+
+            testClient.recordConnectionFailure(new Error("offline"));
+            expect(testClient.failedConnectAttempts).toBe(1);
+            expect(testClient.nextConnectAt - Date.now()).toBe(2000);
+
+            vi.advanceTimersByTime(2000);
+            testClient.recordConnectionFailure(new Error("still offline"));
+            expect(testClient.failedConnectAttempts).toBe(2);
+            expect(testClient.nextConnectAt - Date.now()).toBe(2000);
+
+            vi.advanceTimersByTime(2000);
+            testClient.recordConnectionFailure(new Error("still offline"));
+            expect(testClient.failedConnectAttempts).toBe(3);
+            expect(testClient.nextConnectAt - Date.now()).toBe(2000);
+        } finally {
+            vi.useRealTimers();
+        }
     });
 
     it("does not close the websocket when refreshing blob auth during startup sync", async () => {

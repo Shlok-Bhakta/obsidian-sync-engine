@@ -199,6 +199,7 @@ describe("SyncEngine local CRUD enqueueing", () => {
 			path: "Notes/existing.md",
 		});
 		expect(outbox.rows[0]?.data).toBeInstanceOf(Uint8Array);
+		expect(outbox.rows[0]?.data?.byteLength).toBe(0);
 		expect(readYjsContent(yjsStateStore.states.get("Notes/existing.md")!)).toBe("hello world");
 		expect(wakeSoon).toHaveBeenCalledTimes(1);
 	});

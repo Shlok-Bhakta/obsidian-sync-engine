@@ -21,6 +21,74 @@ async function sha256Hex(bytes: Uint8Array): Promise<string> {
     return [...new Uint8Array(hash)].map(byte => byte.toString(16).padStart(2, "0")).join("");
 }
 
+function contentFromState(state: Uint8Array): string {
+    const doc = new Y.Doc();
+    if (state.byteLength > 0) {
+        Y.applyUpdateV2(doc, state);
+    }
+    const content = doc.getText(MARKDOWN_FIELD).toJSON();
+    doc.destroy();
+    return content;
+}
+
+function changedRange(before: string, after: string): { from: number; to: number; insert: string } | null {
+    if (before === after) {
+        return null;
+    }
+    let prefix = 0;
+    while (prefix < before.length && prefix < after.length && before.charCodeAt(prefix) === after.charCodeAt(prefix)) {
+        prefix++;
+    }
+    let beforeSuffix = before.length;
+    let afterSuffix = after.length;
+    while (
+        beforeSuffix > prefix &&
+        afterSuffix > prefix &&
+        before.charCodeAt(beforeSuffix - 1) === after.charCodeAt(afterSuffix - 1)
+    ) {
+        beforeSuffix--;
+        afterSuffix--;
+    }
+    return {
+        from: prefix,
+        to: beforeSuffix,
+        insert: after.slice(prefix, afterSuffix),
+    };
+}
+
+export function rebaseLocalTextChange(base: string, local: string, remote: string): string {
+    if (local === base) {
+        return remote;
+    }
+    if (remote === base) {
+        return local;
+    }
+
+    const change = changedRange(base, local);
+    if (!change) {
+        return remote;
+    }
+
+    if (change.from === base.length && change.to === base.length) {
+        return `${remote}${change.insert}`;
+    }
+    if (change.from === 0 && change.to === 0) {
+        return `${change.insert}${remote}`;
+    }
+
+    const prefix = base.slice(0, change.from);
+    const suffix = base.slice(change.to);
+    if (remote.startsWith(prefix) && remote.endsWith(suffix) && remote.length >= prefix.length + suffix.length) {
+        return `${remote.slice(0, prefix.length)}${change.insert}${remote.slice(remote.length - suffix.length)}`;
+    }
+
+    if (local.startsWith(base)) {
+        return `${remote}${local.slice(base.length)}`;
+    }
+
+    return local;
+}
+
 export class DocSync {
     private db: OutboxStore;
     private ydoc = new Y.Doc();
@@ -32,6 +100,7 @@ export class DocSync {
     private checkpointPromise: Promise<void> = Promise.resolve();
     private editsSinceCheckpoint = 0;
     private serverSyncedState = false;
+    private serverBaseContent: string;
 
 
     constructor(
@@ -44,6 +113,7 @@ export class DocSync {
         this.db = db;
         this.serverSyncedState = initialServerSyncedState;
         Y.applyUpdateV2(this.ydoc, initialState);
+        this.serverBaseContent = this.ytext.toJSON();
     }
 
     public destroy(){
@@ -99,6 +169,7 @@ export class DocSync {
         this.localRevision++;
         this.localEditRevision = 0;
         this.serverSyncedState = true;
+        this.serverBaseContent = this.ytext.toJSON();
         await this.persistState();
     }
 
@@ -148,6 +219,7 @@ export class DocSync {
                     this.ytext.insert(0, expectedBefore);
                 }
                 this.serverSyncedState = false;
+                this.serverBaseContent = expectedBefore;
             }
             for (const { fromA, toA, insertText } of changes.reverse()) {
                 const deletelen = toA - fromA;
@@ -195,10 +267,37 @@ export class DocSync {
         Y.applyUpdateV2(this.ydoc, update);
         this.localRevision++;
         this.serverSyncedState = true;
+        if (this.localEditRevision === 0) {
+            this.serverBaseContent = this.ytext.toJSON();
+        }
         void this.flushCheckpointSoon(0).catch(error => {
             log.error("failed to persist remote Yjs state", { path: this.path, ...errorContext(error) });
         });
         return this.ytext.toJSON();
+    }
+
+    public async rebaseLocalChangesOntoRemoteState(remoteState: Uint8Array): Promise<string> {
+        const localContent = this.ytext.toJSON();
+        const remoteContent = contentFromState(remoteState);
+        const rebasedContent = rebaseLocalTextChange(this.serverBaseContent, localContent, remoteContent);
+
+        this.ydoc.destroy();
+        this.ydoc = new Y.Doc();
+        Y.applyUpdateV2(this.ydoc, remoteState);
+        this.ytext = this.ydoc.getText(MARKDOWN_FIELD);
+        this.ydoc.transact(() => {
+            if (this.ytext.length > 0) {
+                this.ytext.delete(0, this.ytext.length);
+            }
+            if (rebasedContent.length > 0) {
+                this.ytext.insert(0, rebasedContent);
+            }
+        }, "rebase local changes");
+        this.localRevision++;
+        this.serverSyncedState = false;
+        this.serverBaseContent = remoteContent;
+        await this.persistState();
+        return rebasedContent;
     }
 
     private scheduleCheckpoint(): void {
