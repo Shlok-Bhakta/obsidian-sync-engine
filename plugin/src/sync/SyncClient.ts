@@ -838,7 +838,7 @@ export class SyncClient {
                             await this.vaultMutator.upsertBinaryFile(change.path, change.contentBytes);
                         } else if (change.isYjs) {
                             const content = change.content ?? "";
-                            await this.yjsApplicator.applyState(change.path, change.yjsState ?? docStateFromContent(content, Y));
+                            await this.yjsApplicator.applyState(change.path, change.yjsState ?? docStateFromContent(content, Y), change.revision);
                         } else {
                             const content = change.content ?? "";
                             appliedBytes = new TextEncoder().encode(content);
@@ -853,9 +853,9 @@ export class SyncClient {
                         await this.vaultMutator.renamePath(change.path, change.toPath);
                     } else if (change.operation === "YjsUpdate") {
                         if (change.yjsState) {
-                            await this.yjsApplicator.applyState(change.path, change.yjsState);
+                            await this.yjsApplicator.applyState(change.path, change.yjsState, change.revision);
                         } else if (change.data) {
-                            await this.yjsApplicator.applyUpdate(change.path, change.data);
+                            await this.yjsApplicator.applyUpdate(change.path, change.data, change.revision);
                         }
                     }
                 });
@@ -967,7 +967,13 @@ export class SyncClient {
 
             for (const path of docSyncPaths) {
                 const pathRows = rows.filter(row => row.operation === "YjsUpdate" && row.path === path);
+                const updates = pathRows
+                    .map(row => row.data)
+                    .filter((data): data is Uint8Array => data instanceof Uint8Array && data.byteLength > 0);
                 const { doc, destroy } = await this.yjsApplicator.resolveYdoc(path);
+                for (const update of updates) {
+                    Y.applyUpdateV2(doc, update);
+                }
                 resolved.push({
                     path,
                     doc,
@@ -1009,14 +1015,19 @@ export class SyncClient {
                     );
                     if (entry.openDoc) {
                         const replaceRevision = entry.openDoc.getLocalRevision();
-                        if (!(await entry.openDoc.replaceStateIfRevision(state, replaceRevision))) {
+                        if (!(await entry.openDoc.replaceStateIfRevision(state, replaceRevision, this.lastPulledRevision))) {
                             this.log.debug("skipped stale open-doc state replacement after DocSync", {
                                 segmentId: segment.id,
                                 path: entry.path,
                             });
                         }
                     } else {
-                        await this.stateStore.put(entry.path, state);
+                        const contentHash = await sha256Hex(new TextEncoder().encode(target));
+                        if ("putServerSyncedState" in this.stateStore && typeof this.stateStore.putServerSyncedState === "function") {
+                            await this.stateStore.putServerSyncedState(entry.path, state, contentHash, this.lastPulledRevision);
+                        } else {
+                            await this.stateStore.put(entry.path, state);
+                        }
                     }
                     coalesced.set(entry.path, {
                         mutationId: crypto.randomUUID(),
@@ -1256,14 +1267,15 @@ export class SyncClient {
     }
 
     private async pullSince(ws: WebSocket, revision: string): Promise<wsPacket> {
+        const requestId = crypto.randomUUID();
         this.pendingPullResponses++;
         try {
             const response = withTimeout(
-                this.waitForPullResponse(ws),
+                this.waitForPullResponse(ws, requestId),
                 WS_WAIT_TIMEOUT_MS,
                 "Timed out waiting for pull response",
             );
-            ws.send(encodePacket({ type: opType.PullSince, revision }));
+            ws.send(encodePacket({ type: opType.PullSince, revision, requestId }));
             return await response;
         } finally {
             this.pendingPullResponses--;
@@ -1311,10 +1323,7 @@ export class SyncClient {
                     this.onEditorPresenceDisconnect(msg.clientId);
                     return;
                 }
-                if (msg.type === opType.ChangeBatch || msg.type === opType.SnapshotReset) {
-                    if (this.pendingPullResponses > 0) {
-                        return;
-                    }
+                if ((msg.type === opType.ChangeBatch || msg.type === opType.SnapshotReset) && !msg.requestId) {
                     this.handleLivePush(msg);
                 }
             } catch {
@@ -1422,12 +1431,13 @@ export class SyncClient {
         });
     }
 
-    private waitForPullResponse(ws: WebSocket): Promise<wsPacket> {
+    private waitForPullResponse(ws: WebSocket, requestId: string): Promise<wsPacket> {
         return waitForPacket(ws, {
             accept: packet => (
-                packet.type === opType.InitRequired ||
-                packet.type === opType.ChangeBatch ||
-                packet.type === opType.SnapshotReset
+                (packet.type === opType.InitRequired ||
+                    packet.type === opType.ChangeBatch ||
+                    packet.type === opType.SnapshotReset) &&
+                packet.requestId === requestId
             ) ? packet : undefined,
             closeMessage: "WebSocket closed before pull response",
             errorMessage: "WebSocket errored before pull response",

@@ -64,6 +64,7 @@ class QueueOutboxStore extends MemoryOutboxStore {
 class MemoryYjsStateStore {
     states = new Map<string, Uint8Array>();
     hashes = new Map<string, string>();
+    metadata = new Map<string, { serverSynced: boolean; serverRevision: string | null }>();
 
     async get(path: string): Promise<Uint8Array | null> {
         return this.states.get(path) ?? null;
@@ -76,6 +77,17 @@ class MemoryYjsStateStore {
     async putWithContentHash(path: string, state: Uint8Array, hash: string): Promise<void> {
         this.states.set(path, new Uint8Array(state));
         this.hashes.set(path, hash);
+        this.metadata.set(path, { serverSynced: false, serverRevision: null });
+    }
+
+    async putServerSyncedState(path: string, state: Uint8Array, hash: string, serverRevision: string): Promise<void> {
+        this.states.set(path, new Uint8Array(state));
+        this.hashes.set(path, hash);
+        this.metadata.set(path, { serverSynced: true, serverRevision });
+    }
+
+    async getMetadata(path: string): Promise<{ serverSynced: boolean; serverRevision: string | null } | null> {
+        return this.metadata.get(path) ?? null;
     }
 
     async has(path: string): Promise<boolean> {
@@ -93,6 +105,7 @@ class MemoryYjsStateStore {
     async delete(path: string): Promise<void> {
         this.states.delete(path);
         this.hashes.delete(path);
+        this.metadata.delete(path);
     }
 
     async rename(fromPath: string, toPath: string): Promise<void> {
@@ -105,6 +118,11 @@ class MemoryYjsStateStore {
         if (hash) {
             this.hashes.set(toPath, hash);
             this.hashes.delete(fromPath);
+        }
+        const metadata = this.metadata.get(fromPath);
+        if (metadata) {
+            this.metadata.set(toPath, metadata);
+            this.metadata.delete(fromPath);
         }
     }
 }
@@ -160,6 +178,7 @@ async function makeClient(
         onOpenYjsContent?: (path: string, content: string) => Promise<boolean>;
         flushOpenYjsChanges?: (path: string) => Promise<void>;
         onRemotePluginFilesChanged?: () => void;
+        onRemoteConfigApplied?: (path: string, bytes: Uint8Array) => void;
     } = {},
 ): Promise<{
     client: SyncClient;
@@ -285,7 +304,7 @@ async function makeClient(
         options.getDocSync,
         undefined,
         undefined,
-        undefined,
+        options.onRemoteConfigApplied,
         options.onRemotePluginFilesChanged,
         options.onOpenYjsContent,
         options.flushOpenYjsChanges,
@@ -535,6 +554,53 @@ describe("SyncClient initial snapshot", () => {
         Y.applyUpdateV2(materialized, rows[0]!.data!);
         expect(materialized.getText(MARKDOWN_FIELD).toString()).toBe("base local");
         materialized.destroy();
+    });
+
+    it("replays pending closed-document Yjs rows before DocSync upload after restart", async () => {
+        const path = "notes/existing.md";
+        const baseState = docStateFromContent("base", Y);
+        const editedDoc = new Y.Doc();
+        Y.applyUpdateV2(editedDoc, baseState);
+        const beforeEdit = Y.encodeStateVector(editedDoc);
+        editedDoc.getText(MARKDOWN_FIELD).insert(4, " typed-before-checkpoint");
+        const pendingUpdate = Y.encodeStateAsUpdateV2(editedDoc, beforeEdit);
+        editedDoc.destroy();
+
+        const stateStore = new MemoryYjsStateStore();
+        await stateStore.put(path, baseState);
+        const outbox = new MemoryOutboxStore([{
+            mutationId: "pending-yjs",
+            operation: "YjsUpdate",
+            path,
+            data: pendingUpdate,
+            created: 1,
+        }]);
+        const { client } = await makeClient({ [path]: "base typed-before-checkpoint" }, stateStore, outbox);
+        const emptyServerState = docStateFromContent("", Y);
+        (client as unknown as {
+            requestDocSync: () => Promise<unknown>;
+        }).requestDocSync = vi.fn(async () => ({
+            type: opType.DocSyncAck,
+            paths: [{
+                path,
+                data: new Uint8Array(),
+                stateVector: Y.encodeStateVectorFromUpdateV2(emptyServerState),
+                yjsState: emptyServerState,
+            }],
+        }));
+
+        const jsonl = await (client as unknown as {
+            prepareSegmentJsonl: (socket: WebSocket, segment: OutboxSegment) => Promise<string>;
+        }).prepareSegmentJsonl({ send: vi.fn() } as unknown as WebSocket, { id: "segment", path: "pending.jsonl" });
+
+        const rows = decodeUpdateBatchJsonl(jsonl);
+        expect(rows).toHaveLength(1);
+        const materialized = new Y.Doc();
+        Y.applyUpdateV2(materialized, emptyServerState);
+        Y.applyUpdateV2(materialized, rows[0]!.data!);
+        expect(materialized.getText(MARKDOWN_FIELD).toString()).toBe("base typed-before-checkpoint");
+        materialized.destroy();
+        expect(readYjsContent(stateStore.states.get(path)!)).toBe("base typed-before-checkpoint");
     });
 
     it("waits for startup sync before requesting a bootstrap link", async () => {
@@ -968,6 +1034,43 @@ describe("SyncClient initial snapshot", () => {
         });
 
         expect(onRemotePluginFilesChanged).not.toHaveBeenCalled();
+    });
+
+    it("applies remote config bytes through the config callback for restart reconciliation", async () => {
+        const onRemoteConfigApplied = vi.fn();
+        const files: Record<string, string | Uint8Array> = {
+            ".obsidian/workspace.json": new TextEncoder().encode("{\"old\":true}"),
+        };
+        const { client } = await makeClient(files, new MemoryYjsStateStore(), new MemoryOutboxStore(), {
+            onRemoteConfigApplied,
+        });
+        const testClient = client as unknown as {
+            lastPulledRevision: string;
+            applyChangeBatch: (packet: unknown) => Promise<void>;
+        };
+        testClient.lastPulledRevision = "1";
+        const bytes = new TextEncoder().encode("{\"remote\":true}");
+
+        await testClient.applyChangeBatch({
+            type: opType.ChangeBatch,
+            fromRevision: "1",
+            serverRevision: "2",
+            changes: [{
+                mutationId: "remote-config",
+                operation: "UpsertFile",
+                path: ".obsidian/workspace.json",
+                contentBytes: bytes,
+                isFolder: false,
+                isYjs: false,
+                storageKind: "bytea",
+                created: Date.now(),
+                revision: "2",
+                clientId: "other-client",
+            }],
+        });
+
+        expect(files[".obsidian/workspace.json"]).toEqual(bytes);
+        expect(onRemoteConfigApplied).toHaveBeenCalledWith(".obsidian/workspace.json", bytes);
     });
 
     it("merges a full remote Yjs state into an open document with pending local edits", async () => {
@@ -1449,6 +1552,53 @@ describe("SyncClient initial snapshot", () => {
         expect(liveClient.livePushBacklog).toHaveLength(0);
     });
 
+    it("does not satisfy a pull waiter with an uncorrelated live push", async () => {
+        const files = { "notes/existing.md": "before" };
+        const { client } = await makeClient(files);
+        const ws = new FakeWebSocket();
+        const wait = (client as unknown as {
+            waitForPullResponse: (socket: FakeWebSocket, requestId: string) => Promise<unknown>;
+        }).waitForPullResponse(ws, "pull-1");
+        let resolved = false;
+        wait.then(() => {
+            resolved = true;
+        });
+
+        ws.emitPacket({
+            type: opType.ChangeBatch,
+            fromRevision: "1",
+            serverRevision: "2",
+            changes: [{
+                mutationId: "live-first",
+                operation: "UpsertFile",
+                path: "notes/existing.md",
+                content: "live",
+                storageKind: "text",
+                isFolder: false,
+                isYjs: false,
+                created: Date.now(),
+                revision: "2",
+                clientId: "other-client",
+            }],
+        });
+        await Promise.resolve();
+        expect(resolved).toBe(false);
+
+        ws.emitPacket({
+            type: opType.ChangeBatch,
+            requestId: "pull-1",
+            fromRevision: "1",
+            serverRevision: "3",
+            changes: [],
+        });
+
+        await expect(wait).resolves.toMatchObject({
+            type: opType.ChangeBatch,
+            requestId: "pull-1",
+            serverRevision: "3",
+        });
+    });
+
     it("does not advance revision on an empty change batch with a higher server cursor", async () => {
         const persisted: string[] = [];
         const { client } = await makeClient({ "notes/existing.md": "before" });
@@ -1472,6 +1622,74 @@ describe("SyncClient initial snapshot", () => {
 
         expect(testClient.lastPulledRevision).toBe("5");
         expect(persisted).toEqual([]);
+    });
+
+    it("advances across mostly echoed reconnect revisions while applying remote interleavings", async () => {
+        const files = { "notes/existing.md": "local" };
+        const stateStore = new MemoryYjsStateStore();
+        const { client } = await makeClient(files, stateStore);
+        const testClient = client as unknown as {
+            lastPulledRevision: string;
+            applyChangeBatch: (packet: unknown) => Promise<void>;
+        };
+        testClient.lastPulledRevision = "0";
+        const changes = Array.from({ length: 600 }, (_, index) => {
+            const revision = String(index + 1);
+            if (revision === "250") {
+                return {
+                    mutationId: "remote-note-250",
+                    operation: "UpsertFile" as const,
+                    path: "notes/existing.md",
+                    content: "remote 250",
+                    yjsState: docStateFromContent("remote 250", Y),
+                    storageKind: "text" as const,
+                    isFolder: false,
+                    isYjs: true,
+                    created: Date.now(),
+                    revision,
+                    clientId: "other-client",
+                };
+            }
+            if (revision === "500") {
+                return {
+                    mutationId: "remote-note-500",
+                    operation: "UpsertFile" as const,
+                    path: "notes/existing.md",
+                    content: "remote 500",
+                    yjsState: docStateFromContent("remote 500", Y),
+                    storageKind: "text" as const,
+                    isFolder: false,
+                    isYjs: true,
+                    created: Date.now(),
+                    revision,
+                    clientId: "other-client",
+                };
+            }
+            return {
+                mutationId: `echo-${revision}`,
+                operation: "UpsertFile" as const,
+                path: `notes/local-${revision}.md`,
+                content: `echo ${revision}`,
+                storageKind: "text" as const,
+                isFolder: false,
+                isYjs: false,
+                created: Date.now(),
+                revision,
+                clientId: "client",
+            };
+        });
+
+        await testClient.applyChangeBatch({
+            type: opType.ChangeBatch,
+            fromRevision: "0",
+            serverRevision: "600",
+            changes,
+        });
+
+        expect(testClient.lastPulledRevision).toBe("600");
+        expect(files["notes/existing.md"]).toBe("remote 500");
+        expect(files["notes/local-600.md"]).toBeUndefined();
+        expect(readYjsContent(stateStore.states.get("notes/existing.md")!)).toBe("remote 500");
     });
 
     it("pulls remote startup changes before flushing pending local outbox", async () => {

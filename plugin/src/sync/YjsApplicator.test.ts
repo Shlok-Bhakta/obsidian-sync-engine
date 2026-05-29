@@ -133,6 +133,24 @@ describe("YjsApplicator", () => {
         expect(readYjsContent(stateStore.states.get("notes/a.md")!)).toBe("base remote");
     });
 
+    it("routes remote markdown into an open editor even before DocSync exists", async () => {
+        const files = { "notes/a.md": "local open copy" };
+        const stateStore = new MemoryStateStore();
+        const applied: string[] = [];
+        const applicator = makeApplicator(files, stateStore, {
+            onOpenYjsContent: async (_path, content) => {
+                applied.push(content);
+                return true;
+            },
+        });
+
+        await applicator.applyState("notes/a.md", docStateFromContent("remote content", Y), "2");
+
+        expect(applied).toEqual(["remote content"]);
+        expect(files["notes/a.md"]).toBe("local open copy");
+        expect(readYjsContent(stateStore.states.get("notes/a.md")!)).toBe("remote content");
+    });
+
     it("flushes open-editor changes before merging a full remote state", async () => {
         const files = { "notes/a.md": "base" };
         const stateStore = new MemoryStateStore();
@@ -219,5 +237,52 @@ describe("YjsApplicator", () => {
         expect(openDoc.getYdoc().getText(MARKDOWN_FIELD).toString()).toBe("base remote local");
         expect(readYjsContent(stateStore.states.get("notes/a.md")!)).toBe("base remote local");
         expect(openDoc.hasServerSyncedState()).toBe(false);
+    });
+
+    it("uses CRDT merge for open documents marked server-synced", async () => {
+        const files = { "notes/a.md": "base" };
+        const stateStore = new MemoryStateStore();
+        const initialState = docStateFromContent("base", Y);
+        await stateStore.put("notes/a.md", initialState);
+        const openDoc = new DocSync(
+            new MemoryOutbox(),
+            stateStore as unknown as YjsStateStore,
+            "notes/a.md",
+            initialState,
+            true,
+        );
+        const localEdit = EditorState.create({ doc: "base" }).update({
+            changes: { from: 4, insert: " local" },
+        });
+        await openDoc.applyChanges(localEdit.changes, {
+            mutationId: crypto.randomUUID(),
+            operation: "YjsUpdate",
+            path: "notes/a.md",
+            data: new Uint8Array(),
+            created: Date.now(),
+        });
+
+        const remoteDoc = new Y.Doc();
+        Y.applyUpdateV2(remoteDoc, initialState);
+        remoteDoc.getText(MARKDOWN_FIELD).insert(4, " remote");
+        const remoteState = Y.encodeStateAsUpdateV2(remoteDoc);
+        remoteDoc.destroy();
+        const applied: string[] = [];
+        const applicator = makeApplicator(files, stateStore, {
+            getDocSync: path => path === "notes/a.md" ? openDoc : undefined,
+            onOpenYjsContent: async (_path, content) => {
+                applied.push(content);
+                return true;
+            },
+        });
+
+        await applicator.applyState("notes/a.md", remoteState);
+
+        const merged = openDoc.getYdoc().getText(MARKDOWN_FIELD).toString();
+        expect(merged).toContain("base");
+        expect(merged).toContain("local");
+        expect(merged).toContain("remote");
+        expect(merged.match(/base/g)).toHaveLength(1);
+        expect(applied).toEqual([merged]);
     });
 });

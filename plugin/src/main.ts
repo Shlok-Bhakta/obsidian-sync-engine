@@ -658,6 +658,7 @@ export default class SyncEngine extends Plugin {
 		const contentHash = await sha256Hex(new TextEncoder().encode(initialContent));
 		const cachedHash = await this.yjsStateStore.getContentHash(pathID);
 		let initialState = await this.yjsStateStore.get(pathID);
+		let initialServerSyncedState = false;
 		if (!initialState || cachedHash !== contentHash) {
 			initialState = docStateFromContent(initialContent, Y);
 			await this.yjsStateStore.putWithContentHash(
@@ -666,8 +667,11 @@ export default class SyncEngine extends Plugin {
 				contentHash,
 			);
 			log.debug("seeded Yjs state for open document", { path: pathID, chars: initialContent.length });
+		} else {
+			const metadata = await this.yjsStateStore.getMetadata?.(pathID);
+			initialServerSyncedState = metadata?.serverSynced === true;
 		}
-		const dsync = new DocSync(this.db, this.yjsStateStore, pathID, initialState);
+		const dsync = new DocSync(this.db, this.yjsStateStore, pathID, initialState, initialServerSyncedState);
 		this.docs.set(pathID, dsync);
 		log.debug("created DocSync", { path: pathID });
 		return dsync;

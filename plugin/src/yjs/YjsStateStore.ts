@@ -1,5 +1,10 @@
 import { App, normalizePath, PluginManifest } from "obsidian";
 
+export type YjsStateMetadata = {
+    serverSynced: boolean;
+    serverRevision: string | null;
+};
+
 export class YjsStateStore {
     private readonly dir: string;
     private mutationQueue: Promise<void> = Promise.resolve();
@@ -18,6 +23,10 @@ export class YjsStateStore {
 
     contentHashPathFor(vaultPath: string): string {
         return normalizePath(`${this.statePathFor(vaultPath)}.sha256`);
+    }
+
+    metadataPathFor(vaultPath: string): string {
+        return normalizePath(`${this.statePathFor(vaultPath)}.meta.json`);
     }
 
     async has(vaultPath: string): Promise<boolean> {
@@ -52,6 +61,47 @@ export class YjsStateStore {
                 state.byteOffset + state.byteLength,
             ));
             await this.app.vault.adapter.write(this.contentHashPathFor(vaultPath), hash);
+            await this.writeMetadata(vaultPath, { serverSynced: false, serverRevision: null });
+        });
+    }
+
+    async putServerSyncedState(
+        vaultPath: string,
+        state: Uint8Array,
+        hash: string,
+        serverRevision: string,
+    ): Promise<void> {
+        return this.runSerialized(async () => {
+            const statePath = this.statePathFor(vaultPath);
+            await this.ensureDirectory(dirname(statePath));
+            await this.app.vault.adapter.writeBinary(statePath, state.buffer.slice(
+                state.byteOffset,
+                state.byteOffset + state.byteLength,
+            ));
+            await this.app.vault.adapter.write(this.contentHashPathFor(vaultPath), hash);
+            await this.writeMetadata(vaultPath, { serverSynced: true, serverRevision });
+        });
+    }
+
+    async getMetadata(vaultPath: string): Promise<YjsStateMetadata | null> {
+        const path = this.metadataPathFor(vaultPath);
+        if (!(await this.app.vault.adapter.exists(path))) {
+            return null;
+        }
+        try {
+            const parsed = JSON.parse(await this.app.vault.adapter.read(path)) as Partial<YjsStateMetadata>;
+            return {
+                serverSynced: parsed.serverSynced === true,
+                serverRevision: typeof parsed.serverRevision === "string" ? parsed.serverRevision : null,
+            };
+        } catch {
+            return null;
+        }
+    }
+
+    async putMetadata(vaultPath: string, metadata: YjsStateMetadata): Promise<void> {
+        return this.runSerialized(async () => {
+            await this.writeMetadata(vaultPath, metadata);
         });
     }
 
@@ -84,6 +134,7 @@ export class YjsStateStore {
             }
             await this.renamePathIfExists(fromPath, toPath, false);
             await this.renamePathIfExists(`${fromPath}.sha256`, `${toPath}.sha256`, false);
+            await this.renamePathIfExists(`${fromPath}.meta.json`, `${toPath}.meta.json`, false);
         });
     }
 
@@ -93,8 +144,15 @@ export class YjsStateStore {
             await this.deleteAtPath(path, isFolder);
             if (!isFolder) {
                 await this.deleteAtPath(`${path}.sha256`, false);
+                await this.deleteAtPath(`${path}.meta.json`, false);
             }
         });
+    }
+
+    private async writeMetadata(vaultPath: string, metadata: YjsStateMetadata): Promise<void> {
+        const path = this.metadataPathFor(vaultPath);
+        await this.ensureDirectory(dirname(path));
+        await this.app.vault.adapter.write(path, JSON.stringify(metadata));
     }
 
     private async renamePathIfExists(fromPath: string, toPath: string, isFolder: boolean): Promise<void> {

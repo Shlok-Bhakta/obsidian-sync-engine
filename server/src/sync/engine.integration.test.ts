@@ -8,6 +8,7 @@ import { decodePacket, encodePacket, encodePathToken, encodeUpdateBatchJsonl, PR
 import { shouldSyncPath, shouldUseYjs } from "../../../shared/pathPolicy";
 import {
   acceptMutations,
+  changeBatchPacket,
   compactYjsEvents,
   countYjsEvents,
   getCompactedRevision,
@@ -547,6 +548,26 @@ describeIntegration("sync engine postgres integration", () => {
     expect(file?.yjsState).toEqual(clientState);
   });
 
+  it("includes materialized markdown yjs_state on UpsertFile change batches", async () => {
+    const clientState = stateFromMarkdown("client seeded");
+
+    await acceptMutations(CLIENT_A, [{
+      mutationId: crypto.randomUUID(),
+      operation: "UpsertFile",
+      path: NOTE_PATH,
+      content: "client seeded",
+      yjsState: clientState,
+      isYjs: true,
+      storageKind: "text",
+      created: Date.now(),
+    }]);
+
+    const batch = await changeBatchPacket("0");
+    const change = batch.changes.find(entry => entry.path === NOTE_PATH);
+    expect(change?.operation).toBe("UpsertFile");
+    expect(change?.yjsState).toEqual(clientState);
+  });
+
   it("rejects markdown UpsertFile when content and yjs_state disagree", async () => {
     const beforeRevision = await getServerRevision();
 
@@ -704,6 +725,13 @@ describeIntegration("sync engine postgres integration", () => {
     expect(await getFile("notes/stale.md")).toBeNull();
     expect((await getFile(NOTE_PATH))?.content).toBe("bootstrapped note");
     expect((await readBlobFile(blobPath))?.bytes).toEqual(blobBytes);
+    const blobFile = await getFile(blobPath);
+    const blobEvents = await listSyncEvents(blobPath);
+    expect(BigInt(blobFile?.revision ?? "0")).toBeGreaterThan(0n);
+    expect(blobEvents).toHaveLength(1);
+    expect(blobEvents[0]?.operation).toBe("UpsertFile");
+    expect(blobEvents[0]?.storageKind).toBe("lo");
+    expect(blobEvents[0]?.revision).toBe(blobFile!.revision);
 
     const stagedRows = await sql<{ count: string }[]>`
       SELECT COUNT(*)::TEXT AS count

@@ -158,21 +158,25 @@ export type wsPacket =
     | {
         type: opType.PullSince;
         revision: Revision;
+        requestId?: string;
     }
     | {
         type: opType.InitRequired;
         serverRevision: Revision;
+        requestId?: string;
     }
     | {
         type: opType.ChangeBatch;
         fromRevision: Revision;
         serverRevision: Revision;
         changes: ServerChange[];
+        requestId?: string;
     }
     | {
         type: opType.SnapshotReset;
         targetRevision: Revision;
         files: ServerChange[];
+        requestId?: string;
     }
     | {
         type: opType.BootstrapCreate;

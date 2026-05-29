@@ -15,6 +15,7 @@ const authPacketSchema = z.object({
 const pullSincePacketSchema = z.object({
     type: z.literal(opType.PullSince),
     revision: revisionSchema,
+    requestId: z.string().min(1).optional(),
 });
 
 const updateBatchPacketSchema = z.object({
@@ -63,6 +64,7 @@ const batchAckPacketSchema = z.object({
 const initRequiredPacketSchema = z.object({
     type: z.literal(opType.InitRequired),
     serverRevision: revisionSchema,
+    requestId: z.string().min(1).optional(),
 });
 
 const changeBatchPacketSchema = z.object({
@@ -70,12 +72,14 @@ const changeBatchPacketSchema = z.object({
     fromRevision: revisionSchema,
     serverRevision: revisionSchema,
     changes: z.array(z.record(z.unknown())),
+    requestId: z.string().min(1).optional(),
 });
 
 const snapshotResetPacketSchema = z.object({
     type: z.literal(opType.SnapshotReset),
     targetRevision: revisionSchema,
     files: z.array(z.record(z.unknown())),
+    requestId: z.string().min(1).optional(),
 });
 
 const bootstrapCreatePacketSchema = z.object({

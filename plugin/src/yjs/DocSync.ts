@@ -161,7 +161,7 @@ export class DocSync {
         this.editsSinceCheckpoint = 0;
     }
 
-    public async replaceState(state: Uint8Array): Promise<void> {
+    public async replaceState(state: Uint8Array, serverRevision = "0"): Promise<void> {
         this.ydoc.destroy();
         this.ydoc = new Y.Doc();
         Y.applyUpdateV2(this.ydoc, state);
@@ -170,14 +170,19 @@ export class DocSync {
         this.localEditRevision = 0;
         this.serverSyncedState = true;
         this.serverBaseContent = this.ytext.toJSON();
-        await this.persistState();
+        const contentHash = await sha256Hex(new TextEncoder().encode(this.serverBaseContent));
+        if ("putServerSyncedState" in this.stateStore && typeof this.stateStore.putServerSyncedState === "function") {
+            await this.stateStore.putServerSyncedState(this.path, state, contentHash, serverRevision);
+        } else {
+            await this.persistState();
+        }
     }
 
-    public async replaceStateIfRevision(state: Uint8Array, expectedRevision: number): Promise<boolean> {
+    public async replaceStateIfRevision(state: Uint8Array, expectedRevision: number, serverRevision = "0"): Promise<boolean> {
         if (this.localRevision !== expectedRevision) {
             return false;
         }
-        await this.replaceState(state);
+        await this.replaceState(state, serverRevision);
         return true;
     }
 

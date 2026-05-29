@@ -291,6 +291,10 @@ export async function buildBootstrapZip(request: BootstrapBuildRequest): Promise
         const statePath = join(vaultRoot, ".sync-engine-state", request.pluginId, "yjs", `${row.path}.state`);
         await writeFileBytes(statePath, row.yjsState);
         await writeFileBytes(`${statePath}.sha256`, new TextEncoder().encode(await sha256Hex(bytes)));
+        await writeFileBytes(`${statePath}.meta.json`, new TextEncoder().encode(JSON.stringify({
+          serverSynced: true,
+          serverRevision: row.revision,
+        })));
       }
     }
 

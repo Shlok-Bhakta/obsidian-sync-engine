@@ -255,7 +255,9 @@ function rowToChange(row: EventRow): ServerChange {
     content: row.content ?? undefined,
     contentBytes: row.storageKind === "bytea" ? row.contentBytes ?? undefined : undefined,
     data: row.payload ?? undefined,
-    yjsState: row.operation === "YjsUpdate" && row.yjsState ? row.yjsState : undefined,
+    yjsState: row.yjsState && (row.operation === "YjsUpdate" || (row.operation === "UpsertFile" && row.isYjs === true))
+      ? row.yjsState
+      : undefined,
     isFolder: row.isFolder ?? undefined,
     isYjs: row.isYjs ?? undefined,
     storageKind: row.storageKind ?? undefined,
@@ -362,7 +364,12 @@ export async function registerClient(
   `;
 }
 
-export async function applyMutation(tx: typeof sql, clientId: string, mutation: SyncMutation): Promise<string> {
+export async function applyMutation(
+  tx: typeof sql,
+  clientId: string,
+  mutation: SyncMutation,
+  options: { stagedBlob?: StagedBlobUpload | null } = {},
+): Promise<string> {
   if (isPluginInternalPath(mutation.path) || (mutation.toPath && isPluginInternalPath(mutation.toPath))) {
     throw new Error(`Refusing to sync plugin-internal path: ${mutation.toPath ?? mutation.path}`);
   }
@@ -387,7 +394,7 @@ export async function applyMutation(tx: typeof sql, clientId: string, mutation: 
     return existing[0].revision;
   }
 
-  let stagedBlob: StagedBlobUpload | null = null;
+  let stagedBlob: StagedBlobUpload | null = options.stagedBlob ?? null;
   if (mutation.operation === "UpsertFile" && mutation.storageKind === "lo" && mutation.blobUploadId) {
     stagedBlob = await consumeStagedBlob(tx, clientId, mutation.blobUploadId, mutation.path);
     if (!stagedBlob) {
@@ -972,6 +979,7 @@ export async function handlePull(packet: Extract<wsPacket, { type: opType.PullSi
     return {
       type: opType.InitRequired,
       serverRevision: "0",
+      requestId: packet.requestId,
     };
   }
 
@@ -984,7 +992,7 @@ export async function handlePull(packet: Extract<wsPacket, { type: opType.PullSi
       targetRevision: snapshot.targetRevision,
       files: snapshot.files.length,
     });
-    return snapshot;
+    return { ...snapshot, requestId: packet.requestId };
   }
 
   const batch = await changeBatchPacket(packet.revision);
@@ -993,7 +1001,7 @@ export async function handlePull(packet: Extract<wsPacket, { type: opType.PullSi
     serverRevision: batch.serverRevision,
     changes: batch.changes.length,
   });
-  return batch;
+  return { ...batch, requestId: packet.requestId };
 }
 
 export async function handleDocSync(paths: DocSyncPath[]): Promise<Extract<wsPacket, { type: opType.DocSyncAck }>> {

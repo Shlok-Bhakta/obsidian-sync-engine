@@ -34,7 +34,7 @@ export class YjsApplicator {
         this.flushOpenYjsChanges = options.flushOpenYjsChanges ?? (async () => {});
     }
 
-    async applyUpdate(path: string, update: Uint8Array): Promise<void> {
+    async applyUpdate(path: string, update: Uint8Array, serverRevision = "0"): Promise<void> {
         const normalized = normalizePath(path);
         await this.flushOpenYjsChanges(normalized);
         const openDoc = this.getDocSync(normalized);
@@ -52,11 +52,10 @@ export class YjsApplicator {
             doc.destroy();
         }
         await this.upsertYjsTextFile(normalized, content);
-        await this.options.stateStore.put(normalized, state);
-        await this.options.stateStore.putContentHash(normalized, await sha256Hex(new TextEncoder().encode(content)));
+        await this.persistServerState(normalized, state, content, serverRevision);
     }
 
-    async applyState(path: string, state: Uint8Array): Promise<void> {
+    async applyState(path: string, state: Uint8Array, serverRevision = "0"): Promise<void> {
         const normalized = normalizePath(path);
         await this.flushOpenYjsChanges(normalized);
         const openDoc = this.getDocSync(normalized);
@@ -66,33 +65,29 @@ export class YjsApplicator {
                     ? openDoc.applyRemoteUpdate(state)
                     : await openDoc.rebaseLocalChangesOntoRemoteState(state);
                 await this.upsertYjsTextFile(normalized, content);
-                await this.options.stateStore.put(normalized, Y.encodeStateAsUpdateV2(openDoc.getYdoc()));
-                await this.options.stateStore.putContentHash(normalized, await sha256Hex(new TextEncoder().encode(content)));
+                await this.persistServerState(normalized, Y.encodeStateAsUpdateV2(openDoc.getYdoc()), content, serverRevision);
                 return;
             }
 
             const content = yjsContentFromState(state);
             await this.upsertYjsTextFile(normalized, content);
-            await this.options.stateStore.put(normalized, state);
-            await this.options.stateStore.putContentHash(normalized, await sha256Hex(new TextEncoder().encode(content)));
-            await openDoc.replaceState(state);
+            await this.persistServerState(normalized, state, content, serverRevision);
+            await openDoc.replaceState(state, serverRevision);
             return;
         }
 
         const content = yjsContentFromState(state);
         await this.upsertYjsTextFile(normalized, content);
-        await this.options.stateStore.put(normalized, state);
-        await this.options.stateStore.putContentHash(normalized, await sha256Hex(new TextEncoder().encode(content)));
+        await this.persistServerState(normalized, state, content, serverRevision);
     }
 
-    async refreshState(path: string, content: string, yjsState?: Uint8Array): Promise<void> {
+    async refreshState(path: string, content: string, yjsState?: Uint8Array, serverRevision = "0"): Promise<void> {
         const state = yjsState ?? docStateFromContent(content, Y);
         const normalized = normalizePath(path);
-        await this.options.stateStore.put(normalized, state);
-        await this.options.stateStore.putContentHash(normalized, await sha256Hex(new TextEncoder().encode(content)));
+        await this.persistServerState(normalized, state, content, serverRevision);
         const openDoc = this.getDocSync(normalized);
         if (openDoc) {
-            await openDoc.replaceState(state);
+            await openDoc.replaceState(state, serverRevision);
         }
     }
 
@@ -113,10 +108,20 @@ export class YjsApplicator {
 
     private async upsertYjsTextFile(path: string, content: string): Promise<void> {
         const normalized = normalizePath(path);
-        if (this.getDocSync(normalized) && await this.onOpenYjsContent(normalized, content)) {
+        if (await this.onOpenYjsContent(normalized, content)) {
             return;
         }
         await this.options.vaultMutator.upsertTextFile(normalized, content);
+    }
+
+    private async persistServerState(path: string, state: Uint8Array, content: string, serverRevision: string): Promise<void> {
+        const contentHash = await sha256Hex(new TextEncoder().encode(content));
+        if ("putServerSyncedState" in this.options.stateStore && typeof this.options.stateStore.putServerSyncedState === "function") {
+            await this.options.stateStore.putServerSyncedState(path, state, contentHash, serverRevision);
+            return;
+        }
+        await this.options.stateStore.put(path, state);
+        await this.options.stateStore.putContentHash(path, contentHash);
     }
 
     private async getOrSeedState(path: string): Promise<Uint8Array> {

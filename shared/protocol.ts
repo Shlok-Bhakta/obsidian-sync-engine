@@ -223,14 +223,14 @@ export function decodePacket(packet: string): wsPacket {
         });
     }
     if (typed.type === opType.ChangeBatch) {
-        const batch = data as { type: opType.ChangeBatch; fromRevision: string; serverRevision: string; changes: EncodedServerChange[] };
+        const batch = data as { type: opType.ChangeBatch; fromRevision: string; serverRevision: string; changes: EncodedServerChange[]; requestId?: string };
         return validatePacket({
             ...batch,
             changes: batch.changes.map(decodeServerChange),
         });
     }
     if (typed.type === opType.SnapshotReset) {
-        const reset = data as { type: opType.SnapshotReset; targetRevision: string; files: EncodedServerChange[] };
+        const reset = data as { type: opType.SnapshotReset; targetRevision: string; files: EncodedServerChange[]; requestId?: string };
         return validatePacket({
             ...reset,
             files: reset.files.map(decodeServerChange),

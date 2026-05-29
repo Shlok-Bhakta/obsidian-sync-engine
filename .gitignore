@@ -32,5 +32,6 @@ tunnel.sh
 db_data/*
 logfile
 mega-test-results/
+.real-e2e-cache/
 
 .env

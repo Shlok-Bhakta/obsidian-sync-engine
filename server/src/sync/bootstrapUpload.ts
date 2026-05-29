@@ -47,6 +47,7 @@ export async function acceptBootstrapSnapshot(
 
     let latest = "0";
     for (const mutation of mutations) {
+      let stagedBlob = null;
       if (mutation.operation === "UpsertFile" && mutation.storageKind === "lo") {
         const staged = await tx<{
           contentOid: number;
@@ -65,55 +66,19 @@ export async function acceptBootstrapSnapshot(
         if (!staged[0]) {
           throw new Error(`Bootstrap blob is missing for ${mutation.path}`);
         }
-        await tx`
-          INSERT INTO files (
-            path,
-            content,
-            content_bytes,
-            content_oid,
-            storage_kind,
-            byte_size,
-            content_sha256,
-            yjs_state,
-            is_folder,
-            is_yjs,
-            deleted,
-            revision,
-            updated_at
-          )
-          VALUES (
-            ${mutation.path},
-            NULL,
-            NULL,
-            ${staged[0].contentOid},
-            'lo',
-            ${staged[0].byteSize}::BIGINT,
-            ${staged[0].contentSha256},
-            NULL,
-            FALSE,
-            FALSE,
-            FALSE,
-            0,
-            NOW()
-          )
-          ON CONFLICT (path) DO UPDATE SET
-            content = NULL,
-            content_bytes = NULL,
-            content_oid = EXCLUDED.content_oid,
-            storage_kind = 'lo',
-            byte_size = EXCLUDED.byte_size,
-            content_sha256 = EXCLUDED.content_sha256,
-            yjs_state = NULL,
-            is_folder = FALSE,
-            is_yjs = FALSE,
-            deleted = FALSE,
-            updated_at = NOW();
-        `;
+        stagedBlob = {
+          uploadId: `bootstrap:${bootstrapId}:${mutation.path}`,
+          clientId,
+          path: mutation.path,
+          contentOid: staged[0].contentOid,
+          byteSize: Number.parseInt(staged[0].byteSize, 10),
+          contentSha256: staged[0].contentSha256,
+        };
       }
       latest = await applyMutation(tx, clientId, {
         ...mutation,
         mutationId: `bootstrap:${bootstrapId}:${mutation.mutationId}`,
-      });
+      }, { stagedBlob });
     }
 
     const staleRows = await tx<{ contentOid: number | null }[]>`
