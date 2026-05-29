@@ -5,6 +5,7 @@ import { folderDescendantLike } from "../sqlUtils";
 import * as Y from "yjs";
 import {
   applyYjsPayload,
+  contentFromYjsState,
   docStateFromContent,
   encodeMissingUpdate,
   replayYjsPayloads,
@@ -419,6 +420,43 @@ export async function applyMutation(tx: typeof sql, clientId: string, mutation: 
     return revision;
   }
 
+  if (mutation.operation === "UpsertFile") {
+    const isYjs = mutation.isYjs ?? shouldUseYjs(mutation.path);
+    const storageKind = mutation.storageKind ?? (isYjs ? "text" : mutation.contentBytes ? "bytea" : "text");
+    if (isYjs && storageKind !== "text") {
+      throw new Error(`Yjs markdown file ${mutation.path} must use text storage`);
+    }
+    if (isYjs && mutation.yjsState) {
+      const yjsContent = contentFromYjsState(mutation.yjsState);
+      const content = mutation.content ?? "";
+      if (yjsContent !== content) {
+        throw new Error(`Yjs state/content mismatch for ${mutation.path}`);
+      }
+    }
+  }
+
+  let yjsUpdateResult: { content: string; state: Uint8Array; contentOid: number | null } | null = null;
+  if (mutation.operation === "YjsUpdate") {
+    if (!mutation.data) {
+      throw new Error(`Yjs update for ${mutation.path} is missing payload`);
+    }
+    const current = await tx<{ yjsState: Uint8Array | null; contentOid: number | null }[]>`
+      SELECT yjs_state AS "yjsState", content_oid AS "contentOid"
+      FROM files
+      WHERE path = ${mutation.path}
+      FOR UPDATE;
+    `;
+    const next = applyYjsPayload(current[0]?.yjsState ?? null, mutation.data);
+    if (next.hasPendingUpdates) {
+      throw new Error(`Yjs update for ${mutation.path} has unresolved dependencies; run DocSync before uploading`);
+    }
+    yjsUpdateResult = {
+      content: next.content,
+      state: next.state,
+      contentOid: current[0]?.contentOid ?? null,
+    };
+  }
+
   const inserted = await tx<RevisionRow[]>`
     INSERT INTO sync_events (
       client_id,
@@ -559,20 +597,13 @@ export async function applyMutation(tx: typeof sql, clientId: string, mutation: 
         updated_at = NOW();
     `;
   } else if (mutation.operation === "YjsUpdate") {
-    if (!mutation.data) {
-      throw new Error(`Yjs update for ${mutation.path} is missing payload`);
+    if (!yjsUpdateResult) {
+      throw new Error(`Yjs update for ${mutation.path} was not prepared`);
     }
-    const current = await tx<{ yjsState: Uint8Array | null; contentOid: number | null }[]>`
-      SELECT yjs_state AS "yjsState", content_oid AS "contentOid"
-      FROM files
-      WHERE path = ${mutation.path}
-      FOR UPDATE;
-    `;
-    await unlinkLargeObject(current[0]?.contentOid, tx);
-    const next = applyYjsPayload(current[0]?.yjsState ?? null, mutation.data);
+    await unlinkLargeObject(yjsUpdateResult.contentOid, tx);
     await tx`
       INSERT INTO files (path, content, yjs_state, is_folder, is_yjs, deleted, revision, updated_at)
-      VALUES (${mutation.path}, ${next.content}, ${next.state}, FALSE, TRUE, FALSE, ${revision}, NOW())
+      VALUES (${mutation.path}, ${yjsUpdateResult.content}, ${yjsUpdateResult.state}, FALSE, TRUE, FALSE, ${revision}, NOW())
       ON CONFLICT (path) DO UPDATE SET
         content = EXCLUDED.content,
         content_bytes = NULL,

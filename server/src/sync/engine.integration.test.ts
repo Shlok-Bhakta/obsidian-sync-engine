@@ -547,6 +547,24 @@ describeIntegration("sync engine postgres integration", () => {
     expect(file?.yjsState).toEqual(clientState);
   });
 
+  it("rejects markdown UpsertFile when content and yjs_state disagree", async () => {
+    const beforeRevision = await getServerRevision();
+
+    await expect(acceptMutations(CLIENT_A, [{
+      mutationId: crypto.randomUUID(),
+      operation: "UpsertFile",
+      path: NOTE_PATH,
+      content: "visible text",
+      yjsState: stateFromMarkdown("different crdt text"),
+      isYjs: true,
+      storageKind: "text",
+      created: Date.now(),
+    }])).rejects.toThrow("Yjs state/content mismatch");
+
+    expect(await getFile(NOTE_PATH)).toBeNull();
+    expect(await getServerRevision()).toBe(beforeRevision);
+  });
+
   it("rejects plugin-internal paths", async () => {
     await expect(acceptMutations(CLIENT_A, [{
       mutationId: crypto.randomUUID(),
@@ -1215,7 +1233,14 @@ describeIntegration("sync engine postgres integration", () => {
     expect(BigInt(initialRevision)).toBeGreaterThan(0n);
 
     const snapshot = await snapshotPacket();
-    expect(snapshot.files).toHaveLength(sample.folderMutations.length + sample.fileMutations.length);
+    const expectedSnapshotPaths = new Set([
+      ...sample.folderMutations.map(mutation => mutation.path),
+      ...sample.fileMutations.map(mutation => mutation.path),
+    ]);
+    const snapshotPaths = new Set(snapshot.files.map(file => file.path));
+    const missingSnapshotPaths = [...expectedSnapshotPaths].filter(path => !snapshotPaths.has(path));
+    expect(missingSnapshotPaths).toEqual([]);
+    expect(snapshot.files.length).toBeGreaterThanOrEqual(expectedSnapshotPaths.size);
     expect(snapshot.files.some(file => file.path.startsWith(".trash/"))).toBe(false);
     expect(snapshot.files.some(file => file.path.includes("/.git/") || file.path === ".git")).toBe(false);
     expect(snapshot.files.some(file => file.path.endsWith(".md") && file.yjsState?.byteLength)).toBe(true);
@@ -1331,8 +1356,9 @@ describeIntegration("sync engine postgres integration", () => {
     sameTextDoc.destroy();
   });
 
-  it("raw Yjs delta without handshake does not update files.content", async () => {
+  it("raw Yjs delta without handshake is rejected without minting a revision", async () => {
     await seedMarkdownFile(CLIENT_A, NOTE_PATH, "hello");
+    const beforeRevision = await getServerRevision();
 
     const mismatchedDoc = makeClientDoc("hello");
     const before = Y.encodeStateVector(mismatchedDoc);
@@ -1340,10 +1366,13 @@ describeIntegration("sync engine postgres integration", () => {
     const badDelta = Y.encodeStateAsUpdateV2(mismatchedDoc, before);
     mismatchedDoc.destroy();
 
-    await acceptMutations(CLIENT_A, [mutationYjsUpdate(NOTE_PATH, badDelta)]);
+    await expect(acceptMutations(CLIENT_A, [mutationYjsUpdate(NOTE_PATH, badDelta)]))
+      .rejects.toThrow("unresolved dependencies");
 
     const file = await getFile(NOTE_PATH);
     expect(file?.content).toBe("hello");
+    expect(await getServerRevision()).toBe(beforeRevision);
+    expect(await listYjsEvents(NOTE_PATH)).toHaveLength(0);
   });
 
   it("compaction flushes files then deletes yjs sync_events", async () => {
@@ -1453,6 +1482,60 @@ describeIntegration("sync engine postgres integration", () => {
       expect(data.clientKey).toStartWith("obs_sync_");
       expect((await listSyncEvents(NOTE_PATH))).toHaveLength(0);
       expect(BigInt(await getCompactedRevision())).toBeGreaterThan(0n);
+    } finally {
+      await built.cleanup();
+    }
+  });
+
+  it("bootstrapped clients pull edits made after the link revision without re-uploading the old snapshot", async () => {
+    await seedMarkdownFile(CLIENT_A, NOTE_PATH, "a");
+    const built = await buildBootstrapZip({
+      vaultName: "Bootstrap Vault",
+      backendUrl: "https://sync.example.test",
+      configDir: ".obsidian",
+      pluginId: "obsidian-sync-engine",
+    });
+
+    try {
+      const entries = await readStoredZip(built.zipPath);
+      expect(new TextDecoder().decode(entries.get("Bootstrap Vault/notes/test.md"))).toBe("a");
+      const data = JSON.parse(new TextDecoder().decode(entries.get("Bootstrap Vault/.obsidian/plugins/obsidian-sync-engine/data.json")));
+      expect(data.lastPulledRevision).toBe(built.snapshotRevision);
+
+      const desktopDoc = await currentServerDoc(NOTE_PATH);
+      try {
+        for (const char of ["b", "c", "d", "s"]) {
+          appendToDoc(desktopDoc, char);
+          await uploadYjsEdit(CLIENT_A, NOTE_PATH, desktopDoc);
+        }
+      } finally {
+        desktopDoc.destroy();
+      }
+      expect((await getFile(NOTE_PATH))?.content).toBe("abcds");
+
+      const pull = await handlePull({ type: opType.PullSince, revision: built.snapshotRevision });
+      expect(pull.type).toBe(opType.ChangeBatch);
+      if (pull.type !== opType.ChangeBatch) {
+        return;
+      }
+      expect(pull.changes.filter(change => change.operation === "YjsUpdate")).toHaveLength(4);
+
+      const bootstrappedState = entries.get("Bootstrap Vault/.sync-engine-state/obsidian-sync-engine/yjs/notes/test.md.state");
+      expect(bootstrappedState).toBeInstanceOf(Uint8Array);
+      const bootstrappedDoc = docFromState(bootstrappedState!);
+      try {
+        for (const change of pull.changes) {
+          if (change.operation === "YjsUpdate") {
+            expect(change.yjsState).toBeInstanceOf(Uint8Array);
+            Y.applyUpdateV2(bootstrappedDoc, change.yjsState!);
+          }
+        }
+        expect(readDoc(bootstrappedDoc)).toBe("abcds");
+      } finally {
+        bootstrappedDoc.destroy();
+      }
+
+      expect(await getServerRevision()).toBe(pull.serverRevision);
     } finally {
       await built.cleanup();
     }

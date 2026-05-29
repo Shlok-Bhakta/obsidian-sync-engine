@@ -408,34 +408,6 @@ describe("SyncClient initial snapshot", () => {
         expect(paths).not.toContain("assets/too-large.pdf");
     });
 
-    it("does not keep retrying first-sync upload only because a large blob was skipped", async () => {
-        const { client } = await makeClient({
-            "notes/existing.md": "existing note",
-            "assets/too-large.pdf": new Uint8Array((64 * 1024) + 1),
-            ".obsidian/workspace.json": "{}",
-        });
-        (client as unknown as {
-            blobClient: { upload: () => Promise<void> };
-        }).blobClient.upload = vi.fn(async () => {
-            throw new Error("413");
-        });
-        const testClient = client as unknown as {
-            readVaultSnapshot: () => Promise<outboxData[]>;
-            shouldUploadFirstSyncOverSnapshot: (packet: unknown) => Promise<boolean>;
-        };
-        const uploaded = await testClient.readVaultSnapshot();
-
-        await expect(testClient.shouldUploadFirstSyncOverSnapshot({
-            type: opType.SnapshotReset,
-            targetRevision: "10",
-            files: uploaded.map((change, index) => ({
-                ...change,
-                revision: String(index + 1),
-                clientId: "server",
-            })),
-        })).resolves.toBe(false);
-    });
-
     it("drops stale ignored rows while preparing an outbox segment", async () => {
         const outbox = new MemoryOutboxStore([
             {
@@ -591,11 +563,13 @@ describe("SyncClient initial snapshot", () => {
         });
     });
 
-    it("uploads local first-sync snapshot over a server snapshot that is missing local files", async () => {
-        const { client } = await makeClient({
-            "notes/existing.md": "local note",
+    it("does not upload a local first-sync snapshot over an existing server snapshot", async () => {
+        const files = {
+            "notes/existing.md": "old bootstrap note",
+            "notes/local-only.md": "local-only",
             ".obsidian/workspace.json": "{}",
-        });
+        };
+        const { client } = await makeClient(files);
         const ws = new FakeWebSocket();
         const testClient = client as unknown as {
             runStartupSync: () => Promise<void>;
@@ -619,18 +593,33 @@ describe("SyncClient initial snapshot", () => {
         testClient.pullSince = async () => ({
             type: opType.SnapshotReset,
             targetRevision: "170",
-            files: [{
-                mutationId: "snapshot:assets/blob.pdf:170",
-                operation: "UpsertFile",
-                path: "assets/blob.pdf",
-                contentBytes: new Uint8Array([1]),
-                storageKind: "bytea",
-                isFolder: false,
-                isYjs: false,
-                created: Date.now(),
-                revision: "170",
-                clientId: "server",
-            }],
+            files: [
+                {
+                    mutationId: "snapshot:assets/blob.pdf:169",
+                    operation: "UpsertFile",
+                    path: "assets/blob.pdf",
+                    contentBytes: new Uint8Array([1]),
+                    storageKind: "bytea",
+                    isFolder: false,
+                    isYjs: false,
+                    created: Date.now(),
+                    revision: "169",
+                    clientId: "server",
+                },
+                {
+                    mutationId: "snapshot:notes/existing.md:170",
+                    operation: "UpsertFile",
+                    path: "notes/existing.md",
+                    content: "server latest note",
+                    yjsState: docStateFromContent("server latest note", Y),
+                    storageKind: "text",
+                    isFolder: false,
+                    isYjs: true,
+                    created: Date.now(),
+                    revision: "170",
+                    clientId: "server",
+                },
+            ],
         });
         testClient.bootstrapUploader.uploadAuthoritativeSnapshot = vi.fn(async () => "171");
         testClient.catchUpToServer = async () => {};
@@ -638,9 +627,66 @@ describe("SyncClient initial snapshot", () => {
 
         await testClient.runStartupSync();
 
-        expect(testClient.bootstrapUploader.uploadAuthoritativeSnapshot).toHaveBeenCalledTimes(1);
-        expect(testClient.lastPulledRevision).toBe("171");
-        expect(persisted).toEqual(["171"]);
+        expect(testClient.bootstrapUploader.uploadAuthoritativeSnapshot).not.toHaveBeenCalled();
+        expect(files["notes/existing.md"]).toBe("server latest note");
+        expect(files["notes/local-only.md"]).toBe("local-only");
+        expect(testClient.lastPulledRevision).toBe("170");
+        expect(persisted).toEqual(["170"]);
+        expect(testClient.startupSynced).toBe(true);
+    });
+
+    it("bootstrapped clients catch up edits made after the link revision before indexing can upload", async () => {
+        const path = "notes/existing.md";
+        const stateStore = new MemoryYjsStateStore();
+        await stateStore.put(path, docStateFromContent("a", Y));
+        const files = {
+            [path]: "a",
+            "notes/local-only.md": "created by first Obsidian launch",
+        };
+        const { client } = await makeClient(files, stateStore);
+        const ws = new FakeWebSocket();
+        const latestState = docStateFromContent("abcds", Y);
+        const testClient = client as unknown as {
+            runStartupSync: () => Promise<void>;
+            ensureAuthenticatedSocket: () => Promise<FakeWebSocket>;
+            flushPendingOutboxForStartup: () => Promise<void>;
+            pullSince: (_ws: FakeWebSocket, revision: string) => Promise<unknown>;
+            bootstrapUploader: { uploadAuthoritativeSnapshot: () => Promise<string> };
+            catchUpToServer: (_ws?: FakeWebSocket) => Promise<void>;
+            livePushPromise: Promise<void>;
+            startupSynced: boolean;
+            lastPulledRevision: string;
+        };
+        testClient.lastPulledRevision = "3985";
+        testClient.ensureAuthenticatedSocket = async () => ws;
+        testClient.flushPendingOutboxForStartup = async () => {};
+        testClient.pullSince = vi.fn(async (_socket, revision) => {
+            expect(revision).toBe("3985");
+            return {
+                type: opType.ChangeBatch,
+                fromRevision: "3985",
+                serverRevision: "3989",
+                changes: [{
+                    mutationId: "remote-after-link",
+                    operation: "YjsUpdate",
+                    path,
+                    data: new Uint8Array([1]),
+                    yjsState: latestState,
+                    created: Date.now(),
+                    revision: "3989",
+                    clientId: "desktop-client",
+                }],
+            };
+        });
+        testClient.bootstrapUploader.uploadAuthoritativeSnapshot = vi.fn(async () => "4865");
+        testClient.catchUpToServer = async () => {};
+        testClient.livePushPromise = Promise.resolve();
+
+        await testClient.runStartupSync();
+
+        expect(testClient.bootstrapUploader.uploadAuthoritativeSnapshot).not.toHaveBeenCalled();
+        expect(files[path]).toBe("abcds");
+        expect(testClient.lastPulledRevision).toBe("3989");
         expect(testClient.startupSynced).toBe(true);
     });
 
@@ -1428,10 +1474,14 @@ describe("SyncClient initial snapshot", () => {
         expect(persisted).toEqual([]);
     });
 
-    it("flushes pending local outbox before startup pull can snapshot reset", async () => {
+    it("pulls remote startup changes before flushing pending local outbox", async () => {
         const order: string[] = [];
-        const { client } = await makeClient({ "notes/existing.md": "local" });
+        const path = "notes/existing.md";
+        const stateStore = new MemoryYjsStateStore();
+        await stateStore.put(path, docStateFromContent("a", Y));
+        const { client } = await makeClient({ [path]: "a" }, stateStore);
         const ws = new FakeWebSocket();
+        const latestState = docStateFromContent("abcds", Y);
         const testClient = client as unknown as {
             runStartupSync: () => Promise<void>;
             ensureAuthenticatedSocket: () => Promise<FakeWebSocket>;
@@ -1444,22 +1494,34 @@ describe("SyncClient initial snapshot", () => {
         testClient.ensureAuthenticatedSocket = async () => ws;
         testClient.flushPendingOutboxForStartup = async () => {
             order.push("flush");
+            expect(readYjsContent(stateStore.states.get(path)!)).toBe("abcds");
         };
         testClient.pullSince = async () => {
             order.push("pull");
             return {
                 type: opType.ChangeBatch,
                 fromRevision: "0",
-                serverRevision: "0",
-                changes: [],
+                serverRevision: "3989",
+                changes: [{
+                    mutationId: "remote-after-link",
+                    operation: "YjsUpdate",
+                    path,
+                    data: new Uint8Array([1]),
+                    yjsState: latestState,
+                    created: Date.now(),
+                    revision: "3989",
+                    clientId: "desktop-client",
+                }],
             };
         };
-        testClient.catchUpToServer = async () => {};
+        testClient.catchUpToServer = async () => {
+            order.push("catch-up");
+        };
         testClient.livePushPromise = Promise.resolve();
 
         await testClient.runStartupSync();
 
-        expect(order).toEqual(["flush", "pull"]);
+        expect(order).toEqual(["pull", "catch-up", "flush", "catch-up", "catch-up"]);
         expect(testClient.startupSynced).toBe(true);
     });
 

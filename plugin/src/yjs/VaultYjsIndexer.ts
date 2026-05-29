@@ -56,6 +56,10 @@ export class VaultYjsIndexer {
     }
 
     async ensureFile(file: TAbstractFile): Promise<void> {
+        await this.indexFile(file, true);
+    }
+
+    private async indexFile(file: TAbstractFile, reportChange: boolean): Promise<void> {
         if (!(file instanceof TFile) || file.extension !== "md" || this.shouldIgnorePath(file.path)) {
             return;
         }
@@ -67,7 +71,9 @@ export class VaultYjsIndexer {
         }
         const yjsState = docStateFromContent(content, Y);
         await this.store.putWithContentHash(file.path, yjsState, contentHash);
-        await this.onIndexedChange({ path: file.path, content, yjsState, contentHash });
+        if (reportChange) {
+            await this.onIndexedChange({ path: file.path, content, yjsState, contentHash });
+        }
         log.debug("indexed Yjs state", { path: file.path, chars: content.length });
     }
 
@@ -92,7 +98,7 @@ export class VaultYjsIndexer {
                 log.warn("Yjs vault scan stopped early", { processed, files: files.length });
                 return;
             }
-            await this.ensureFile(file);
+            await this.indexFile(file, false);
             processed++;
             if (processed % BATCH_SIZE === 0) {
                 await sleep(0);

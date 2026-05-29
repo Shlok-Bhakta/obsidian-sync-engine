@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
 import { TFile, TFolder } from "obsidian";
+import { EditorState } from "@codemirror/state";
 import SyncEngine from "./main";
 import { OutboxStore } from "./db/db";
 import { outboxData } from "../../shared/types";
@@ -110,7 +111,7 @@ function makeHarness(files: Record<string, string | Uint8Array> = {}) {
 	plugin.docs = new Map();
 	plugin.pendingDocs = new Map();
 	plugin.pendingFileTimers = new Map();
-	return { plugin: plugin as unknown as SyncEngine, outbox, yjsStateStore, wakeSoon };
+	return { plugin: plugin as unknown as SyncEngine, outbox, yjsStateStore, wakeSoon, syncClient };
 }
 
 describe("SyncEngine local CRUD enqueueing", () => {
@@ -202,6 +203,20 @@ describe("SyncEngine local CRUD enqueueing", () => {
 		expect(outbox.rows[0]?.data?.byteLength).toBe(0);
 		expect(readYjsContent(yjsStateStore.states.get("Notes/existing.md")!)).toBe("hello world");
 		expect(wakeSoon).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not enqueue editor updates produced by remote applies", async () => {
+		const { plugin, outbox, syncClient } = makeHarness();
+		syncClient.isApplyingRemoteChanges.mockImplementation((path?: string) => path === "Notes/open.md");
+		const transaction = EditorState.create({ doc: "abcd" }).update({
+			changes: { from: 4, insert: "efg" },
+		});
+
+		await (plugin as unknown as {
+			handleEditorChange: (update: unknown, path: string) => Promise<void>;
+		}).handleEditorChange(transaction, "Notes/open.md");
+
+		expect(outbox.rows).toHaveLength(0);
 	});
 
 	it("does not enqueue a duplicate closed markdown update when content hash is unchanged", async () => {

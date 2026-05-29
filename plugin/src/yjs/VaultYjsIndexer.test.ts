@@ -86,6 +86,19 @@ function makeIndexer(
 }
 
 describe("VaultYjsIndexer", () => {
+    it("baselines missing Yjs state during startup scan without reporting local changes", async () => {
+        const { indexer, store, onIndexedChange } = makeIndexer({
+            "Notes/a.md": "from bootstrap zip",
+        });
+
+        indexer.start();
+        await indexer.waitForInitialScan();
+
+        expect(onIndexedChange).not.toHaveBeenCalled();
+        expect(readYjsContent(store.states.get("Notes/a.md")!)).toBe("from bootstrap zip");
+        expect(store.hashes.get("Notes/a.md")).toBe(await sha256Hex("from bootstrap zip"));
+    });
+
     it("reports markdown files whose cached content hash changed", async () => {
         const { indexer, store, onIndexedChange } = makeIndexer({
             "Notes/a.md": "current",

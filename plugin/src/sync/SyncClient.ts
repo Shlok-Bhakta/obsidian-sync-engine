@@ -113,7 +113,6 @@ export class SyncClient {
     private readonly vaultMutator: VaultMutator;
     private readonly yjsApplicator: YjsApplicator;
     private readonly bootstrapUploader: BootstrapUploader;
-    private skippedInitialSnapshotPaths = new Set<string>();
 
     constructor(
         private readonly app: App,
@@ -415,7 +414,6 @@ export class SyncClient {
     private async runStartupSync(): Promise<void> {
         this.log.info("startup sync beginning", { lastPulledRevision: this.lastPulledRevision });
         const openWs = await this.ensureAuthenticatedSocket();
-        await this.flushPendingOutboxForStartup();
         const pullResponse = await this.pullSince(openWs, this.lastPulledRevision);
 
         if (pullResponse.type === opType.InitRequired) {
@@ -441,21 +439,13 @@ export class SyncClient {
                     targetRevision: pullResponse.targetRevision,
                     files: pullResponse.files.length,
                 });
-                if (await this.shouldUploadFirstSyncOverSnapshot(pullResponse)) {
-                    this.log.warn("first sync snapshot is missing local files; replacing server with bootstrap snapshot", {
-                        targetRevision: pullResponse.targetRevision,
-                        files: pullResponse.files.length,
-                    });
-                    const revision = await this.bootstrapUploader.uploadAuthoritativeSnapshot();
-                    await this.persistLastPulledRevision(revision);
-                    new Notice("Sync completed first sync by uploading this vault snapshot");
-                } else {
-                    await this.applySnapshotReset(pullResponse);
-                }
+                await this.applySnapshotReset(pullResponse);
             }
         } else {
             throw new Error(`Unexpected pull response: ${pullResponse.type}`);
         }
+        await this.catchUpToServer(openWs);
+        await this.flushPendingOutboxForStartup();
         await this.catchUpToServer(openWs);
         this.startupSynced = true;
         this.recordConnectionSuccess();
@@ -471,7 +461,7 @@ export class SyncClient {
         if (!(await this.outbox.hasPendingChanges())) {
             return;
         }
-        this.log.info("flushing pending outbox before startup pull");
+        this.log.info("flushing pending outbox after startup pull");
         while (!this.stopped && await this.outbox.hasPendingChanges()) {
             const segment = await this.outbox.claimNextSegment(true);
             if (!segment) {
@@ -602,7 +592,6 @@ export class SyncClient {
     private async readVaultSnapshot(): Promise<SyncMutation[]> {
         const created = Date.now();
         const changes: SyncMutation[] = [];
-        this.skippedInitialSnapshotPaths.clear();
         const paths = await this.listSnapshotPaths();
         this.log.debug("reading vault snapshot", { paths: paths.length });
 
@@ -666,7 +655,6 @@ export class SyncClient {
                             blobUploadId: upload.uploadId,
                         });
                     } catch (error) {
-                        this.skippedInitialSnapshotPaths.add(normalizePath(entry.path));
                         this.log.error("skipping large file during initial snapshot after blob upload failure", {
                             path: entry.path,
                             byteSize: contentBytes.byteLength,
@@ -699,18 +687,6 @@ export class SyncClient {
             await this.stateStore.putWithContentHash(path, yjsState, contentHash);
         }
         return { yjsState, contentHash };
-    }
-
-    private async shouldUploadFirstSyncOverSnapshot(packet: Extract<wsPacket, { type: opType.SnapshotReset }>): Promise<boolean> {
-        if (this.lastPulledRevision !== "0") {
-            return false;
-        }
-        const snapshotPaths = new Set(packet.files.map(file => normalizePath(file.path)));
-        const localPaths = await this.listSnapshotPaths();
-        return localPaths.some(entry => {
-            const path = normalizePath(entry.path);
-            return !this.skippedInitialSnapshotPaths.has(path) && !snapshotPaths.has(path);
-        });
     }
 
     private async listSnapshotPaths(): Promise<SnapshotPath[]> {
