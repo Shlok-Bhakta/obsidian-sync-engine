@@ -362,9 +362,6 @@ export default class SyncEngine extends Plugin {
 				return;
 			}
 			const pathID = file.path;
-			if (this.syncClient?.isApplyingRemoteChanges(pathID)) {
-				return;
-			}
 			if (!shouldUseYjs(pathID, this.app.vault.configDir)) {
 				return;
 			}
@@ -632,9 +629,6 @@ export default class SyncEngine extends Plugin {
 	}
 
 	private async handleEditorChange(update: ViewUpdate, pathID: Path): Promise<void> {
-		if (this.syncClient?.isApplyingRemoteChanges(pathID)) {
-			return;
-		}
 		const doc = await this.getOrCreateDoc(pathID, update.startState.doc.toString());
 		const row: outboxData = {
 			mutationId: crypto.randomUUID(),

@@ -57,7 +57,16 @@ class MemoryYjsStateStore {
 function readYjsContent(state: Uint8Array): string {
 	const doc = new Y.Doc();
 	Y.applyUpdateV2(doc, state);
-	const content = doc.getText(MARKDOWN_FIELD).toString();
+	const content = doc.getText(MARKDOWN_FIELD).toJSON();
+	doc.destroy();
+	return content;
+}
+
+function readYjsContentAfterUpdate(state: Uint8Array, update: Uint8Array): string {
+	const doc = new Y.Doc();
+	Y.applyUpdateV2(doc, state);
+	Y.applyUpdateV2(doc, update);
+	const content = doc.getText(MARKDOWN_FIELD).toJSON();
 	doc.destroy();
 	return content;
 }
@@ -221,8 +230,8 @@ describe("SyncEngine local CRUD enqueueing", () => {
 		expect(wakeSoon).toHaveBeenCalledTimes(1);
 	});
 
-	it("does not enqueue editor updates produced by remote applies", async () => {
-		const { plugin, outbox, syncClient } = makeHarness();
+	it("queues real editor updates while a remote apply is in progress", async () => {
+		const { plugin, outbox, syncClient, yjsStateStore } = makeHarness();
 		syncClient.isApplyingRemoteChanges.mockImplementation((path?: string) => path === "Notes/open.md");
 		const transaction = EditorState.create({ doc: "abcd" }).update({
 			changes: { from: 4, insert: "efg" },
@@ -232,7 +241,8 @@ describe("SyncEngine local CRUD enqueueing", () => {
 			handleEditorChange: (update: unknown, path: string) => Promise<void>;
 		}).handleEditorChange(transaction, "Notes/open.md");
 
-		expect(outbox.rows).toHaveLength(0);
+		expect(outbox.rows).toHaveLength(1);
+		expect(readYjsContentAfterUpdate(yjsStateStore.states.get("Notes/open.md")!, outbox.rows[0]!.data!)).toBe("abcdefg");
 	});
 
 	it("does not enqueue a duplicate closed markdown update when content hash is unchanged", async () => {
