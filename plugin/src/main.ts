@@ -18,6 +18,15 @@ import { log } from "./logger";
 const INLINE_BYTES_LIMIT = 16 * 1024;
 const CONFIG_DIR_POLL_MS = Platform.isMobile ? 30_000 : 2000;
 type ConfigDirScanMode = "baseline" | "enqueue";
+type BootVaultEntry = {
+	isFolder: boolean;
+	fingerprint: string | null;
+};
+type PreStartupLocalEvent = {
+	path: string;
+	isFolder: boolean;
+	kind: "create" | "modify";
+};
 type RemoteEditorPresence = EditorPresence & {
 	updatedAt: number;
 };
@@ -201,6 +210,9 @@ export default class SyncEngine extends Plugin {
 	private remoteEditorDispatches: Set<EditorView> = new Set();
 	private configDirPollerStarted = false;
 	private yjsIndexerStarted = false;
+	private startupSyncCompleted = false;
+	private bootVaultEntries = new Map<Path, BootVaultEntry>();
+	private preStartupLocalEvents = new Map<Path, PreStartupLocalEvent>();
 	/** Content hashes of syncable config files on disk before the first startup pull. */
 	private bootConfigSha = new Map<Path, string>();
 	/** Last config file bytes applied from the server during startup/live pull. */
@@ -233,7 +245,10 @@ export default class SyncEngine extends Plugin {
 		this.bootstrapStatusBarEl = this.addStatusBarItem();
 		this.bootstrapStatusBarEl.addClass("sync-engine-bootstrap-statusbar");
 		this.renderBootstrapStatusBar();
-		void this.captureBootConfigShas();
+		await Promise.all([
+			this.captureBootConfigShas(),
+			this.captureBootVaultEntries(),
+		]);
 		this.yjsIndexer = new VaultYjsIndexer(
 			this.app,
 			this.yjsStateStore,
@@ -264,6 +279,8 @@ export default class SyncEngine extends Plugin {
 			(path) => this.docs.get(path),
 			(status) => this.setBootstrapStatus(status),
 			() => {
+				this.startupSyncCompleted = true;
+				void this.flushDeferredPreStartupLocalEvents();
 				this.startConfigDirPoller();
 				if (!Platform.isMobile) {
 					this.startYjsIndexer();
@@ -716,7 +733,13 @@ export default class SyncEngine extends Plugin {
 	}
 
 	private async enqueueLocalCreate(file: TAbstractFile): Promise<void> {
-		if (this.syncClient?.isApplyingRemoteChanges(file.path) || !this.shouldSyncLocalPath(file.path)) {
+		if (
+			this.syncClient?.isApplyingRemoteChanges(file.path) ||
+			!this.shouldSyncLocalPath(file.path)
+		) {
+			return;
+		}
+		if (this.deferPreStartupLocalEvent(file.path, file instanceof TFolder, "create")) {
 			return;
 		}
 		if (file instanceof TFolder) {
@@ -836,25 +859,38 @@ export default class SyncEngine extends Plugin {
 		if (!(file instanceof TFile) || file.extension !== "md") {
 			return;
 		}
-		if (this.docs.has(file.path) || this.pendingDocs.has(file.path)) {
+		if (this.deferPreStartupLocalEvent(file.path, false, "modify")) {
 			return;
 		}
-		if (this.syncClient?.isApplyingRemoteChanges(file.path) || !this.shouldSyncLocalPath(file.path)) {
+		await this.queueMarkdownPathChange(file.path, file);
+	}
+
+	private async queueMarkdownPathChange(path: string, file?: TFile): Promise<void> {
+		if (this.docs.has(path) || this.pendingDocs.has(path)) {
 			return;
 		}
-		const previousState = await this.yjsStateStore.get(file.path);
-		const content = await this.app.vault.read(file);
+		if (
+			this.syncClient?.isApplyingRemoteChanges(path) ||
+			!this.shouldSyncLocalPath(path)
+		) {
+			return;
+		}
+		const previousState = await this.yjsStateStore.get(path);
+		const loaded = file ?? this.app.vault.getAbstractFileByPath(path);
+		const content = loaded instanceof TFile
+			? await this.app.vault.read(loaded)
+			: await this.app.vault.adapter.read(path);
 		const contentHash = await sha256Hex(new TextEncoder().encode(content));
-		if (previousState && await this.yjsStateStore.getContentHash(file.path) === contentHash) {
+		if (previousState && await this.yjsStateStore.getContentHash(path) === contentHash) {
 			return;
 		}
 		const nextState = docStateFromContent(content, Y);
 		await this.yjsStateStore.putWithContentHash(
-			file.path,
+			path,
 			nextState,
 			contentHash,
 		);
-		await this.queueIndexedMarkdownChange(file.path, content, nextState, previousState);
+		await this.queueIndexedMarkdownChange(path, content, nextState, previousState);
 	}
 
 	private async queueIndexedMarkdownChange(
@@ -1007,6 +1043,9 @@ export default class SyncEngine extends Plugin {
 		) {
 			return;
 		}
+		if (this.deferPreStartupLocalEvent(file.path, false, "modify")) {
+			return;
+		}
 		this.queuePathUpsertDebounced(file.path);
 	}
 
@@ -1045,6 +1084,36 @@ export default class SyncEngine extends Plugin {
 				this.bootConfigSha.set(path, await sha256Hex(bytes));
 			} catch (error) {
 				log.debug("failed to capture boot config hash", { path, ...errorContext(error) });
+			}
+		}
+	}
+
+	private async captureBootVaultEntries(): Promise<void> {
+		this.bootVaultEntries.clear();
+		await this.addBootVaultEntries("");
+		await this.addBootVaultEntries(this.app.vault.configDir);
+		log.debug("captured boot vault entries", { entries: this.bootVaultEntries.size });
+	}
+
+	private async addBootVaultEntries(dir: string): Promise<void> {
+		if (dir && !(await this.app.vault.adapter.exists(dir))) {
+			return;
+		}
+		const listed = await this.app.vault.adapter.list(dir);
+		for (const folder of listed.folders) {
+			if (!this.shouldSyncLocalPath(folder)) {
+				continue;
+			}
+			this.bootVaultEntries.set(folder, { isFolder: true, fingerprint: null });
+			await this.addBootVaultEntries(folder);
+		}
+		for (const file of listed.files) {
+			if (!this.shouldSyncLocalPath(file)) {
+				continue;
+			}
+			const stat = await this.app.vault.adapter.stat(file);
+			if (stat?.type === "file") {
+				this.bootVaultEntries.set(file, { isFolder: false, fingerprint: `${stat.mtime}:${stat.size}` });
 			}
 		}
 	}
@@ -1153,6 +1222,81 @@ export default class SyncEngine extends Plugin {
 
 	private shouldSyncLocalPath(path: string): boolean {
 		return shouldSyncPath(path, this.app.vault.configDir, this.manifest.id);
+	}
+
+	private deferPreStartupLocalEvent(path: string, isFolder: boolean, kind: PreStartupLocalEvent["kind"]): boolean {
+		if (this.startupSyncCompleted || !this.hasServerBaseline()) {
+			return false;
+		}
+		this.preStartupLocalEvents.set(path, { path, isFolder, kind });
+		log.debug("deferred pre-startup local vault event for synced baseline", { path, kind });
+		return true;
+	}
+
+	private async flushDeferredPreStartupLocalEvents(): Promise<void> {
+		const events = [...this.preStartupLocalEvents.values()]
+			.sort((a, b) => {
+				if (a.isFolder !== b.isFolder) {
+					return a.isFolder ? -1 : 1;
+				}
+				return a.path.localeCompare(b.path);
+			});
+		this.preStartupLocalEvents.clear();
+		for (const event of events) {
+			try {
+				if (!(await this.shouldReplayDeferredPreStartupEvent(event))) {
+					continue;
+				}
+				if (event.isFolder) {
+					await this.db.putInOutbox({
+						mutationId: crypto.randomUUID(),
+						operation: "CreateFolder",
+						path: event.path,
+						isFolder: true,
+						created: Date.now(),
+					});
+					log.info("queued deferred pre-startup folder create", { path: event.path });
+					this.syncClient.wakeSoon();
+				} else if (shouldUseYjs(event.path, this.app.vault.configDir)) {
+					await this.queueMarkdownPathChange(event.path);
+				} else if (!this.isConfigDirPath(event.path)) {
+					this.queuePathUpsertDebounced(event.path);
+				}
+			} catch (error) {
+				log.error("failed to replay deferred pre-startup local event", {
+					path: event.path,
+					kind: event.kind,
+					...errorContext(error),
+				});
+			}
+		}
+	}
+
+	private async shouldReplayDeferredPreStartupEvent(event: PreStartupLocalEvent): Promise<boolean> {
+		if (!this.shouldSyncLocalPath(event.path)) {
+			return false;
+		}
+		const stat = await this.app.vault.adapter.stat(event.path);
+		if (!stat) {
+			return false;
+		}
+		const current: BootVaultEntry = {
+			isFolder: stat.type === "folder",
+			fingerprint: stat.type === "file" ? `${stat.mtime}:${stat.size}` : null,
+		};
+		const boot = this.bootVaultEntries.get(event.path);
+		if (!boot) {
+			return true;
+		}
+		return boot.isFolder !== current.isFolder || boot.fingerprint !== current.fingerprint;
+	}
+
+	private hasServerBaseline(): boolean {
+		try {
+			return BigInt(this.settings.lastPulledRevision || "0") > BigInt(0);
+		} catch {
+			return false;
+		}
 	}
 
 	onunload() {

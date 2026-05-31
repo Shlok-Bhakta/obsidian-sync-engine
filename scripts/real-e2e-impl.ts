@@ -16,6 +16,15 @@ import { docStateFromContent, MARKDOWN_FIELD } from "../shared/yjsSeed";
 import { shouldSyncPath, shouldUseYjs } from "../shared/pathPolicy";
 
 type PluginLifecycleMode = "minimal" | "mobile" | "desktop";
+type BootVaultEntry = {
+  isFolder: boolean;
+  fingerprint: string | null;
+};
+type PreStartupLocalEvent = {
+  path: string;
+  isFolder: boolean;
+  kind: "create" | "modify";
+};
 
 type ChildHandle = {
   name: string;
@@ -36,6 +45,7 @@ const postgresUser = "postgres";
 const postgresPassword = "postgres";
 const databaseUrl = `postgres://${postgresUser}:${postgresPassword}@127.0.0.1:${postgresPort}/${postgresDatabase}`;
 const pluginId = "obsidian-sync-engine";
+const inlineBytesLimit = 16 * 1024;
 const skipTests = process.argv.includes("--skip-tests");
 const withDockerIntegration = process.argv.includes("--with-docker-integration");
 const keepTemp = process.argv.includes("--keep-temp");
@@ -362,6 +372,9 @@ class RealClient {
   lastPulledRevision = "0";
   clientKey = "To Be Generated";
   private indexerStarted = false;
+  private startupSyncCompleted = false;
+  private bootVaultEntries = new Map<string, BootVaultEntry>();
+  private preStartupLocalEvents = new Map<string, PreStartupLocalEvent>();
 
   constructor(
     readonly root: string,
@@ -450,6 +463,8 @@ class RealClient {
         this.bootstrapStatuses.push(status);
       },
       () => {
+        this.startupSyncCompleted = true;
+        void this.flushDeferredPreStartupLocalEvents();
         if (this.lifecycle === "desktop" && !this.indexerStarted) {
           this.indexerStarted = true;
           this.indexer.start();
@@ -470,6 +485,7 @@ class RealClient {
     await this.stateStore.open();
     await this.outbox.open();
     await this.loadPluginData();
+    await this.captureBootVaultEntries();
   }
 
   start(): void {
@@ -577,7 +593,13 @@ class RealClient {
 
   /** Mirrors `main.ts` `enqueueLocalCreate` for vault `create` events on bootstrap open. */
   async enqueueLocalCreate(file: TFile | TFolder): Promise<void> {
-    if (this.syncClient.isApplyingRemoteChanges(file.path) || !this.shouldSyncLocalPath(file.path)) {
+    if (
+      this.syncClient.isApplyingRemoteChanges(file.path) ||
+      !this.shouldSyncLocalPath(file.path)
+    ) {
+      return;
+    }
+    if (this.deferPreStartupLocalEvent(file.path, file instanceof TFolder, "create")) {
       return;
     }
     if (file instanceof TFolder) {
@@ -611,6 +633,115 @@ class RealClient {
         created: Date.now(),
       });
       this.syncClient.wakeSoon();
+      return;
+    }
+    const bytes = new Uint8Array(await this.adapter.readBinary(file.path));
+    if (bytes.byteLength > inlineBytesLimit) {
+      const upload = await this.syncClient.uploadBlob(file.path, bytes);
+      await this.outbox.putInOutbox({
+        mutationId: crypto.randomUUID(),
+        operation: "UpsertFile",
+        path: file.path,
+        storageKind: "lo",
+        isFolder: false,
+        isYjs: false,
+        blobUploadId: upload.blobUploadId,
+        byteSize: upload.byteSize,
+        contentSha256: upload.contentSha256,
+        created: Date.now(),
+      });
+    } else {
+      await this.outbox.putInOutbox({
+        mutationId: crypto.randomUUID(),
+        operation: "UpsertFile",
+        path: file.path,
+        contentBytes: bytes,
+        storageKind: "bytea",
+        isFolder: false,
+        isYjs: false,
+        byteSize: bytes.byteLength,
+        created: Date.now(),
+      });
+    }
+    this.syncClient.wakeSoon();
+  }
+
+  private deferPreStartupLocalEvent(path: string, isFolder: boolean, kind: PreStartupLocalEvent["kind"]): boolean {
+    if (this.startupSyncCompleted || !this.hasServerBaseline()) {
+      return false;
+    }
+    this.preStartupLocalEvents.set(path, { path, isFolder, kind });
+    return true;
+  }
+
+  private hasServerBaseline(): boolean {
+    try {
+      return BigInt(this.lastPulledRevision || "0") > BigInt(0);
+    } catch {
+      return false;
+    }
+  }
+
+  private async flushDeferredPreStartupLocalEvents(): Promise<void> {
+    const events = [...this.preStartupLocalEvents.values()]
+      .sort((a, b) => {
+        if (a.isFolder !== b.isFolder) return a.isFolder ? -1 : 1;
+        return a.path.localeCompare(b.path);
+      });
+    this.preStartupLocalEvents.clear();
+    for (const event of events) {
+      if (!(await this.shouldReplayDeferredPreStartupEvent(event))) {
+        continue;
+      }
+      await this.enqueueLocalCreate(event.isFolder ? makeFolder(event.path) : makeFile(event.path));
+    }
+  }
+
+  private async shouldReplayDeferredPreStartupEvent(event: PreStartupLocalEvent): Promise<boolean> {
+    if (!this.shouldSyncLocalPath(event.path)) {
+      return false;
+    }
+    const stat = await this.adapter.stat(event.path);
+    if (!stat) {
+      return false;
+    }
+    const current: BootVaultEntry = {
+      isFolder: stat.type === "folder",
+      fingerprint: stat.type === "file" ? `${stat.mtime}:${stat.size}` : null,
+    };
+    const boot = this.bootVaultEntries.get(event.path);
+    if (!boot) {
+      return true;
+    }
+    return boot.isFolder !== current.isFolder || boot.fingerprint !== current.fingerprint;
+  }
+
+  private async captureBootVaultEntries(): Promise<void> {
+    this.bootVaultEntries.clear();
+    await this.addBootVaultEntries("");
+    await this.addBootVaultEntries(".obsidian");
+  }
+
+  private async addBootVaultEntries(dir: string): Promise<void> {
+    if (dir && !(await this.adapter.exists(dir))) {
+      return;
+    }
+    const listed = await this.adapter.list(dir);
+    for (const folder of listed.folders) {
+      if (!this.shouldSyncLocalPath(folder)) {
+        continue;
+      }
+      this.bootVaultEntries.set(folder, { isFolder: true, fingerprint: null });
+      await this.addBootVaultEntries(folder);
+    }
+    for (const file of listed.files) {
+      if (!this.shouldSyncLocalPath(file)) {
+        continue;
+      }
+      const stat = await this.adapter.stat(file);
+      if (stat?.type === "file") {
+        this.bootVaultEntries.set(file, { isFolder: false, fingerprint: `${stat.mtime}:${stat.size}` });
+      }
     }
   }
 
@@ -872,6 +1003,7 @@ async function seedVaultTree(client: RealClient, folderCount: number, filesPerFo
       await client.writeText(`${folder}/note-${fileIndex}.md`, `seed ${index}-${fileIndex}`);
     }
   }
+  await client.putBinary("CMCU/assets/logo.bin", new Uint8Array([1, 2, 3, 4]));
   await client.indexVault();
   await waitFor(async () => !(await client.hasPendingOutbox()), "seed vault did not finish uploading");
 }

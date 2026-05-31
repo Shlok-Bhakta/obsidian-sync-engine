@@ -92,11 +92,24 @@ function makeHarness(files: Record<string, string | Uint8Array> = {}) {
 				const value = files[file.path] ?? "";
 				return typeof value === "string" ? value : new TextDecoder().decode(value);
 			},
+			getAbstractFileByPath: (path: string) => files[path] === undefined ? null : makeFile(path),
 			adapter: {
 				readBinary: async (path: string) => {
 					const value = files[path] ?? "";
 					const bytes = typeof value === "string" ? textEncoder.encode(value) : value;
 					return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+				},
+				read: async (path: string) => {
+					const value = files[path] ?? "";
+					return typeof value === "string" ? value : new TextDecoder().decode(value);
+				},
+				stat: async (path: string) => {
+					const value = files[path];
+					if (value === undefined) {
+						return null;
+					}
+					const size = typeof value === "string" ? textEncoder.encode(value).byteLength : value.byteLength;
+					return { type: "file", mtime: 1, size };
 				},
 			},
 		},
@@ -107,10 +120,13 @@ function makeHarness(files: Record<string, string | Uint8Array> = {}) {
 	plugin.syncClient = syncClient;
 	plugin.app = app;
 	plugin.manifest = { id: "obsidian-sync-engine" };
-	plugin.settings = {};
+	plugin.settings = { lastPulledRevision: "0" };
 	plugin.docs = new Map();
 	plugin.pendingDocs = new Map();
 	plugin.pendingFileTimers = new Map();
+	plugin.startupSyncCompleted = false;
+	plugin.bootVaultEntries = new Map();
+	plugin.preStartupLocalEvents = new Map();
 	return { plugin: plugin as unknown as SyncEngine, outbox, yjsStateStore, wakeSoon, syncClient };
 }
 
@@ -261,6 +277,90 @@ describe("SyncEngine local CRUD enqueueing", () => {
 			byteSize: 3,
 		});
 		expect(outbox.rows[0]?.contentBytes).toEqual(new Uint8Array([1, 2, 3]));
+		expect(wakeSoon).toHaveBeenCalledTimes(1);
+	});
+
+	it("defers bootstrapped vault discovery creates before startup sync completes", async () => {
+		const { plugin, outbox, wakeSoon } = makeHarness({
+			"assets/image.bin": new Uint8Array([1, 2, 3]),
+		});
+		(plugin as unknown as {
+			settings: { lastPulledRevision: string };
+		}).settings.lastPulledRevision = "3105";
+
+		await (plugin as unknown as {
+			enqueueLocalCreate: (file: TFile) => Promise<void>;
+		}).enqueueLocalCreate(makeFile("assets/image.bin"));
+		await vi.advanceTimersByTimeAsync(500);
+
+		expect(outbox.rows).toHaveLength(0);
+		expect(wakeSoon).not.toHaveBeenCalled();
+	});
+
+	it("drops deferred bootstrapped discovery creates when the file matches the boot snapshot", async () => {
+		const { plugin, outbox, wakeSoon } = makeHarness({
+			"assets/image.bin": new Uint8Array([1, 2, 3]),
+		});
+		const testPlugin = plugin as unknown as {
+			settings: { lastPulledRevision: string };
+			bootVaultEntries: Map<string, { isFolder: boolean; fingerprint: string | null }>;
+			enqueueLocalCreate: (file: TFile) => Promise<void>;
+			flushDeferredPreStartupLocalEvents: () => Promise<void>;
+		};
+		testPlugin.settings.lastPulledRevision = "3105";
+		testPlugin.bootVaultEntries.set("assets/image.bin", { isFolder: false, fingerprint: "1:3" });
+
+		await testPlugin.enqueueLocalCreate(makeFile("assets/image.bin"));
+		await testPlugin.flushDeferredPreStartupLocalEvents();
+		await vi.advanceTimersByTimeAsync(500);
+
+		expect(outbox.rows).toHaveLength(0);
+		expect(wakeSoon).not.toHaveBeenCalled();
+	});
+
+	it("replays deferred pre-startup creates for files created after boot", async () => {
+		const { plugin, outbox, wakeSoon } = makeHarness({
+			"Notes/quick.md": "urgent thought",
+		});
+		const testPlugin = plugin as unknown as {
+			settings: { lastPulledRevision: string };
+			enqueueLocalCreate: (file: TFile) => Promise<void>;
+			flushDeferredPreStartupLocalEvents: () => Promise<void>;
+		};
+		testPlugin.settings.lastPulledRevision = "3105";
+
+		await testPlugin.enqueueLocalCreate(makeFile("Notes/quick.md"));
+		await testPlugin.flushDeferredPreStartupLocalEvents();
+
+		expect(outbox.rows).toHaveLength(1);
+		expect(outbox.rows[0]).toMatchObject({
+			operation: "UpsertFile",
+			path: "Notes/quick.md",
+			content: "urgent thought",
+		});
+		expect(wakeSoon).toHaveBeenCalledTimes(1);
+	});
+
+	it("queues local creates after startup sync completes for an existing synced vault", async () => {
+		const { plugin, outbox, wakeSoon } = makeHarness({
+			"assets/image.bin": new Uint8Array([1, 2, 3]),
+		});
+		const testPlugin = plugin as unknown as {
+			settings: { lastPulledRevision: string };
+			startupSyncCompleted: boolean;
+			enqueueLocalCreate: (file: TFile) => Promise<void>;
+		};
+		testPlugin.settings.lastPulledRevision = "3105";
+		testPlugin.startupSyncCompleted = true;
+
+		await testPlugin.enqueueLocalCreate(makeFile("assets/image.bin"));
+		await vi.advanceTimersByTimeAsync(500);
+
+		expect(outbox.rows).toHaveLength(1);
+		expect(outbox.rows[0]).toMatchObject({
+			operation: "UpsertFile",
+			path: "assets/image.bin",
+		});
 		expect(wakeSoon).toHaveBeenCalledTimes(1);
 	});
 
