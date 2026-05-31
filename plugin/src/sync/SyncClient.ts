@@ -17,7 +17,7 @@ import { errorContext, Logger } from "../../../shared/logger";
 import { log as rootLog } from "../logger";
 import { readSocketMessage, waitForPacket, withTimeout } from "./SocketRequest";
 
-const FLUSH_DELAY_MS = 16;
+const FLUSH_DELAY_MS = 0;
 const ERROR_BACKOFF_MS = 2000;
 const CONNECT_RETRY_DELAY_MS = 2000;
 const WS_WAIT_TIMEOUT_MS = 60_000;
@@ -110,6 +110,7 @@ export class SyncClient {
     private lastFailureNoticeAt = 0;
     private pendingLastPulledRevision: string | null = null;
     private revisionFlushTimer: number | null = null;
+	private startupDocSyncPaths = new Set<string>();
     private readonly vaultMutator: VaultMutator;
     private readonly yjsApplicator: YjsApplicator;
     private readonly bootstrapUploader: BootstrapUploader;
@@ -413,6 +414,7 @@ export class SyncClient {
 
     private async runStartupSync(): Promise<void> {
         this.log.info("startup sync beginning", { lastPulledRevision: this.lastPulledRevision });
+		this.startupDocSyncPaths.clear();
         const openWs = await this.ensureAuthenticatedSocket();
         const pullResponse = await this.pullSince(openWs, this.lastPulledRevision);
 
@@ -453,6 +455,7 @@ export class SyncClient {
         await this.livePushPromise.catch(() => {});
         await this.catchUpToServer(openWs);
         await this.flushPendingLastPulledRevision();
+		this.startupDocSyncPaths.clear();
         this.log.info("startup sync complete", { lastPulledRevision: this.lastPulledRevision });
         this.onStartupSynced();
     }
@@ -825,6 +828,11 @@ export class SyncClient {
                     continue;
                 }
                 const changePaths = remoteChangePaths(change);
+				if (!this.startupSynced) {
+					for (const path of changePaths) {
+						this.startupDocSyncPaths.add(path);
+					}
+				}
                 await this.vaultMutator.runRemoteMutation(remoteChangePaths(change), async () => {
                     if (change.operation === "CreateFolder") {
                         await this.vaultMutator.ensureFolder(change.path);
@@ -929,27 +937,28 @@ export class SyncClient {
 
         const coalesced = new Map<string, SyncMutation>();
         const docSyncPaths: string[] = [];
-        for (const path of yjsPaths) {
-            const pathRows = rows.filter(row => row.operation === "YjsUpdate" && row.path === path);
-            const updates = pathRows.map(row => row.data).filter((data): data is Uint8Array => data instanceof Uint8Array);
-            const openDoc = this.getDocSync(path);
-            if (
-                openDoc?.hasServerSyncedState() &&
-                updates.length === pathRows.length &&
-                updates.length > 0 &&
-                updates.every(update => update.byteLength > 0)
-            ) {
-                coalesced.set(path, {
-                    mutationId: crypto.randomUUID(),
-                    operation: "YjsUpdate",
-                    path,
-                    data: updates.length === 1 ? updates[0] : Y.mergeUpdatesV2(updates),
-                    created: Math.max(...pathRows.map(row => row.created)),
-                });
-            } else {
-                docSyncPaths.push(path);
-            }
-        }
+		for (const path of yjsPaths) {
+			const pathRows = rows.filter(row => row.operation === "YjsUpdate" && row.path === path);
+			const updates = pathRows.map(row => row.data).filter((data): data is Uint8Array => data instanceof Uint8Array);
+			const openDoc = this.getDocSync(path);
+			if (
+				!this.startupDocSyncPaths.has(path) &&
+				openDoc?.hasServerSyncedState() &&
+				updates.length === pathRows.length &&
+				updates.length > 0 &&
+				updates.every(update => update.byteLength > 0)
+			) {
+				coalesced.set(path, {
+					mutationId: crypto.randomUUID(),
+					operation: "YjsUpdate",
+					path,
+					data: updates.length === 1 ? updates[0] : Y.mergeUpdatesV2(updates),
+					created: Math.max(...pathRows.map(row => row.created)),
+				});
+			} else {
+				docSyncPaths.push(path);
+			}
+		}
 
         if (docSyncPaths.length > 0) {
             this.log.debug("coalescing Yjs updates before upload", {

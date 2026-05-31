@@ -494,14 +494,15 @@ describe("SyncClient initial snapshot", () => {
                 created: 2,
             },
         ]);
-        const { client } = await makeClient({ [path]: "hello world!" }, new MemoryYjsStateStore(), outbox, {
-            getDocSync: requested => requested === path ? openDoc : undefined,
-        });
-        const ws = { send: vi.fn() } as unknown as WebSocket;
+		const { client } = await makeClient({ [path]: "hello world!" }, new MemoryYjsStateStore(), outbox, {
+			getDocSync: requested => requested === path ? openDoc : undefined,
+		});
+		(client as unknown as { startupSynced: boolean }).startupSynced = true;
+		const ws = { send: vi.fn() } as unknown as WebSocket;
 
-        const jsonl = await (client as unknown as {
-            prepareSegmentJsonl: (socket: WebSocket, segment: OutboxSegment) => Promise<string>;
-        }).prepareSegmentJsonl(ws, { id: "segment", path: "pending.jsonl" });
+		const jsonl = await (client as unknown as {
+			prepareSegmentJsonl: (socket: WebSocket, segment: OutboxSegment) => Promise<string>;
+		}).prepareSegmentJsonl(ws, { id: "segment", path: "pending.jsonl" });
 
         expect(ws.send).not.toHaveBeenCalled();
         const rows = decodeUpdateBatchJsonl(jsonl);
@@ -511,11 +512,108 @@ describe("SyncClient initial snapshot", () => {
         Y.applyUpdateV2(materialized, baseState);
         Y.applyUpdateV2(materialized, rows[0]!.data!);
         expect(materialized.getText(MARKDOWN_FIELD).toString()).toBe("hello world!");
-        materialized.destroy();
-        openDoc.destroy();
-    });
+		materialized.destroy();
+		openDoc.destroy();
+	});
 
-    it("rebases empty closed-document resync markers through DocSync before upload", async () => {
+	it("keeps open-document Yjs updates fast during startup flush when the path was not pulled", async () => {
+		const path = "notes/existing.md";
+		const baseState = docStateFromContent("hello", Y);
+		const doc = new Y.Doc();
+		Y.applyUpdateV2(doc, baseState);
+		const beforeEdit = Y.encodeStateVector(doc);
+		doc.getText(MARKDOWN_FIELD).insert(5, " local");
+		const update = Y.encodeStateAsUpdateV2(doc, beforeEdit);
+		const finalState = Y.encodeStateAsUpdateV2(doc);
+		doc.destroy();
+
+		const openDoc = new DocSync(
+			new MemoryOutboxStore(),
+			new MemoryYjsStateStore() as unknown as YjsStateStore,
+			path,
+			finalState,
+			true,
+		);
+		const outbox = new MemoryOutboxStore([{
+			mutationId: "offline-local",
+			operation: "YjsUpdate",
+			path,
+			data: update,
+			created: 1,
+		}]);
+		const { client } = await makeClient({ [path]: "hello local" }, new MemoryYjsStateStore(), outbox, {
+			getDocSync: requested => requested === path ? openDoc : undefined,
+		});
+		const ws = { send: vi.fn() } as unknown as WebSocket;
+
+		const jsonl = await (client as unknown as {
+			prepareSegmentJsonl: (socket: WebSocket, segment: OutboxSegment) => Promise<string>;
+		}).prepareSegmentJsonl(ws, { id: "segment", path: "pending.jsonl" });
+
+		expect(ws.send).not.toHaveBeenCalled();
+		const rows = decodeUpdateBatchJsonl(jsonl);
+		expect(rows).toHaveLength(1);
+		expect(rows[0]?.operation).toBe("YjsUpdate");
+		openDoc.destroy();
+	});
+
+	it("rebases startup-touched open-document Yjs updates through DocSync during startup flush", async () => {
+		const path = "notes/existing.md";
+		const baseState = docStateFromContent("hello", Y);
+		const doc = new Y.Doc();
+		Y.applyUpdateV2(doc, baseState);
+		const beforeEdit = Y.encodeStateVector(doc);
+		doc.getText(MARKDOWN_FIELD).insert(5, " local");
+		const update = Y.encodeStateAsUpdateV2(doc, beforeEdit);
+		const finalState = Y.encodeStateAsUpdateV2(doc);
+		doc.destroy();
+
+		const openDoc = new DocSync(
+			new MemoryOutboxStore(),
+			new MemoryYjsStateStore() as unknown as YjsStateStore,
+			path,
+			finalState,
+			true,
+		);
+		const outbox = new MemoryOutboxStore([{
+			mutationId: "offline-local",
+			operation: "YjsUpdate",
+			path,
+			data: update,
+			created: 1,
+		}]);
+		const { client } = await makeClient({ [path]: "hello local" }, new MemoryYjsStateStore(), outbox, {
+			getDocSync: requested => requested === path ? openDoc : undefined,
+		});
+		(client as unknown as { startupDocSyncPaths: Set<string> }).startupDocSyncPaths.add(path);
+		const emptyServerDoc = new Y.Doc();
+		const emptyStateVector = Y.encodeStateVector(emptyServerDoc);
+		emptyServerDoc.destroy();
+		const requestDocSync = vi.fn(async () => ({
+			type: opType.DocSyncAck,
+			paths: [{
+				path,
+				data: new Uint8Array(),
+				stateVector: emptyStateVector,
+				yjsState: new Uint8Array(),
+			}],
+		}));
+		(client as unknown as {
+			requestDocSync: typeof requestDocSync;
+		}).requestDocSync = requestDocSync;
+
+		const jsonl = await (client as unknown as {
+			prepareSegmentJsonl: (socket: WebSocket, segment: OutboxSegment) => Promise<string>;
+		}).prepareSegmentJsonl({} as WebSocket, { id: "segment", path: "pending.jsonl" });
+
+		expect(requestDocSync).toHaveBeenCalledTimes(1);
+		const rows = decodeUpdateBatchJsonl(jsonl);
+		expect(rows).toHaveLength(1);
+		expect(rows[0]?.operation).toBe("YjsUpdate");
+		openDoc.destroy();
+	});
+
+	it("rebases empty closed-document resync markers through DocSync before upload", async () => {
         const path = "notes/existing.md";
         const stateStore = new MemoryYjsStateStore();
         await stateStore.put(path, docStateFromContent("base local", Y));

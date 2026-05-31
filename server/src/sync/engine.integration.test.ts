@@ -568,6 +568,19 @@ describeIntegration("sync engine postgres integration", () => {
     expect(change?.yjsState).toEqual(clientState);
   });
 
+  it("sends YjsUpdate change batches as deltas without the full materialized state", async () => {
+    await seedMarkdownFile(CLIENT_A, NOTE_PATH, "hello");
+    const doc = makeClientDoc("hello");
+    appendToDoc(doc, " world");
+    await uploadYjsEdit(CLIENT_A, NOTE_PATH, doc);
+    doc.destroy();
+
+    const batch = await changeBatchPacket("1");
+    const change = batch.changes.find(entry => entry.path === NOTE_PATH && entry.operation === "YjsUpdate");
+    expect(change?.data).toBeInstanceOf(Uint8Array);
+    expect(change?.yjsState).toBeUndefined();
+  });
+
   it("rejects markdown UpsertFile when content and yjs_state disagree", async () => {
     const beforeRevision = await getServerRevision();
 
@@ -1065,7 +1078,7 @@ describeIntegration("sync engine postgres integration", () => {
     expect(pull.type).toBe(opType.ChangeBatch);
     if (pull.type === opType.ChangeBatch) {
       const yjsChange = pull.changes.find(change => change.operation === "YjsUpdate");
-      expect(yjsChange?.yjsState).toBeInstanceOf(Uint8Array);
+      expect(yjsChange?.yjsState).toBeUndefined();
       expect(yjsChange?.data).toBeInstanceOf(Uint8Array);
     }
   });
@@ -1554,8 +1567,9 @@ describeIntegration("sync engine postgres integration", () => {
       try {
         for (const change of pull.changes) {
           if (change.operation === "YjsUpdate") {
-            expect(change.yjsState).toBeInstanceOf(Uint8Array);
-            Y.applyUpdateV2(bootstrappedDoc, change.yjsState!);
+            expect(change.yjsState).toBeUndefined();
+            expect(change.data).toBeInstanceOf(Uint8Array);
+            Y.applyUpdateV2(bootstrappedDoc, change.data!);
           }
         }
         expect(readDoc(bootstrappedDoc)).toBe("abcds");
@@ -1748,7 +1762,7 @@ describeIntegration("sync engine postgres integration", () => {
     expect(BigInt(r2)).toBeGreaterThan(BigInt(r1));
   });
 
-  it("websocket fan-out keeps prior changes until the target explicitly pulls", async () => {
+  it("websocket fan-out advances the target revision after a live push", async () => {
     const peerB = new TestPeer("ws-client-b", "obs_sync_seed", "0");
     await peerB.connect();
     const peerA = new TestPeer("ws-client-a", peerB.clientKey, "0");
@@ -1764,7 +1778,7 @@ describeIntegration("sync engine postgres integration", () => {
       await peerA.waitFor(packet => packet.type === opType.BatchAck && packet.segmentId === "segment-2");
       const secondPush = await peerB.waitFor(packet => packet.type === opType.ChangeBatch || packet.type === opType.SnapshotReset);
 
-      expect(serverPacketPaths(secondPush)).toEqual(["notes/a.md", "notes/b.md"]);
+      expect(serverPacketPaths(secondPush)).toEqual(["notes/b.md"]);
     } finally {
       peerA.close();
       peerB.close();

@@ -255,7 +255,7 @@ function rowToChange(row: EventRow): ServerChange {
     content: row.content ?? undefined,
     contentBytes: row.storageKind === "bytea" ? row.contentBytes ?? undefined : undefined,
     data: row.payload ?? undefined,
-    yjsState: row.yjsState && (row.operation === "YjsUpdate" || (row.operation === "UpsertFile" && row.isYjs === true))
+    yjsState: row.yjsState && row.operation === "UpsertFile" && row.isYjs === true
       ? row.yjsState
       : undefined,
     isFolder: row.isFolder ?? undefined,

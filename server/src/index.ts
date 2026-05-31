@@ -513,6 +513,9 @@ async function pushChangesToOtherClients(sender: Client, revision: string): Prom
         const packet = await changeBatchPacket(fromRevision);
         target.socket!.send(encodePacket(packet));
         const pushedRevision = revisionFromServerPacket(packet);
+        if (pushedRevision) {
+          target.lastPulledRevision = pushedRevision;
+        }
         log.info("pushed changes to websocket client", {
           senderClientId: sender.clientId,
           targetClientId: target.clientId,
