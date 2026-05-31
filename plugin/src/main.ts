@@ -3,7 +3,7 @@ import * as Y from 'yjs';
 import {DEFAULT_SETTINGS, SyncEngineSettings, SyncEngineSettingTab} from "./settings";
 import { JsonlOutboxStore, OutboxStore } from 'db/db';
 import { EditorView, ViewUpdate } from "@codemirror/view";
-import { EditorSelection } from "@codemirror/state";
+import { EditorSelection, EditorState, Text } from "@codemirror/state";
 import { BootstrapStatus, EditorPresence, EditorPresencePosition, outboxData, Path } from "../../shared/types";
 import { DocSync } from 'yjs/DocSync';
 import { SyncClient } from 'sync/SyncClient';
@@ -81,6 +81,27 @@ function mapPositionThroughReplacement(position: number, from: number, to: numbe
 		return position + insertLength - (to - from);
 	}
 	return from + insertLength;
+}
+
+function editorPresencePositionForOffset(doc: Text, offset: number): EditorPresencePosition {
+	const clampedOffset = Math.max(0, Math.min(doc.length, offset));
+	const line = doc.lineAt(clampedOffset);
+	return {
+		line: line.number - 1,
+		ch: clampedOffset - line.from,
+	};
+}
+
+function editorPresencePositionsForSelection(
+	state: EditorState,
+): Pick<EditorPresence, "from" | "to" | "head" | "anchor"> {
+	const range = state.selection.main;
+	return {
+		from: editorPresencePositionForOffset(state.doc, range.from),
+		to: editorPresencePositionForOffset(state.doc, range.to),
+		head: editorPresencePositionForOffset(state.doc, range.head),
+		anchor: editorPresencePositionForOffset(state.doc, range.anchor),
+	};
 }
 
 function parseRgb(value: string): { r: number; g: number; b: number } | null {
@@ -374,16 +395,28 @@ export default class SyncEngine extends Plugin {
 			if (this.remoteEditorDispatches.has(update.view)) {
 				return;
 			}
-			if (!update.selectionSet) {
+			if (!update.selectionSet && !update.docChanged) {
 				return;
 			}
-			this.sendActiveEditorPresence();
+			const file = fileForEditorView(this.app, update.view);
+			if (!file) {
+				return;
+			}
+			if (!shouldUseYjs(file.path, this.app.vault.configDir)) {
+				return;
+			}
+			this.sendEditorPresenceFromState(file.path, update.state);
 		});
 	}
 
 	private sendActiveEditorPresence(): void {
 		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
 		if (!view?.file) {
+			return;
+		}
+		const editorView = editorViewFor(view.editor);
+		if (editorView) {
+			this.sendEditorPresenceFromState(view.file.path, editorView.state);
 			return;
 		}
 		this.localPresenceColor = presenceColorForName(this.settings.clientName);
@@ -404,6 +437,25 @@ export default class SyncEngine extends Plugin {
 		this.lastSentPresenceKey = presenceKey;
 		this.syncClient.sendEditorPresence(
 			view.file.path,
+			positions,
+			this.localPresenceColor,
+		);
+	}
+
+	private sendEditorPresenceFromState(path: Path, state: EditorState): void {
+		this.localPresenceColor = presenceColorForName(this.settings.clientName);
+		const positions = editorPresencePositionsForSelection(state);
+		const presenceKey = JSON.stringify({
+			path,
+			...positions,
+			color: this.localPresenceColor,
+		});
+		if (presenceKey === this.lastSentPresenceKey) {
+			return;
+		}
+		this.lastSentPresenceKey = presenceKey;
+		this.syncClient.sendEditorPresence(
+			path,
 			positions,
 			this.localPresenceColor,
 		);

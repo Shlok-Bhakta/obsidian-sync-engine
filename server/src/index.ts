@@ -463,6 +463,7 @@ type Client = {
 };
 
 const authenticatedClients = new Set<Client>();
+const latestEditorPresences = new Map<string, EditorPresence>();
 
 function findAuthenticatedClient(clientId: string): Client | null {
   for (const client of authenticatedClients) {
@@ -489,6 +490,7 @@ function evictDuplicateClientConnection(client: Client): void {
       continue;
     }
     broadcastPresenceDisconnect(existing);
+    latestEditorPresences.delete(existing.clientId);
     authenticatedClients.delete(existing);
     if (existing.socket) {
       authenticatedSockets.delete(existing.socket);
@@ -565,10 +567,35 @@ function broadcastPresenceUpdate(sender: Client, data: Extract<wsPacket, { type:
     anchor: data.anchor,
     color: data.color,
   };
+  latestEditorPresences.set(sender.clientId, presence);
   broadcastToOtherClients(sender, {
     type: opType.EditorPresenceUpdate,
     ...presence,
   });
+}
+
+function sendPresenceSnapshot(client: Client): void {
+  if (!client.socket || !client.isAuthenticated) {
+    return;
+  }
+  for (const presence of latestEditorPresences.values()) {
+    if (presence.clientId === client.clientId) {
+      continue;
+    }
+    try {
+      client.socket.send(encodePacket({
+        type: opType.EditorPresenceUpdate,
+        ...presence,
+      }));
+    } catch (error) {
+      log.error("failed to send editor presence snapshot", {
+        clientId: client.clientId,
+        clientName: client.clientName,
+        presenceClientId: presence.clientId,
+        ...errorContext(error),
+      });
+    }
+  }
 }
 
 function broadcastPresenceDisconnect(sender: Client): void {
@@ -665,6 +692,7 @@ app.get(
             serverRevision: await getServerRevision(),
           };
           ws.send(encodePacket(ack));
+          sendPresenceSnapshot(client);
           if (latestBootstrapStatus && latestBootstrapStatus.status === "ready" && latestBootstrapStatus.expiresAt) {
             ws.send(encodePacket({
               ...latestBootstrapStatus,
@@ -847,6 +875,7 @@ app.get(
       onClose: () => {
         if (client.isAuthenticated) {
           broadcastPresenceDisconnect(client);
+          latestEditorPresences.delete(client.clientId);
         }
         if (client.socket) {
           authenticatedSockets.delete(client.socket);

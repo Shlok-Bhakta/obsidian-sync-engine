@@ -1625,7 +1625,7 @@ describe("SyncClient initial snapshot", () => {
     });
 
     it("advances across mostly echoed reconnect revisions while applying remote interleavings", async () => {
-        const files = { "notes/existing.md": "local" };
+        const files: Record<string, string> = { "notes/existing.md": "local" };
         const stateStore = new MemoryYjsStateStore();
         const { client } = await makeClient(files, stateStore);
         const testClient = client as unknown as {

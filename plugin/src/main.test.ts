@@ -92,6 +92,7 @@ function makeHarness(files: Record<string, string | Uint8Array> = {}) {
 		isApplyingRemoteChanges: vi.fn(() => false),
 		wakeSoon,
 		uploadBlob: vi.fn(),
+		sendEditorPresence: vi.fn(),
 	};
 	const textEncoder = new TextEncoder();
 	const app = {
@@ -129,7 +130,7 @@ function makeHarness(files: Record<string, string | Uint8Array> = {}) {
 	plugin.syncClient = syncClient;
 	plugin.app = app;
 	plugin.manifest = { id: "obsidian-sync-engine" };
-	plugin.settings = { lastPulledRevision: "0" };
+	plugin.settings = { lastPulledRevision: "0", clientName: "Alice" };
 	plugin.docs = new Map();
 	plugin.pendingDocs = new Map();
 	plugin.pendingFileTimers = new Map();
@@ -137,6 +138,22 @@ function makeHarness(files: Record<string, string | Uint8Array> = {}) {
 	plugin.bootVaultEntries = new Map();
 	plugin.preStartupLocalEvents = new Map();
 	return { plugin: plugin as unknown as SyncEngine, outbox, yjsStateStore, wakeSoon, syncClient };
+}
+
+function stubPresenceColorDom(): void {
+	vi.stubGlobal("document", {
+		body: {
+			appendChild: vi.fn(),
+		},
+		createElement: vi.fn(() => ({
+			style: {},
+			remove: vi.fn(),
+		})),
+	});
+	vi.stubGlobal("getComputedStyle", vi.fn(() => ({
+		getPropertyValue: () => "rgb(124, 58, 237)",
+		color: "rgb(124, 58, 237)",
+	})));
 }
 
 describe("SyncEngine local CRUD enqueueing", () => {
@@ -393,5 +410,55 @@ describe("SyncEngine local CRUD enqueueing", () => {
 			path: "assets/image.bin",
 			isFolder: false,
 		});
+	});
+});
+
+describe("SyncEngine editor presence", () => {
+	beforeEach(() => {
+		stubPresenceColorDom();
+	});
+
+	afterEach(() => {
+		vi.unstubAllGlobals();
+	});
+
+	it("sends the post-change cursor position from CodeMirror state", () => {
+		const { plugin, syncClient } = makeHarness();
+		const state = EditorState.create({
+			doc: "Hello World",
+			selection: { anchor: "Hello World".length },
+		});
+
+		(plugin as unknown as {
+			sendEditorPresenceFromState: (path: string, state: EditorState) => void;
+		}).sendEditorPresenceFromState("Notes/open.md", state);
+
+		expect(syncClient.sendEditorPresence).toHaveBeenCalledTimes(1);
+		expect(syncClient.sendEditorPresence).toHaveBeenCalledWith(
+			"Notes/open.md",
+			{
+				from: { line: 0, ch: 11 },
+				to: { line: 0, ch: 11 },
+				head: { line: 0, ch: 11 },
+				anchor: { line: 0, ch: 11 },
+			},
+			expect.stringMatching(/^#[0-9a-f]{6}$/),
+		);
+	});
+
+	it("deduplicates unchanged presence packets", () => {
+		const { plugin, syncClient } = makeHarness();
+		const state = EditorState.create({
+			doc: "Hello World",
+			selection: { anchor: 5 },
+		});
+		const testPlugin = plugin as unknown as {
+			sendEditorPresenceFromState: (path: string, state: EditorState) => void;
+		};
+
+		testPlugin.sendEditorPresenceFromState("Notes/open.md", state);
+		testPlugin.sendEditorPresenceFromState("Notes/open.md", state);
+
+		expect(syncClient.sendEditorPresence).toHaveBeenCalledTimes(1);
 	});
 });
