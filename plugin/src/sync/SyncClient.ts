@@ -944,6 +944,7 @@ export class SyncClient {
 			if (
 				!this.startupDocSyncPaths.has(path) &&
 				openDoc?.hasServerSyncedState() &&
+				!openDoc.requiresDocSyncBeforeUpload() &&
 				updates.length === pathRows.length &&
 				updates.length > 0 &&
 				updates.every(update => update.byteLength > 0)

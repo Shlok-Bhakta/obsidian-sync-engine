@@ -557,6 +557,74 @@ describe("SyncClient initial snapshot", () => {
 		openDoc.destroy();
 	});
 
+	it("rebases open-document Yjs updates through DocSync after a remote merge before upload", async () => {
+		const path = "notes/existing.md";
+		const baseState = docStateFromContent("hello", Y);
+		const stateStore = new MemoryYjsStateStore();
+		await stateStore.putServerSyncedState(path, baseState, "base-hash", "1");
+		const openDoc = new DocSync(
+			new MemoryOutboxStore(),
+			stateStore as unknown as YjsStateStore,
+			path,
+			baseState,
+			true,
+		);
+		const localRow: outboxData = {
+			mutationId: "phone-offline-local",
+			operation: "YjsUpdate",
+			path,
+			data: new Uint8Array(),
+			created: 1,
+		};
+		await openDoc.applyChanges(
+			EditorState.create({ doc: "hello" }).update({ changes: { from: 5, insert: " phone" } }).changes,
+			localRow,
+		);
+
+		const remoteDoc = new Y.Doc();
+		Y.applyUpdateV2(remoteDoc, baseState);
+		remoteDoc.getText(MARKDOWN_FIELD).insert(5, " desktop");
+		const remoteState = Y.encodeStateAsUpdateV2(remoteDoc);
+		const remoteStateVector = Y.encodeStateVector(remoteDoc);
+		remoteDoc.destroy();
+		openDoc.applyRemoteUpdate(remoteState);
+
+		const outbox = new MemoryOutboxStore([localRow]);
+		const { client } = await makeClient({ [path]: "hello phone" }, stateStore, outbox, {
+			getDocSync: requested => requested === path ? openDoc : undefined,
+		});
+		const requestDocSync = vi.fn(async () => ({
+			type: opType.DocSyncAck,
+			paths: [{
+				path,
+				data: new Uint8Array(),
+				stateVector: remoteStateVector,
+				yjsState: remoteState,
+			}],
+		}));
+		(client as unknown as {
+			requestDocSync: typeof requestDocSync;
+		}).requestDocSync = requestDocSync;
+
+		const jsonl = await (client as unknown as {
+			prepareSegmentJsonl: (socket: WebSocket, segment: OutboxSegment) => Promise<string>;
+		}).prepareSegmentJsonl({ send: vi.fn() } as unknown as WebSocket, { id: "segment", path: "pending.jsonl" });
+
+		expect(requestDocSync).toHaveBeenCalledTimes(1);
+		const rows = decodeUpdateBatchJsonl(jsonl);
+		expect(rows).toHaveLength(1);
+		expect(rows[0]?.operation).toBe("YjsUpdate");
+		const materialized = new Y.Doc();
+		Y.applyUpdateV2(materialized, remoteState);
+		Y.applyUpdateV2(materialized, rows[0]!.data!);
+		const merged = materialized.getText(MARKDOWN_FIELD).toJSON();
+		expect(merged).toContain("phone");
+		expect(merged).toContain("desktop");
+		materialized.destroy();
+		expect(openDoc.requiresDocSyncBeforeUpload()).toBe(false);
+		openDoc.destroy();
+	});
+
 	it("rebases startup-touched open-document Yjs updates through DocSync during startup flush", async () => {
 		const path = "notes/existing.md";
 		const baseState = docStateFromContent("hello", Y);

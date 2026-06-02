@@ -100,6 +100,7 @@ export class DocSync {
     private checkpointPromise: Promise<void> = Promise.resolve();
     private editsSinceCheckpoint = 0;
     private serverSyncedState = false;
+    private uploadRequiresDocSync = false;
     private serverBaseContent: string;
 
 
@@ -143,6 +144,10 @@ export class DocSync {
         return this.serverSyncedState;
     }
 
+    public requiresDocSyncBeforeUpload(): boolean {
+        return this.uploadRequiresDocSync;
+    }
+
     public async persistState(): Promise<void> {
         if (this.checkpointTimer !== null) {
             clearTimeout(this.checkpointTimer);
@@ -169,6 +174,7 @@ export class DocSync {
         this.localRevision++;
         this.localEditRevision = 0;
         this.serverSyncedState = true;
+        this.uploadRequiresDocSync = false;
         this.serverBaseContent = this.ytext.toJSON();
         const contentHash = await sha256Hex(new TextEncoder().encode(this.serverBaseContent));
         if ("putServerSyncedState" in this.stateStore && typeof this.stateStore.putServerSyncedState === "function") {
@@ -269,9 +275,13 @@ export class DocSync {
     }
 
     public applyRemoteUpdate(update: Uint8Array): string {
+        const hadLocalEdits = this.localEditRevision > 0;
         Y.applyUpdateV2(this.ydoc, update);
         this.localRevision++;
         this.serverSyncedState = true;
+        if (hadLocalEdits) {
+            this.uploadRequiresDocSync = true;
+        }
         if (this.localEditRevision === 0) {
             this.serverBaseContent = this.ytext.toJSON();
         }
@@ -300,6 +310,7 @@ export class DocSync {
         }, "rebase local changes");
         this.localRevision++;
         this.serverSyncedState = false;
+        this.uploadRequiresDocSync = true;
         this.serverBaseContent = remoteContent;
         await this.persistState();
         return rebasedContent;
