@@ -35,6 +35,7 @@ type PresenceLayer = {
 	view: EditorView;
 	scrollHandler: () => void;
 };
+type EditorPresenceViewUpdate = Pick<ViewUpdate, "state" | "startState" | "changes" | "docChanged" | "selectionSet">;
 
 function generateClientId(): string {
 	return "obs_client_" + crypto.randomUUID();
@@ -94,14 +95,29 @@ function editorPresencePositionForOffset(doc: Text, offset: number): EditorPrese
 
 function editorPresencePositionsForSelection(
 	state: EditorState,
+	selection = state.selection,
 ): Pick<EditorPresence, "from" | "to" | "head" | "anchor"> {
-	const range = state.selection.main;
+	const range = selection.main;
 	return {
 		from: editorPresencePositionForOffset(state.doc, range.from),
 		to: editorPresencePositionForOffset(state.doc, range.to),
 		head: editorPresencePositionForOffset(state.doc, range.head),
 		anchor: editorPresencePositionForOffset(state.doc, range.anchor),
 	};
+}
+
+function editorPresencePositionsForUpdate(update: EditorPresenceViewUpdate): Pick<EditorPresence, "from" | "to" | "head" | "anchor"> {
+	if (update.selectionSet || !update.docChanged) {
+		return editorPresencePositionsForSelection(update.state);
+	}
+	const selection = EditorSelection.create(
+		update.startState.selection.ranges.map(range => EditorSelection.range(
+			update.changes.mapPos(range.anchor, 1),
+			update.changes.mapPos(range.head, 1),
+		)),
+		update.startState.selection.mainIndex,
+	);
+	return editorPresencePositionsForSelection(update.state, selection);
 }
 
 function parseRgb(value: string): { r: number; g: number; b: number } | null {
@@ -405,7 +421,7 @@ export default class SyncEngine extends Plugin {
 			if (!shouldUseYjs(file.path, this.app.vault.configDir)) {
 				return;
 			}
-			this.sendEditorPresenceFromState(file.path, update.state);
+			this.sendEditorPresenceFromUpdate(file.path, update);
 		});
 	}
 
@@ -445,6 +461,19 @@ export default class SyncEngine extends Plugin {
 	private sendEditorPresenceFromState(path: Path, state: EditorState): void {
 		this.localPresenceColor = presenceColorForName(this.settings.clientName);
 		const positions = editorPresencePositionsForSelection(state);
+		this.sendEditorPresenceIfChanged(path, positions);
+	}
+
+	private sendEditorPresenceFromUpdate(path: Path, update: EditorPresenceViewUpdate): void {
+		this.localPresenceColor = presenceColorForName(this.settings.clientName);
+		const positions = editorPresencePositionsForUpdate(update);
+		this.sendEditorPresenceIfChanged(path, positions);
+	}
+
+	private sendEditorPresenceIfChanged(
+		path: Path,
+		positions: Pick<EditorPresence, "from" | "to" | "head" | "anchor">,
+	): void {
 		const presenceKey = JSON.stringify({
 			path,
 			...positions,
@@ -1072,6 +1101,7 @@ export default class SyncEngine extends Plugin {
 					changes: change,
 					selection: EditorSelection.create(selection.map(range => EditorSelection.range(range.anchor, range.head))),
 				});
+				this.scheduleRemotePresenceRender();
 			} finally {
 				this.remoteEditorDispatches.delete(editorView);
 			}

@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
-import { TFile, TFolder } from "obsidian";
-import { EditorState } from "@codemirror/state";
+import { MarkdownView, TFile, TFolder } from "obsidian";
+import type { Editor } from "obsidian";
+import { EditorState, type TransactionSpec } from "@codemirror/state";
 import SyncEngine from "./main";
 import { OutboxStore } from "./db/db";
 import { outboxData } from "../../shared/types";
@@ -134,6 +135,7 @@ function makeHarness(files: Record<string, string | Uint8Array> = {}) {
 	plugin.docs = new Map();
 	plugin.pendingDocs = new Map();
 	plugin.pendingFileTimers = new Map();
+	plugin.remoteEditorDispatches = new Set();
 	plugin.startupSyncCompleted = false;
 	plugin.bootVaultEntries = new Map();
 	plugin.preStartupLocalEvents = new Map();
@@ -444,6 +446,80 @@ describe("SyncEngine editor presence", () => {
 			},
 			expect.stringMatching(/^#[0-9a-f]{6}$/),
 		);
+	});
+
+	it("sends the inferred post-insert cursor when CodeMirror does not explicitly set selection", () => {
+		const { plugin, syncClient } = makeHarness();
+		const transaction = EditorState.create({
+			doc: "Hello Worl",
+			selection: { anchor: "Hello Worl".length },
+		}).update({
+			changes: { from: "Hello Worl".length, insert: "d" },
+		});
+
+		(plugin as unknown as {
+			sendEditorPresenceFromUpdate: (path: string, update: unknown) => void;
+		}).sendEditorPresenceFromUpdate("Notes/open.md", {
+			state: transaction.state,
+			startState: transaction.startState,
+			changes: transaction.changes,
+			docChanged: transaction.docChanged,
+			selectionSet: false,
+		});
+
+		expect(syncClient.sendEditorPresence).toHaveBeenCalledTimes(1);
+		expect(syncClient.sendEditorPresence).toHaveBeenCalledWith(
+			"Notes/open.md",
+			{
+				from: { line: 0, ch: 11 },
+				to: { line: 0, ch: 11 },
+				head: { line: 0, ch: 11 },
+				anchor: { line: 0, ch: 11 },
+			},
+			expect.stringMatching(/^#[0-9a-f]{6}$/),
+		);
+	});
+
+	it("rerenders remote presence after applying remote text to an open editor", async () => {
+		const { plugin } = makeHarness();
+		const file = makeFile("Notes/open.md");
+		let state = EditorState.create({
+			doc: "Hello Worl",
+			selection: { anchor: "Hello Worl".length },
+		});
+		const editorView = {
+			get state() {
+				return state;
+			},
+			dispatch: vi.fn((spec: TransactionSpec) => {
+				state = state.update(spec).state;
+			}),
+		};
+		const view = Object.create(MarkdownView.prototype) as MarkdownView & {
+			file: TFile;
+			editor: Editor & { cm: typeof editorView };
+		};
+		view.file = file;
+		view.editor = { cm: editorView } as Editor & { cm: typeof editorView };
+		(plugin as unknown as {
+			app: { workspace: { getLeavesOfType: (type: string) => Array<{ view: MarkdownView }> } };
+			scheduleRemotePresenceRender: () => void;
+		}).app.workspace = {
+			getLeavesOfType: vi.fn(() => [{ view }]),
+		};
+		const scheduleRemotePresenceRender = vi.fn();
+		(plugin as unknown as {
+			scheduleRemotePresenceRender: () => void;
+		}).scheduleRemotePresenceRender = scheduleRemotePresenceRender;
+
+		const applied = await (plugin as unknown as {
+			applyRemoteYjsContentToOpenEditors: (path: string, content: string) => Promise<boolean>;
+		}).applyRemoteYjsContentToOpenEditors("Notes/open.md", "Hello World");
+
+		expect(applied).toBe(true);
+		expect(editorView.dispatch).toHaveBeenCalledTimes(1);
+		expect(state.doc.toString()).toBe("Hello World");
+		expect(scheduleRemotePresenceRender).toHaveBeenCalledTimes(1);
 	});
 
 	it("deduplicates unchanged presence packets", () => {
