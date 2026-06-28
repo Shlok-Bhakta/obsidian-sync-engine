@@ -12,6 +12,9 @@
 	},
 	"keywords": [],
 	"license": "0-BSD",
+	"dependencies": {
+		"obsidian-sync-protocol": "file:../shared/protocol"
+	},
 	"devDependencies": {
 		"@eslint/js": "^9.39.4",
 		"@types/node": "^22.15.17",

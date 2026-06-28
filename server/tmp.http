@@ -1,0 +1,8 @@
+### test that auth works
+GET http://localhost:3000/auth?client_name=test&client_secret=test
+
+
+
+### test that auth works
+GET http://localhost:3000/auth?client_name=test&client_secret=obs_sync_B6fwXVYoPUjadVc+Z6nV6e9HhXKOywwb6ShH78YaTYQ=
+# GET http://localhost:3000/auth?client_name=test&client_secret=obs_sync_B6fwXVYoPUjadVc%2BZ6nV6e9HhXKOywwb6ShH78YaTYQ%3D

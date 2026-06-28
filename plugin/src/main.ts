@@ -11,7 +11,7 @@ import {
 	MyPluginSettings,
 	SampleSettingTab,
 } from './settings';
-
+import { deserialize, Message, MessageType, PROTOCOL_VERSION, serialize } from 'obsidian-sync-protocol';
 // Remember to rename these classes and interfaces!
 
 export default class MyPlugin extends Plugin {
@@ -22,18 +22,17 @@ export default class MyPlugin extends Plugin {
 		await this.loadSettings();
 
 		// connect to server over ws
-		this.ws = new WebSocket('ws://obsidian-hono.shloklab.us/ws');
+		this.ws = new WebSocket(`ws://obsidian-hono.shloklab.us/ws?version=${PROTOCOL_VERSION}`);
 		
 
 		this.ws.onopen = () => {
 			console.log('Connected to server');
 			if(this.ws){
-			this.ws.send(
-				JSON.stringify({
-					type: 'auth',
-						token: '88c53ab8-c8b7-4e6d-9481-f1d4326e4cfb',
-					}),
-				);
+				let message: Message = {
+					type: MessageType.AUTH_ACK,
+					token: '88c53ab8-c8b7-4e6d-9481-f1d4326e4cfb'
+				};
+				this.ws.send(serialize(message));
 			}
 		};
 
@@ -41,20 +40,26 @@ export default class MyPlugin extends Plugin {
 		this.addRibbonIcon('dice', 'Sample', (_evt: MouseEvent) => {
 			// Called when the user clicks the icon.
 			if(this.ws){
-			this.ws.send(
-				JSON.stringify({
-					type: 'message',
-					message: 'Hello from Obsidian',
-				}),
-			);
-		}
+				let message: Message = {
+					type: MessageType.MESSAGE,
+					payload: 'Hello from Obsidian'
+				};
+				this.ws.send(
+					serialize(message)
+				);
+			}
 		});
 
 		this.ws.onmessage = (event) => {
 			console.log(event.data);
-			const data = JSON.parse(event.data.toString());
-			if (data.type === 'message_received') {
-				new Notice(data.message);
+			const data = deserialize(event.data.toString());
+			switch(data.type){
+				case MessageType.MESSAGE:
+					new Notice(data.payload);
+					break;
+				case MessageType.ERROR:
+					new Notice(data.reason);
+					break;
 			}
 		};
 		this.ws.onclose = () => {

@@ -4,7 +4,8 @@
     "dev": "bun run --hot src/index.ts"
   },
   "dependencies": {
-    "hono": "^4.12.27"
+    "hono": "^4.12.27",
+    "obsidian-sync-protocol": "file:../shared/protocol"
   },
   "devDependencies": {
     "@types/bun": "latest"
