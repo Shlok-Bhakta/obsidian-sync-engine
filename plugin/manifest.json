@@ -1,11 +1,11 @@
 {
-	"id": "obsidian-sync-engine",
-	"name": "Sync Files",
+	"id": "sample-plugin",
+	"name": "Sample Plugin",
 	"version": "1.0.0",
-	"minAppVersion": "0.15.0",
-	"description": "Sync files with realtime functionality",
+	"minAppVersion": "1.0.0",
+	"description": "Demonstrates some of the capabilities of the Obsidian API.",
 	"author": "Obsidian",
-	"authorUrl": "https://github.com/Shlok-Bhakta/obsidian-sync-engine",
-	"fundingUrl": "https://github.com/Shlok-Bhakta/obsidian-sync-engine",
+	"authorUrl": "https://obsidian.md",
+	"fundingUrl": "https://obsidian.md/pricing",
 	"isDesktopOnly": false
 }
