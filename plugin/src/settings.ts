@@ -34,7 +34,26 @@ export class SampleSettingTab extends PluginSettingTab {
 		const { containerEl } = this;
 
 		containerEl.empty();
-
+		new Setting(containerEl)
+		.setName("Client Name")
+		.setDesc("Name that this client is registered as")	
+		.addButton((button) =>
+			button
+				.setIcon('upload')
+				.setTooltip('Refresh client secret')
+				.setCta()
+				.setClass('obsidian-sync-client-secret-refresh')
+				.onClick(() => this.refreshClientName(this.plugin.settings.clientName)),
+		)
+		.addText((text) =>
+			text
+				.setPlaceholder('Main Computer')
+				.setValue(this.plugin.settings.clientName)
+				.onChange(async (value) => {
+					this.plugin.settings.clientName = value;
+					await this.plugin.saveSettings();
+				}),
+		);
 		const serverUrlDesc = activeDocument.createDocumentFragment();
 		serverUrlDesc.appendText("Enter the URL of the server to connect to");
 		const serverUrlWarning = serverUrlDesc.createDiv({
@@ -67,18 +86,7 @@ export class SampleSettingTab extends PluginSettingTab {
 
 		updateServerUrlWarning(this.plugin.settings.serverUrl);
 
-		new Setting(containerEl)
-		.setName("Client Name")
-		.setDesc("Name that this client is registered as")
-		.addText((text) =>
-			text
-				.setPlaceholder('Main Computer')
-				.setValue(this.plugin.settings.clientName)
-				.onChange(async (value) => {
-					this.plugin.settings.clientName = value;
-					await this.plugin.saveSettings();
-				}),
-		);
+
 		new Setting(containerEl)
 		.setName("Client Secret")
 		.setDesc("DO NOT SHARE THIS WITH ANYONE!!!")			
@@ -120,7 +128,9 @@ export class SampleSettingTab extends PluginSettingTab {
 			let message = deserialize(raw);
 			if(message.type === MessageType.AUTH_INIT){
 				this.plugin.settings.clientSecret = message.token;
-				this.plugin.saveSettings();
+				// refresh setting pane
+				this.display();
+				await this.plugin.saveSettings();
 			}else{
 				new Notice('Error refreshing client secret: ' + message.type);
 			}
@@ -128,4 +138,34 @@ export class SampleSettingTab extends PluginSettingTab {
 			new Notice('Error refreshing client secret: ' + error);
 		}
 	}
+
+	private async refreshClientName(newClientName: string): Promise<void> {
+		try {
+			const response = await requestUrl({
+				url: this.plugin.settings.serverUrl + '/reset-client-name',
+				method: 'POST',
+				contentType: 'application/json',
+				body: serialize({
+					type: MessageType.RESET_CLIENT_NAME,
+					new_client_name: newClientName,
+					token: this.plugin.settings.clientSecret
+				}),
+				throw: false,
+			});
+			const raw = typeof response.json === 'string' ? response.json : response.text;
+			let message = deserialize(raw);
+			if(message.type === MessageType.AUTH_INIT){
+				this.plugin.settings.clientName = message.client_name;
+				// refresh setting pane
+				this.display();
+				await this.plugin.saveSettings();
+			}else{
+				new Notice('Error refreshing client secret: ' + message.type);
+			}
+		} catch (error) {
+			new Notice('Error refreshing client secret: ' + error);
+		}
+	}
+
+
 }

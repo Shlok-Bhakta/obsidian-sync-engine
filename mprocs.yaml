@@ -9,4 +9,6 @@ procs:
     shell: "./plugin/movestuff.py"
   tunnel:
     shell: "./server/tunnel.py"
+  rainfrog:
+    shell: "rainfrog --url postgres://shlok@127.0.0.1:5432/obsidian_sync"
 

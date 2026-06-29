@@ -40,7 +40,12 @@ async function createClient(clientName: string) {
     return client[0].client_secret;
 }
 
-export async function resetClientSecret(clientName: string) {
+export async function resetClientSecret(clientName: string): Promise<string> {
     const client = await sql`UPDATE clients SET client_secret = concat('obs_sync_', encode(gen_random_bytes(32), 'base64')) WHERE client_name = ${clientName} RETURNING client_secret`;
     return client[0].client_secret;
+}
+
+export async function resetClientName(clientName: string, token: string): Promise<string> {
+    const client = await sql`UPDATE clients SET client_name = ${clientName} WHERE client_secret = ${token} RETURNING client_name`;
+    return clientName;
 }

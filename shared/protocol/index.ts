@@ -17,6 +17,7 @@ export enum MessageType {
     AUTH_ACK = "auth_ack",
     AUTH_SUCCESS = "auth_success",
     AUTH_FAILED = "auth_failed",
+    RESET_CLIENT_NAME = "reset_client_name",
     MESSAGE = "message",
     ERROR = "error",
 }
@@ -37,6 +38,11 @@ export const messageSchema = z.discriminatedUnion('type', [
   z.object({ 
     type: z.literal(MessageType.AUTH_FAILED), 
     reason: z.string() }),
+  z.object({
+    type: z.literal(MessageType.RESET_CLIENT_NAME),
+    new_client_name: z.string(),
+    token: z.string()
+  }),
   z.object({ 
     type: z.literal(MessageType.MESSAGE), 
     payload: z.string() }),

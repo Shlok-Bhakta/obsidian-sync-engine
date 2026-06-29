@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 import { upgradeWebSocket, websocket } from 'hono/bun'
 import { bootstrapDB } from './db/MigrationRunner'
-import { auth, checkClientExists, resetClientSecret } from './auth/auth';
+import { auth, checkClientExists, resetClientName, resetClientSecret } from './auth/auth';
 import { PROTOCOL_VERSION, Message, MessageType, serialize, deserialize} from 'obsidian-sync-protocol';
 
 
@@ -44,6 +44,34 @@ app.post('/reset-client-secret', async (c) => {
     type: MessageType.AUTH_INIT,
     client_name: data.client_name,
     token: newClientSecret
+  };
+  return c.json(serialize(response), 200);
+})
+
+app.post('/reset-client-name', async (c) => {
+  let data: Message;
+  try {
+    data = deserialize(await c.req.text());
+  } catch (error) {
+    console.error(error);
+    let response: Message = {
+      type: MessageType.ERROR,
+      reason: 'Invalid request body'
+    };
+    return c.json(serialize(response), 400);
+  }
+  if(data.type !== MessageType.RESET_CLIENT_NAME){
+    let response: Message = {
+      type: MessageType.ERROR,
+      reason: 'Invalid request'
+    };
+    return c.json(serialize(response), 400);
+  }
+  const newClientName = await resetClientName(data.new_client_name, data.token);
+  let response: Message = {
+    type: MessageType.AUTH_INIT,
+    client_name: newClientName,
+    token: data.token
   };
   return c.json(serialize(response), 200);
 })
