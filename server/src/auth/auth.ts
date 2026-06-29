@@ -7,29 +7,40 @@ import { sql } from "bun";
 // 2.2  if even a single client exists then we reject the auth
 
 // Auth Entrypoint
-export async function auth(clientName: string, clientSecret: string) {
-    // check if any client exists
-    const client_count = await sql`SELECT COUNT(*) FROM clients`.values();
+
+export type AuthResult = {
+    authenticated: boolean;
+    token: string | null;
+}
+export async function auth(clientName: string, clientSecret: string): Promise<AuthResult> {
+    // check if any client exists if not make one
+    const client_count = await sql`SELECT * FROM clients`.values();
     console.log(clientSecret);
     console.log(client_count);
     if(client_count.count > 0){
         console.log('client exists');
-        const client_info = await sql`SELECT * FROM clients WHERE client_name = ${clientName} AND client_secret = ${clientSecret}`.values();
-        if(client_info.length > 0){
-            return { authenticated: true };
-        }else{
-            return { authenticated: false };
-        }
-
+        return { 
+            authenticated: await checkClientExists(clientName, clientSecret), 
+            token: null 
+        };
     }else{
         console.log('client does not exist');
-        const new_client = await createClient(clientName);
-        console.log(new_client);
-        return { authenticated: true, client_id: new_client.id };
+        const new_client_secret = await createClient(clientName);
+        console.log(new_client_secret);
+        return { authenticated: true, token: new_client_secret };
     }
 }
 
+export async function checkClientExists(clientName: string, clientSecret: string) {
+    const client_info = await sql`SELECT * FROM clients WHERE client_name = ${clientName} AND client_secret = ${clientSecret}`.values();
+    return client_info.length > 0;
+}
 async function createClient(clientName: string) {
     const client = await sql`INSERT INTO clients (client_name) VALUES (${clientName}) RETURNING client_secret`;
+    return client[0].client_secret;
+}
+
+export async function resetClientSecret(clientName: string) {
+    const client = await sql`UPDATE clients SET client_secret = concat('obs_sync_', encode(gen_random_bytes(32), 'base64')) WHERE client_name = ${clientName} RETURNING client_secret`;
     return client[0].client_secret;
 }

@@ -1,8 +1,22 @@
-/*
+.obsidian-sync-server-url-setting--warning {
+	background: rgba(var(--color-red-rgb), 0.08);
+	border: 1px solid rgba(var(--color-red-rgb), 0.35);
+	border-radius: 6px;
+	padding: 12px;
+}
 
-This CSS file will be included with your plugin, and
-available in the app when your plugin is enabled.
+.obsidian-sync-server-url-warning {
+	color: var(--text-error);
+	font-size: var(--font-ui-smaller);
+	font-weight: var(--font-medium);
+	margin-top: 6px;
+}
 
-If your plugin does not need CSS, delete this file.
-
-*/
+.obsidian-sync-client-secret-refresh {
+	align-items: center;
+	display: inline-flex;
+	height: var(--input-height);
+	justify-content: center;
+	padding: 0 8px;
+	width: var(--input-height);
+}

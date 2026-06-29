@@ -22,7 +22,8 @@ export default class MyPlugin extends Plugin {
 		await this.loadSettings();
 
 		// connect to server over ws
-		this.ws = new WebSocket(`ws://obsidian-hono.shloklab.us/ws?version=${PROTOCOL_VERSION}`);
+		let socketUrl = this.settings.serverUrl.replace('https://', 'wss://').replace('http://', 'ws://') + '/ws?version=' + PROTOCOL_VERSION;
+		this.ws = new WebSocket(socketUrl);
 		
 
 		this.ws.onopen = () => {
@@ -30,7 +31,8 @@ export default class MyPlugin extends Plugin {
 			if(this.ws){
 				let message: Message = {
 					type: MessageType.AUTH_ACK,
-					token: '88c53ab8-c8b7-4e6d-9481-f1d4326e4cfb'
+					client_name: this.settings.clientName,
+					token: this.settings.clientSecret
 				};
 				this.ws.send(serialize(message));
 			}
@@ -50,10 +52,20 @@ export default class MyPlugin extends Plugin {
 			}
 		});
 
-		this.ws.onmessage = (event) => {
+		this.ws.onmessage = async (event) => {
 			console.log(event.data);
 			const data = deserialize(event.data.toString());
 			switch(data.type){
+				case MessageType.AUTH_INIT:
+					this.settings.clientSecret = data.token;
+					await this.saveSettings();
+					break;
+				case MessageType.AUTH_SUCCESS:
+					console.log('Authenticated');
+					break;
+				case MessageType.AUTH_FAILED:
+					new Notice(data.reason);
+					break;
 				case MessageType.MESSAGE:
 					new Notice(data.payload);
 					break;

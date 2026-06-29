@@ -13,6 +13,7 @@ export function deserialize(raw: string): Message {
 
 export enum MessageType {
     AUTH_REQUIRED = "auth_required",
+    AUTH_INIT = "auth_init",
     AUTH_ACK = "auth_ack",
     AUTH_SUCCESS = "auth_success",
     AUTH_FAILED = "auth_failed",
@@ -24,13 +25,18 @@ export const messageSchema = z.discriminatedUnion('type', [
   z.object({ 
     type: z.literal(MessageType.AUTH_REQUIRED) }),
   z.object({ 
+    type: z.literal(MessageType.AUTH_INIT), 
+    client_name: z.string(),
+    token: z.string()}),
+  z.object({ 
     type: z.literal(MessageType.AUTH_ACK), 
+    client_name: z.string(),
     token: z.string() }),
   z.object({ 
     type: z.literal(MessageType.AUTH_SUCCESS) }),
   z.object({ 
     type: z.literal(MessageType.AUTH_FAILED), 
-    reason: z.string().optional() }),
+    reason: z.string() }),
   z.object({ 
     type: z.literal(MessageType.MESSAGE), 
     payload: z.string() }),
