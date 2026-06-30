@@ -3,6 +3,7 @@ import {
 	MarkdownView,
 	MarkdownFileInfo,
 	Modal,
+	Notice,
 	Plugin,
 	requestUrl,
 } from 'obsidian';
@@ -17,6 +18,7 @@ import { WebsocketsHelper } from './websockets/websockets';
 export default class MyPlugin extends Plugin {
 	settings!: MyPluginSettings;
 	ws: WebsocketsHelper | null = null;
+	private isUploadingVault = false;
 
 	async onload() {
 		await this.loadSettings();
@@ -24,12 +26,8 @@ export default class MyPlugin extends Plugin {
 		// connect to server over ws
 		this.ws = new WebsocketsHelper(this);
 
-		// // This creates an icon in the left ribbon.
-		this.addRibbonIcon('dice', 'Sample', (_evt: MouseEvent) => {
-			// Called when the user clicks the icon.
-			if(this.ws){
-				this.ws.sendMessage('Hello from Obsidian');
-			}
+		this.addRibbonIcon('upload', 'Upload entire vault', () => {
+			void this.uploadEntireVaultToServer();
 		});
 		
 		// on type push entire file to server
@@ -122,6 +120,93 @@ export default class MyPlugin extends Plugin {
 
 	async saveSettings() {
 		await this.saveData(this.settings);
+	}
+
+	private async uploadEntireVaultToServer(): Promise<void> {
+		if (this.isUploadingVault) {
+			new Notice('Vault upload is already running');
+			return;
+		}
+
+		this.isUploadingVault = true;
+
+		try {
+			const files = await this.listVaultFiles('');
+			let uploaded = 0;
+			let failed = 0;
+			const concurrency = 8;
+
+			new Notice(`Uploading ${files.length} vault files to server`);
+
+			let nextIndex = 0;
+			const uploadWorker = async () => {
+				while (nextIndex < files.length) {
+					const filePath = files[nextIndex];
+					nextIndex += 1;
+
+					if (filePath === undefined) {
+						continue;
+					}
+
+					try {
+						await this.uploadVaultFile(filePath);
+						uploaded += 1;
+					} catch (error) {
+						failed += 1;
+						console.error(`Failed to upload ${filePath}`, error);
+					}
+				}
+			};
+
+			const workerCount = Math.min(concurrency, files.length);
+			await Promise.all(
+				Array.from({ length: workerCount }, () => uploadWorker()),
+			);
+
+			new Notice(
+				`Vault upload finished: ${uploaded} uploaded, ${failed} failed`,
+			);
+		} catch (error) {
+			console.error('Vault upload failed', error);
+			new Notice('Vault upload failed: ' + this.formatError(error));
+		} finally {
+			this.isUploadingVault = false;
+		}
+	}
+
+	private async listVaultFiles(folderPath: string): Promise<string[]> {
+		const listedFiles = await this.app.vault.adapter.list(folderPath);
+		const nestedFiles = await Promise.all(
+			listedFiles.folders.map((childFolderPath) =>
+				this.listVaultFiles(childFolderPath),
+			),
+		);
+
+		return [...listedFiles.files, ...nestedFiles.flat()];
+	}
+
+	private async uploadVaultFile(filePath: string): Promise<void> {
+		const body = await this.app.vault.adapter.readBinary(filePath);
+		const response = await requestUrl({
+			url: this.settings.serverUrl + '/files',
+			method: 'POST',
+			contentType: 'application/octet-stream',
+			headers: {
+				'X-Obsidian-Path': encodeURIComponent(filePath),
+			},
+			body,
+			throw: false,
+		});
+
+		if (response.status >= 400) {
+			throw new Error(
+				`Server returned ${response.status}: ${response.text}`,
+			);
+		}
+	}
+
+	private formatError(error: unknown): string {
+		return error instanceof Error ? error.message : String(error);
 	}
 }
 
