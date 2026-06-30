@@ -3,7 +3,6 @@ import {
 	MarkdownView,
 	MarkdownFileInfo,
 	Modal,
-	Notice,
 	Plugin,
 } from 'obsidian';
 import {
@@ -11,75 +10,29 @@ import {
 	MyPluginSettings,
 	SampleSettingTab,
 } from './settings';
-import { deserialize, Message, MessageType, PROTOCOL_VERSION, serialize } from 'obsidian-sync-protocol';
+import { WebsocketsHelper } from './websockets/websockets';
 // Remember to rename these classes and interfaces!
 
 export default class MyPlugin extends Plugin {
 	settings!: MyPluginSettings;
-	ws: WebSocket | null = null;
+	ws: WebsocketsHelper | null = null;
 
 	async onload() {
 		await this.loadSettings();
 
 		// connect to server over ws
-		let socketUrl = this.settings.serverUrl.replace('https://', 'wss://').replace('http://', 'ws://') + '/ws?version=' + PROTOCOL_VERSION;
-		this.ws = new WebSocket(socketUrl);
-		
-
-		this.ws.onopen = () => {
-			console.log('Connected to server');
-			if(this.ws){
-				let message: Message = {
-					type: MessageType.AUTH_ACK,
-					client_name: this.settings.clientName,
-					token: this.settings.clientSecret
-				};
-				this.ws.send(serialize(message));
-			}
-		};
+		this.ws = new WebsocketsHelper(this);
 
 		// // This creates an icon in the left ribbon.
 		this.addRibbonIcon('dice', 'Sample', (_evt: MouseEvent) => {
 			// Called when the user clicks the icon.
 			if(this.ws){
-				let message: Message = {
-					type: MessageType.MESSAGE,
-					payload: 'Hello from Obsidian'
-				};
-				this.ws.send(
-					serialize(message)
-				);
+				this.ws.sendMessage('Hello from Obsidian');
 			}
 		});
 
-		this.ws.onmessage = async (event) => {
-			console.log(event.data);
-			const data = deserialize(event.data.toString());
-			switch(data.type){
-				case MessageType.AUTH_INIT:
-					this.settings.clientSecret = data.token;
-					await this.saveSettings();
-					break;
-				case MessageType.AUTH_SUCCESS:
-					console.log('Authenticated');
-					break;
-				case MessageType.AUTH_FAILED:
-					new Notice(data.reason);
-					break;
-				case MessageType.MESSAGE:
-					new Notice(data.payload);
-					break;
-				case MessageType.ERROR:
-					new Notice(data.reason);
-					break;
-			}
-		};
-		this.ws.onclose = () => {
-			console.log('Disconnected from server');
-		};
-		this.ws.onerror = (error) => {
-			console.error('Error: ', error);
-		};
+		
+
 
 		// // This adds a status bar item to the bottom of the app. Does not work on mobile apps.
 		// const statusBarItemEl = this.addStatusBarItem();
