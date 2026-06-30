@@ -1,4 +1,6 @@
 import { sql } from "bun";
+import { Context, Hono } from "hono";
+import { deserialize, Message, MessageType, serialize } from "obsidian-sync-protocol";
 
 // this file is supposed to figure some stuff out
 // 1. if the client exists then see if the client secret is correct
@@ -48,4 +50,59 @@ export async function resetClientSecret(clientName: string): Promise<string> {
 export async function resetClientName(clientName: string, token: string): Promise<string> {
     const client = await sql`UPDATE clients SET client_name = ${clientName} WHERE client_secret = ${token} RETURNING client_name`;
     return clientName;
+}
+
+function errorMessage(reason: string): Message {
+	return {
+		type: MessageType.ERROR,
+		reason,
+	};
+}
+
+type MessageOf<T extends MessageType> = Extract<Message, { type: T }>;
+function withMessage<T extends MessageType>(
+	expectedType: T,
+	handler: (c: Context, data: MessageOf<T>) => Promise<Response> | Response,
+) {
+	return async (c: Context) => {
+		let data: Message;
+		try {
+			data = deserialize(await c.req.text());
+		} catch (error) {
+			console.error(error);
+			return c.json(serialize(errorMessage('Invalid request body')), 400);
+		}
+		if (data.type !== expectedType) {
+			return c.json(serialize(errorMessage('Invalid request')), 400);
+		}
+		return handler(c, data as MessageOf<T>);
+	};
+}
+
+export function registerAuthRoutes(app: Hono) {
+	app.post('/reset-client-secret', withMessage(MessageType.AUTH_ACK, async (c, data) => {
+		const authResult = await checkClientExists(data.client_name, data.token);
+
+		if (!authResult) {
+			return c.json(serialize(errorMessage('Invalid token')), 401);
+		}
+
+		const newClientSecret = await resetClientSecret(data.client_name);
+
+		return c.json(serialize({
+			type: MessageType.AUTH_INIT,
+			client_name: data.client_name,
+			token: newClientSecret,
+		}), 200);
+	}));
+
+	app.post('/reset-client-name', withMessage(MessageType.RESET_CLIENT_NAME, async (c, data) => {
+		const newClientName = await resetClientName(data.new_client_name, data.token);
+
+		return c.json(serialize({
+			type: MessageType.AUTH_INIT,
+			client_name: newClientName,
+			token: data.token,
+		}), 200);
+	}));
 }
