@@ -4,6 +4,7 @@ import {
 	MarkdownFileInfo,
 	Modal,
 	Plugin,
+	requestUrl,
 } from 'obsidian';
 import {
 	DEFAULT_SETTINGS,
@@ -30,7 +31,17 @@ export default class MyPlugin extends Plugin {
 				this.ws.sendMessage('Hello from Obsidian');
 			}
 		});
-
+		
+		// on type push entire file to server
+		this.app.workspace.on('editor-change', async (editor) => {
+			const resp = await requestUrl({
+				url: this.settings.serverUrl + '/files',
+				method: 'POST',
+				contentType: 'application/octet-stream',
+				body: editor.getValue(),
+			});
+			console.log(resp);
+		});
 		
 
 

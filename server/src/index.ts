@@ -3,6 +3,7 @@ import { websocket } from 'hono/bun'
 import { bootstrapDB } from './db/MigrationRunner'
 import { registerAuthRoutes } from './auth/auth';
 import { registerWebSocketRoutes } from './websockets/websockets';
+import { registerObjectStoreRoutes } from './object/object_store';
 
 
 bootstrapDB();
@@ -14,10 +15,10 @@ app.get('/', (c) => {
 
 registerAuthRoutes(app);
 registerWebSocketRoutes(app);
+registerObjectStoreRoutes(app);
 
 export default {
   fetch: app.fetch,
   websocket,
   maxRequestBodySize: 1024 * 1024 * 10, // 10MB
 };
-
