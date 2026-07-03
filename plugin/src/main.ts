@@ -5,7 +5,10 @@ import {
 	Modal,
 	Notice,
 	Plugin,
+	normalizePath,
 	requestUrl,
+	type RequestUrlResponse,
+	type TFile,
 } from 'obsidian';
 import {
 	DEFAULT_SETTINGS,
@@ -31,17 +34,16 @@ export default class MyPlugin extends Plugin {
 		});
 		
 		// on type push entire file to server
-		this.app.workspace.on('editor-change', async (editor) => {
-			const resp = await requestUrl({
-				url: this.settings.serverUrl + '/files',
-				method: 'POST',
-				contentType: 'application/octet-stream',
-				body: editor.getValue(),
-			});
-			console.log(resp);
-		});
-		
+		this.registerEvent(
+			this.app.workspace.on('editor-change', (editor, info) => {
+				const file = info.file;
+				if (!file) {
+					return;
+				}
 
+				void this.uploadEditorFile(editor, file);
+			}),
+		);
 
 		// // This adds a status bar item to the bottom of the app. Does not work on mobile apps.
 		// const statusBarItemEl = this.addStatusBarItem();
@@ -105,7 +107,7 @@ export default class MyPlugin extends Plugin {
 
 	onunload() {
 		if(this.ws){
-			this.ws.close();
+			void this.ws.close();
 			this.ws = null;
 		}
 	}
@@ -202,6 +204,82 @@ export default class MyPlugin extends Plugin {
 			throw new Error(
 				`Server returned ${response.status}: ${response.text}`,
 			);
+		}
+	}
+
+	private async uploadEditorFile(editor: Editor, file: TFile): Promise<void> {
+		try {
+			const response = await requestUrl({
+				url: this.settings.serverUrl + '/files',
+				method: 'POST',
+				contentType: 'application/octet-stream',
+				headers: {
+					'X-Obsidian-Path': encodeURIComponent(file.path),
+				},
+				body: editor.getValue(),
+				throw: false,
+			});
+
+			if (response.status >= 400) {
+				throw new Error(
+					`Server returned ${response.status}: ${response.text}`,
+				);
+			}
+
+			await this.writeSyncMetadata(file, this.getUploadId(response));
+		} catch (error) {
+			console.error(`Failed to sync ${file.path}`, error);
+			new Notice(`Failed to sync ${file.path}: ${this.formatError(error)}`);
+		}
+	}
+
+	private getUploadId(response: RequestUrlResponse): string {
+		const payload: unknown = response.json;
+		const id =
+			typeof payload === 'object' && payload !== null && 'id' in payload
+				? payload.id
+				: undefined;
+		if (typeof id === 'string' && id.length > 0) {
+			return id;
+		}
+
+		throw new Error('Server response did not include an upload id');
+	}
+
+	private async writeSyncMetadata(file: TFile, id: string): Promise<void> {
+		const metadataDir = normalizePath(
+			`${this.manifest.dir ?? `.obsidian/plugins/${this.manifest.id}`}/sync-metadata`,
+		);
+		await this.ensureFolder(metadataDir);
+
+		const metadataPath = normalizePath(
+			`${metadataDir}/${file.path.replace(/[\\/]/g, '__')}.json`,
+		);
+		await this.app.vault.adapter.write(
+			metadataPath,
+			JSON.stringify(
+				{
+					id,
+					path: file.path,
+					timestamp: new Date().toISOString(),
+				},
+				null,
+				2,
+			),
+		);
+	}
+
+	private async ensureFolder(path: string): Promise<void> {
+		if (await this.app.vault.adapter.exists(path)) {
+			return;
+		}
+
+		try {
+			await this.app.vault.adapter.mkdir(path);
+		} catch (error) {
+			if (!(await this.app.vault.adapter.exists(path))) {
+				throw error;
+			}
 		}
 	}
 
