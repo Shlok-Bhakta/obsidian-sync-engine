@@ -37,7 +37,7 @@ export async function checkClientExists(clientName: string, clientSecret: string
     const client_info = await sql`SELECT * FROM clients WHERE client_name = ${clientName} AND client_secret = ${clientSecret}`.values();
     return client_info.length > 0;
 }
-async function createClient(clientName: string) {
+export async function createClient(clientName: string) {
     const client = await sql`INSERT INTO clients (client_name) VALUES (${clientName}) RETURNING client_secret`;
     return client[0].client_secret;
 }

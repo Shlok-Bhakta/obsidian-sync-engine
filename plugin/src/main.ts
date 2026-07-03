@@ -226,27 +226,14 @@ export default class MyPlugin extends Plugin {
 				);
 			}
 
-			await this.writeSyncMetadata(file, this.getUploadId(response));
+			await this.writeSyncMetadata(file);
 		} catch (error) {
 			console.error(`Failed to sync ${file.path}`, error);
 			new Notice(`Failed to sync ${file.path}: ${this.formatError(error)}`);
 		}
 	}
 
-	private getUploadId(response: RequestUrlResponse): string {
-		const payload: unknown = response.json;
-		const id =
-			typeof payload === 'object' && payload !== null && 'id' in payload
-				? payload.id
-				: undefined;
-		if (typeof id === 'string' && id.length > 0) {
-			return id;
-		}
-
-		throw new Error('Server response did not include an upload id');
-	}
-
-	private async writeSyncMetadata(file: TFile, id: string): Promise<void> {
+	private async writeSyncMetadata(file: TFile): Promise<void> {
 		const metadataDir = normalizePath(
 			`${this.manifest.dir ?? `.obsidian/plugins/${this.manifest.id}`}/sync-metadata`,
 		);
@@ -259,7 +246,6 @@ export default class MyPlugin extends Plugin {
 			metadataPath,
 			JSON.stringify(
 				{
-					id,
 					path: file.path,
 					timestamp: new Date().toISOString(),
 				},

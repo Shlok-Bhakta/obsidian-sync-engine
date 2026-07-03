@@ -3,6 +3,7 @@ pkgs.mkShell{
 	buildInputs = [
 		pkgs.postgresql_18_jit
 		pkgs.cloudflared
-    pkgs.rainfrog
+    	pkgs.rainfrog
+		pkgs.zip
 	];
 }
