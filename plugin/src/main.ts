@@ -28,6 +28,7 @@ export default class MyPlugin extends Plugin {
 
 		// connect to server over ws
 		this.ws = new WebsocketsHelper(this);
+		this.syncAdapterWrites();
 
 		this.addRibbonIcon('upload', 'Upload entire vault', () => {
 			void this.uploadEntireVaultToServer();
@@ -110,6 +111,59 @@ export default class MyPlugin extends Plugin {
 			void this.ws.close();
 			this.ws = null;
 		}
+	}
+
+	private syncAdapterWrites(): void {
+		const adapter = this.app.vault.adapter;
+		const write = adapter.write;
+		const writeBinary = adapter.writeBinary;
+
+		adapter.write = async (path, data, options) => {
+			await write.call(adapter, path, data, options);
+			void this.uploadWrittenConfigFile(path);
+		};
+		adapter.writeBinary = async (path, data, options) => {
+			await writeBinary.call(adapter, path, data, options);
+			void this.uploadWrittenConfigFile(path);
+		};
+
+		this.register(() => {
+			adapter.write = write;
+			adapter.writeBinary = writeBinary;
+		});
+	}
+
+	private async uploadWrittenConfigFile(path: string): Promise<void> {
+		if (!this.shouldSyncAdapterWrite(path)) {
+			return;
+		}
+
+		try {
+			await this.uploadVaultFile(path);
+		} catch (error) {
+			console.error(`Failed to sync ${path}`, error);
+			new Notice(`Failed to sync ${path}: ${this.formatError(error)}`);
+		}
+	}
+
+	private shouldSyncAdapterWrite(path: string): boolean {
+		const normalizedPath = normalizePath(path);
+		const configDir = normalizePath(this.app.vault.configDir);
+		const metadataDir = normalizePath(
+			`${this.manifest.dir ?? `${configDir}/plugins/${this.manifest.id}`}/sync-metadata`,
+		);
+
+		if (
+			normalizedPath === metadataDir ||
+			normalizedPath.startsWith(`${metadataDir}/`)
+		) {
+			return false;
+		}
+
+		return (
+			normalizedPath === configDir ||
+			normalizedPath.startsWith(`${configDir}/`)
+		);
 	}
 
 	async loadSettings() {
