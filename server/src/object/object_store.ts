@@ -2,14 +2,15 @@ import { Hono } from "hono";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { cp, mkdir, mkdtemp, rm } from "node:fs/promises";
-import { $ } from "bun";
-import { createClient } from "../auth/auth";
+import { $, sql } from "bun";
+import { createClient, getClientIdFromAuthorization } from "../auth/auth";
 
 export const DEFAULT_OBJECT_STORE_DIR = join(import.meta.dir, "../../object-data");
 
 export type ObjectStoreUploadContent = {
     path: string;
     content: Bun.BlobOrStringOrBuffer;
+    id: string;
 };
 
 export type ObjectStoreUploadResult = {
@@ -23,9 +24,13 @@ export class ObjectStore {
 
     async upload(content: ObjectStoreUploadContent): Promise<ObjectStoreUploadResult> {
         const path = this.pathForFile(decodeURIComponent(content.path));
-
+        
         const bytesWritten = await Bun.write(path, content.content, { createPath: true });
-
+        const [lastUpdatedRevision] = await sql<{ last_updated_revision: number }[]>`
+            INSERT INTO files (file_path, author_id) VALUES (${decodeURIComponent(content.path)}, ${content.id})
+            ON CONFLICT (file_path) DO UPDATE SET author_id = ${content.id}, 
+            last_updated_revision = EXCLUDED.last_updated_revision, updated_at = NOW() RETURNING last_updated_revision
+        `;
         return {
             path,
             bytesWritten,
@@ -80,13 +85,20 @@ export const objectStore = new ObjectStore();
 export function registerObjectStoreRoutes(app: Hono, store = objectStore) {
     app.post('/files', async (c) => {
         const path = c.req.header("X-Obsidian-Path");
+        const authorization = c.req.header("Authorization");
+        if (!authorization) {
+            return c.json({ error: "Authorization is required" }, 400);
+        }
         if (!path) {
             return c.json({ error: "Request body is required" }, 400);
         }
 
+        const clientId = await getClientIdFromAuthorization(authorization);
+        console.log("clientId", clientId);
         const result = await store.upload({
             path: path,
             content: await c.req.arrayBuffer(),
+            id: clientId
         });
         return c.json(result, 200);
     });

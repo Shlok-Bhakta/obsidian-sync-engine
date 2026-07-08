@@ -7,4 +7,18 @@ CREATE TABLE clients (
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
     UNIQUE (client_name)
-)
+);
+
+CREATE SEQUENCE global_revision AS BIGINT;
+
+
+CREATE TABLE files (
+    id UUID PRIMARY KEY DEFAULT uuidv7(),
+    file_path TEXT NOT NULL UNIQUE,
+    last_updated_revision BIGINT NOT NULL DEFAULT NEXTVAL('global_revision'),
+    file_is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
+    author_id UUID NOT NULL REFERENCES clients(id),
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+

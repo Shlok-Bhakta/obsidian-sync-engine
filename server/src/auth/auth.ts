@@ -52,6 +52,15 @@ export async function resetClientName(clientName: string, token: string): Promis
     return clientName;
 }
 
+export async function getClientIdFromAuthorization(authorization: string): Promise<string> {
+    const client = await sql`SELECT id FROM clients WHERE client_secret = ${authorization}`.values();
+	console.log("client", client, client.length);
+	if (client.length === 0) {
+		throw new Error("Invalid authorization");
+	}    
+	return client[0][0]; // this is dumb TODO: fix this to be typesafe or smth
+}
+
 function errorMessage(reason: string): Message {
 	return {
 		type: MessageType.ERROR,

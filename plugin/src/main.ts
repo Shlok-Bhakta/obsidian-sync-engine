@@ -195,6 +195,7 @@ export default class MyPlugin extends Plugin {
 			contentType: 'application/octet-stream',
 			headers: {
 				'X-Obsidian-Path': encodeURIComponent(filePath),
+				'Authorization': this.settings.clientSecret,
 			},
 			body,
 			throw: false,
@@ -215,6 +216,7 @@ export default class MyPlugin extends Plugin {
 				contentType: 'application/octet-stream',
 				headers: {
 					'X-Obsidian-Path': encodeURIComponent(file.path),
+					'Authorization': this.settings.clientSecret,
 				},
 				body: editor.getValue(),
 				throw: false,
