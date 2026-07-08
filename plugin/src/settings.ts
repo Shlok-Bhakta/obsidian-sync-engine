@@ -6,12 +6,14 @@ export interface MyPluginSettings {
 	serverUrl: string;
 	clientName: string;
 	clientSecret: string;
+	revision: number;
 }
 
 export const DEFAULT_SETTINGS: MyPluginSettings = {
 	serverUrl: 'https://...',
 	clientName: 'Main Computer',
 	clientSecret: 'Made by server',
+	revision: 0
 };
 
 const isHttpUrl = (value: string): boolean => {
@@ -109,6 +111,15 @@ export class SampleSettingTab extends PluginSettingTab {
 				}),
 		);
 
+		new Setting(containerEl)
+		.setName("Last Synced Revision")
+		.setDesc("Last synced revision of the client")
+		.addText((text) =>
+			text
+				.setPlaceholder('0')
+				.setValue(this.plugin.settings.revision.toString())
+				.setDisabled(true)
+		);
 	}
 
 	private async refreshClientSecret(): Promise<void> {
