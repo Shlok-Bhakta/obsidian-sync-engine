@@ -5,7 +5,7 @@ import { cp, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { $, sql } from "bun";
 import { createClient, getClientIdFromAuthorization } from "../auth/auth";
 
-export const DEFAULT_OBJECT_STORE_DIR = join(import.meta.dir, "../../object-data");
+export const DEFAULT_OBJECT_STORE_DIR = join(import.meta.dir, "../../" + process.env.OBJECT_STORE_DIR || "object-data");
 
 export type ObjectStoreUploadContent = {
     path: string;
@@ -32,8 +32,9 @@ export class ObjectStore {
             last_updated_revision = EXCLUDED.last_updated_revision, updated_at = NOW() RETURNING last_updated_revision
         `;
         return {
-            path,
+            path: decodeURIComponent(content.path),
             bytesWritten,
+       
         };
     }
 

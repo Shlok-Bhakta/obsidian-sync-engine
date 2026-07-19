@@ -3,6 +3,11 @@ procs:
     shell: "cd plugin && npm i && npm run dev"
   server:
     shell: "cd server && bun i && bun run dev"
+  tests:
+    shell: "cd server && bun test"
+    env:
+      DATABASE_URL: "postgres://postgres:postgres@localhost:5434/test_db"
+      OBJECT_STORE_DIR: "test_object_store"
   db:
     shell: "./db_setup.sh"
   pluginmove:
@@ -10,5 +15,6 @@ procs:
   tunnel:
     shell: "./server/tunnel.py"
   rainfrog:
-    shell: "rainfrog --url postgres://shlok@127.0.0.1:5432/obsidian_sync"
+    shell: "sleep 2 && rainfrog --url postgres://postgres:postgres@localhost:5433/dev_db"
+  
 
