@@ -1,4 +1,10 @@
 import { sql } from "bun";
+import { Hono } from "hono";
+import { registerObjectStoreRoutes } from "../object/object_store";
+
+export function createTestApp() {
+	return registerObjectStoreRoutes(new Hono());
+}
 
 export type ClientRow = {
 	id: string;

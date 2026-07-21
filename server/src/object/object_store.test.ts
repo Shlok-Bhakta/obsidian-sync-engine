@@ -1,5 +1,6 @@
 import { sql } from "bun";
-import { createClientFixture, FileRow } from "../test/fixtures";
+import { testClient } from "hono/testing";
+import { createClientFixture, createTestApp, FileRow } from "../test/fixtures";
 import { ObjectStore, ObjectStoreUploadContent } from "./object_store";
 import { describe, it, expect } from "bun:test";
 
@@ -106,5 +107,43 @@ describe("object store", () => {
         expect(outbox.map(o => o.path)).not.toContain("test2.txt");
         expect(outbox.map(o => o.path)).not.toContain("test3.txt");
         expect(outbox.length).toBe(0);
+    });
+    it("can give the correct inbox via API", async () => {
+        const client = await createClientFixture({ client_name: "alice" });
+        const app = createTestApp();
+        const api = testClient(app);
+        const uploads = [
+            { path: "test.txt", content: "Hello, world!" },
+            { path: "test2.txt", content: "Hello, world 2!" },
+            { path: "test3.txt", content: "Hello, world 3!" },
+        ];
+        await Promise.all(uploads.map(({ path, content }) =>
+            app.request("/files", {
+                method: "POST",
+                headers: {
+                    Authorization: client.client_secret,
+                    "X-Obsidian-Path": path,
+                },
+                body: content,
+            }),
+        ));
+        const res = await api.inbox.$get(
+            { query: { rev: "1" } },
+            { headers: { Authorization: client.client_secret } },
+        );
+        const outbox = await res.json() as { path: string }[];
+        expect(outbox.map(o => o.path)).not.toContain("test.txt");
+        expect(outbox.map(o => o.path)).toContain("test2.txt");
+        expect(outbox.map(o => o.path)).toContain("test3.txt");
+
+        const res2 = await api.inbox.$get(
+            { query: { rev: "4" } },
+            { headers: { Authorization: client.client_secret } },
+        );
+        const inbox = await res2.json() as { path: string }[];
+        expect(inbox.map(o => o.path)).not.toContain("test.txt");
+        expect(inbox.map(o => o.path)).not.toContain("test2.txt");
+        expect(inbox.map(o => o.path)).not.toContain("test3.txt");
+        expect(inbox.length).toBe(0);
     });
 });

@@ -101,59 +101,58 @@ export class ObjectStore {
 export const objectStore = new ObjectStore();
 
 export function registerObjectStoreRoutes(app: Hono, store = objectStore) {
-    app.post('/files', async (c) => {
-        const path = c.req.header("X-Obsidian-Path");
-        const authorization = c.req.header("Authorization");
-        if (!authorization) {
-            return c.json({ error: "Authorization is required" }, 400);
-        }
-        if (!path) {
-            return c.json({ error: "Request body is required" }, 400);
-        }
+    // Chain so Hono accumulates route types (needed by testClient inference).
+    return app
+        .post('/files', async (c) => {
+            const path = c.req.header("X-Obsidian-Path");
+            const authorization = c.req.header("Authorization");
+            if (!authorization) {
+                return c.json({ error: "Authorization is required" }, 400);
+            }
+            if (!path) {
+                return c.json({ error: "Request body is required" }, 400);
+            }
 
-        const clientId = await getClientIdFromAuthorization(authorization);
-        console.log("clientId", clientId);
-        const result = await store.upload({
-            path: path,
-            content: await c.req.arrayBuffer(),
-            id: clientId
-        });
-        return c.json(result, 200);
-    });
-
-    app.get('/bootstrap.zip', async (c) => {
-        const tmp = await mkdtemp(join(tmpdir(), "obsidian-bootstrap-"));
-        const zipPath = join(tmp, "vault.zip");
-
-        try {
-            await store.bootstrap_zip_create(zipPath);
-
-            setTimeout(() => void rm(tmp, { recursive: true, force: true }), 10 * 60 * 1000);
-            return new Response(Bun.file(zipPath), {
-                headers: {
-                    "Content-Type": "application/zip",
-                    "Content-Disposition": `attachment; filename="obsidian-bootstrap-${Date.now()}.zip"`,
-                    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-                    "Pragma": "no-cache",
-                    "Expires": "0",
-                },
+            const clientId = await getClientIdFromAuthorization(authorization);
+            console.log("clientId", clientId);
+            const result = await store.upload({
+                path: path,
+                content: await c.req.arrayBuffer(),
+                id: clientId
             });
-        } catch (error) {
-            await rm(tmp, { recursive: true, force: true });
-            throw error;
-        }
-    });
+            return c.json(result, 200);
+        })
+        .get('/bootstrap.zip', async (c) => {
+            const tmp = await mkdtemp(join(tmpdir(), "obsidian-bootstrap-"));
+            const zipPath = join(tmp, "vault.zip");
 
-    app.get('/inbox', async (c) => {
-        const authorization = c.req.header("Authorization");
-        if (!authorization) {
-            return c.json({ error: "Authorization is required" }, 400);
-        }
-        const clientId = await getClientIdFromAuthorization(authorization);
-        
-        const rev = Number(c.req.query("rev"));
-        const inbox = await store.inbox(rev);
-        return c.json(inbox, 200);
-    });
+            try {
+                await store.bootstrap_zip_create(zipPath);
 
+                setTimeout(() => void rm(tmp, { recursive: true, force: true }), 10 * 60 * 1000);
+                return new Response(Bun.file(zipPath), {
+                    headers: {
+                        "Content-Type": "application/zip",
+                        "Content-Disposition": `attachment; filename="obsidian-bootstrap-${Date.now()}.zip"`,
+                        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                        "Pragma": "no-cache",
+                        "Expires": "0",
+                    },
+                });
+            } catch (error) {
+                await rm(tmp, { recursive: true, force: true });
+                throw error;
+            }
+        })
+        .get('/inbox', async (c) => {
+            const authorization = c.req.header("Authorization");
+            if (!authorization) {
+                return c.json({ error: "Authorization is required" }, 400);
+            }
+            const clientId = await getClientIdFromAuthorization(authorization);
+
+            const rev = Number(c.req.query("rev"));
+            const inbox = await store.inbox(rev);
+            return c.json(inbox, 200);
+        });
 }
