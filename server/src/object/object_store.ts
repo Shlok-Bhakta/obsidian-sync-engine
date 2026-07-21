@@ -18,6 +18,11 @@ export type ObjectStoreUploadResult = {
     bytesWritten: number;
 };
 
+export type ObjectStoreOutboxItem = {
+    path: string;
+    lastUpdatedRevision: number;
+};
+
 // Simple content-addressed object store for blob uploads.
 export class ObjectStore {
     constructor(private readonly rootDirectory = DEFAULT_OBJECT_STORE_DIR) {}
@@ -78,6 +83,18 @@ export class ObjectStore {
 
     pathForFile(file: string): string {
         return join(this.rootDirectory, file);
+    }
+
+    async outbox(rev: number): Promise<ObjectStoreOutboxItem[]> {
+        const result = await sql<{ file_path: string; last_updated_revision: string }[]>`
+            SELECT file_path, last_updated_revision FROM files
+            WHERE last_updated_revision > ${rev}
+            ORDER BY last_updated_revision DESC
+        `;
+        return result.map((r: { file_path: string; last_updated_revision: string }) => ({
+            path: r.file_path,
+            lastUpdatedRevision: Number(r.last_updated_revision),
+        }));
     }
 }
 
