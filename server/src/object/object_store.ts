@@ -153,6 +153,6 @@ export function registerObjectStoreRoutes(app: Hono, store = objectStore) {
 
             const rev = Number(c.req.query("rev"));
             const inbox = await store.inbox(rev);
-            return c.json(inbox, 200);
+            return c.json({"inbox": inbox}, 200);
         });
 }

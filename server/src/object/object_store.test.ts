@@ -131,19 +131,19 @@ describe("object store", () => {
             { query: { rev: "1" } },
             { headers: { Authorization: client.client_secret } },
         );
-        const outbox = await res.json() as { path: string }[];
-        expect(outbox.map(o => o.path)).not.toContain("test.txt");
-        expect(outbox.map(o => o.path)).toContain("test2.txt");
-        expect(outbox.map(o => o.path)).toContain("test3.txt");
+        const outbox = await res.json() as { inbox: { path: string; lastUpdatedRevision: number }[] };
+        expect(outbox.inbox.map(o => o.path)).not.toContain("test.txt");
+        expect(outbox.inbox.map(o => o.path)).toContain("test2.txt");
+        expect(outbox.inbox.map(o => o.path)).toContain("test3.txt");
 
         const res2 = await api.inbox.$get(
             { query: { rev: "4" } },
             { headers: { Authorization: client.client_secret } },
         );
-        const inbox = await res2.json() as { path: string }[];
-        expect(inbox.map(o => o.path)).not.toContain("test.txt");
-        expect(inbox.map(o => o.path)).not.toContain("test2.txt");
-        expect(inbox.map(o => o.path)).not.toContain("test3.txt");
-        expect(inbox.length).toBe(0);
+        const inbox = await res2.json() as { inbox: { path: string; lastUpdatedRevision: number }[] };
+        expect(inbox.inbox.map(o => o.path)).not.toContain("test.txt");
+        expect(inbox.inbox.map(o => o.path)).not.toContain("test2.txt");
+        expect(inbox.inbox.map(o => o.path)).not.toContain("test3.txt");
+        expect(inbox.inbox.length).toBe(0);
     });
 });
