@@ -5,6 +5,10 @@
   "exports": {
     ".": "./index.ts"
   },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "bunx tsc --noEmit"
+  },
   "devDependencies": {
     "@types/bun": "latest"
   },

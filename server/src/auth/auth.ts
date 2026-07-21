@@ -1,117 +1,114 @@
+import { createHash, randomBytes } from "node:crypto";
 import { sql } from "bun";
-import { Context, Hono } from "hono";
-import { deserialize, Message, MessageType, serialize } from "obsidian-sync-protocol";
+import type { Context, Hono, Next } from "hono";
+import { z } from "zod";
 
-// this file is supposed to figure some stuff out
-// 1. if the client exists then see if the client secret is correct
-// 2. if the client does not exist then:
-// 2.1. if no client exists then we make the client and return the client secret
-// 2.2  if even a single client exists then we reject the auth
+export type AuthenticatedClient = { id: string; displayName: string };
 
-// Auth Entrypoint
-
-export type AuthResult = {
-    authenticated: boolean;
-    token: string | null;
+export function hashSecret(secret: string): string {
+  return createHash("sha256").update(secret, "utf8").digest("hex");
 }
-export async function auth(clientName: string, clientSecret: string): Promise<AuthResult> {
-    // check if any client exists if not make one
-    const client_count = await sql`SELECT * FROM clients`.values();
-    console.log(clientSecret);
-    console.log(client_count);
-    if(client_count.count > 0){
-        console.log('client exists');
-        return { 
-            authenticated: await checkClientExists(clientName, clientSecret), 
-            token: null 
-        };
-    }else{
-        console.log('client does not exist');
-        const new_client_secret = await createClient(clientName);
-        console.log(new_client_secret);
-        return { authenticated: true, token: new_client_secret };
+
+export function generateClientSecret(): string {
+  return `obs_sync_${randomBytes(32).toString("base64url")}`;
+}
+
+export async function createClient(displayName: string): Promise<AuthenticatedClient & { secret: string }> {
+  const secret = generateClientSecret();
+  const [row] = await sql<{ id: string; display_name: string }[]>`
+    INSERT INTO clients(display_name, secret_hash)
+    VALUES (${displayName}, ${hashSecret(secret)})
+    RETURNING id, display_name
+  `;
+  if (!row) throw new Error("client creation did not return a row");
+  return { id: row.id, displayName: row.display_name, secret };
+}
+
+export async function authenticateClient(
+  clientId: string,
+  credential: string,
+  expectedName?: string,
+): Promise<AuthenticatedClient | null> {
+  const [row] = await sql<{ id: string; display_name: string }[]>`
+    UPDATE clients
+    SET last_seen_at = NOW(), updated_at = NOW()
+    WHERE id = ${clientId} AND secret_hash = ${hashSecret(credential)} AND status = 'active'
+      AND (${expectedName ?? null}::text IS NULL OR display_name = ${expectedName ?? null})
+    RETURNING id, display_name
+  `;
+  return row ? { id: row.id, displayName: row.display_name } : null;
+}
+
+export function bearerCredential(c: Context): string | null {
+  const value = c.req.header("Authorization");
+  if (!value) return null;
+  const match = /^Bearer\s+(.+)$/i.exec(value);
+  return match?.[1] ?? null;
+}
+
+export async function requireBearer(c: Context, next: Next): Promise<Response | void> {
+  const credential = bearerCredential(c);
+  const clientId = c.req.header("X-Client-Id");
+  if (!credential || !clientId) return c.json({ code: "AUTH_REQUIRED", message: "Bearer authentication is required" }, 401);
+  const client = await authenticateClient(clientId, credential);
+  if (!client) return c.json({ code: "AUTH_INVALID", message: "The client credential is invalid or revoked" }, 401);
+  c.set("client", client);
+  await next();
+}
+
+export function getAuthenticatedClient(c: Context): AuthenticatedClient {
+  const client = c.get("client") as AuthenticatedClient | undefined;
+  if (!client) throw new Error("authenticated client context is missing");
+  return client;
+}
+
+const nameSchema = z.object({ displayName: z.string().trim().min(1).max(100) }).strict();
+
+export function registerAuthRoutes(app: Hono): void {
+  app.post("/v1/auth/register-initial", async (c) => {
+    const parsed = nameSchema.safeParse(await c.req.json().catch(() => null));
+    if (!parsed.success) return c.json({ code: "VALIDATION_FAILED", message: "A valid display name is required" }, 400);
+    try {
+      const result = await sql.begin(async (tx) => {
+        await tx`SELECT pg_advisory_xact_lock(73194521)`;
+        const [{ count }] = await tx<{ count: string }[]>`SELECT COUNT(*)::text AS count FROM clients`;
+        if (count !== "0") return null;
+        const secret = generateClientSecret();
+        const [row] = await tx<{ id: string; display_name: string }[]>`
+          INSERT INTO clients(display_name, secret_hash) VALUES (${parsed.data.displayName}, ${hashSecret(secret)})
+          RETURNING id, display_name
+        `;
+        return row ? { clientId: row.id, displayName: row.display_name, clientSecret: secret } : null;
+      });
+      if (!result) return c.json({ code: "INITIAL_CLIENT_EXISTS", message: "The server has already been claimed" }, 409);
+      return c.json(result, 201);
+    } catch (error) {
+      if (String(error).includes("clients_display_name_key")) {
+        return c.json({ code: "NAME_TAKEN", message: "That client name is already in use" }, 409);
+      }
+      throw error;
     }
-}
+  });
 
-export async function checkClientExists(clientName: string, clientSecret: string) {
-    const client_info = await sql`SELECT * FROM clients WHERE client_name = ${clientName} AND client_secret = ${clientSecret}`.values();
-    return client_info.length > 0;
-}
-export async function createClient(clientName: string) {
-    const client = await sql`INSERT INTO clients (client_name) VALUES (${clientName}) RETURNING client_secret`;
-    return client[0].client_secret;
-}
+  app.post("/v1/auth/rotate-secret", requireBearer, async (c) => {
+    const client = getAuthenticatedClient(c);
+    const secret = generateClientSecret();
+    await sql`UPDATE clients SET secret_hash = ${hashSecret(secret)}, updated_at = NOW() WHERE id = ${client.id}`;
+    return c.json({ clientSecret: secret });
+  });
 
-export async function resetClientSecret(clientName: string): Promise<string> {
-    const client = await sql`UPDATE clients SET client_secret = concat('obs_sync_', encode(gen_random_bytes(32), 'base64')) WHERE client_name = ${clientName} RETURNING client_secret`;
-    return client[0].client_secret;
-}
-
-export async function resetClientName(clientName: string, token: string): Promise<string> {
-    const client = await sql`UPDATE clients SET client_name = ${clientName} WHERE client_secret = ${token} RETURNING client_name`;
-    return clientName;
-}
-
-export async function getClientIdFromAuthorization(authorization: string): Promise<string> {
-    const client = await sql`SELECT id FROM clients WHERE client_secret = ${authorization}`.values();
-	console.log("client", client, client.length);
-	if (client.length === 0) {
-		throw new Error("Invalid authorization");
-	}    
-	return client[0][0]; // this is dumb TODO: fix this to be typesafe or smth
-}
-
-function errorMessage(reason: string): Message {
-	return {
-		type: MessageType.ERROR,
-		reason,
-	};
-}
-
-type MessageOf<T extends MessageType> = Extract<Message, { type: T }>;
-function withMessage<T extends MessageType>(
-	expectedType: T,
-	handler: (c: Context, data: MessageOf<T>) => Promise<Response> | Response,
-) {
-	return async (c: Context) => {
-		let data: Message;
-		try {
-			data = deserialize(await c.req.text());
-		} catch (error) {
-			console.error(error);
-			return c.json(serialize(errorMessage('Invalid request body')), 400);
-		}
-		if (data.type !== expectedType) {
-			return c.json(serialize(errorMessage('Invalid request')), 400);
-		}
-		return handler(c, data as MessageOf<T>);
-	};
-}
-
-export function registerAuthRoutes(app: Hono) {
-	app.post('/reset-client-secret', withMessage(MessageType.AUTH_ACK, async (c, data) => {
-		const authResult = await checkClientExists(data.client_name, data.token);
-
-		if (!authResult) {
-			return c.json(serialize(errorMessage('Invalid token')), 401);
-		}
-
-		const newClientSecret = await resetClientSecret(data.client_name);
-
-		return c.json(serialize({
-			type: MessageType.AUTH_INIT,
-			client_name: data.client_name,
-			token: newClientSecret,
-		}), 200);
-	}));
-
-	app.post('/reset-client-name', withMessage(MessageType.RESET_CLIENT_NAME, async (c, data) => {
-		const newClientName = await resetClientName(data.new_client_name, data.token);
-
-		return c.json(serialize({
-			type: MessageType.AUTH_INIT,
-			client_name: newClientName,
-			token: data.token,
-		}), 200);
-	}));
+  app.patch("/v1/auth/name", requireBearer, async (c) => {
+    const parsed = nameSchema.safeParse(await c.req.json().catch(() => null));
+    if (!parsed.success) return c.json({ code: "VALIDATION_FAILED", message: "A valid display name is required" }, 400);
+    const client = getAuthenticatedClient(c);
+    try {
+      await sql`UPDATE clients SET display_name = ${parsed.data.displayName}, updated_at = NOW() WHERE id = ${client.id}`;
+      return c.json({ displayName: parsed.data.displayName });
+    } catch (error) {
+      if (String(error).includes("clients_display_name_key")) {
+        return c.json({ code: "NAME_TAKEN", message: "That client name is already in use" }, 409);
+      }
+      throw error;
+    }
+  });
 }

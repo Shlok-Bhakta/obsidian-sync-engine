@@ -1,15 +1,9 @@
-# protocol
+# Revision Sync protocol
 
-To install dependencies:
+This package is the wire-type and validation source of truth shared by the Obsidian plugin and server. It defines versioned WebSocket messages, HTTP mutation/change/bootstrap schemas, decimal-string revisions, and the centralized vault path policy.
 
-```bash
+```sh
 bun install
+bun test
+bun run typecheck
 ```
-
-To run:
-
-```bash
-bun run protocol.ts
-```
-
-This project was created using `bun init` in bun v1.3.13. [Bun](https://bun.com) is a fast all-in-one JavaScript runtime.

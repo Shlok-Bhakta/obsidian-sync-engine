@@ -1,182 +1,105 @@
-import { App, Notice, PluginSettingTab, Setting, requestUrl } from 'obsidian';
-import MyPlugin from './main';
-import { deserialize, MessageType, serialize } from 'obsidian-sync-protocol';
+import { App, Notice, PluginSettingTab, Setting } from "obsidian";
+import type { Revision } from "obsidian-sync-protocol";
+import type ObsidianSyncPlugin from "./main";
 
-export interface MyPluginSettings {
-	serverUrl: string;
-	clientName: string;
-	clientSecret: string;
-	revision: number;
+export interface SyncPluginSettings {
+  serverUrl: string;
+  clientName: string;
+  clientId: string;
+  clientSecret: string;
+  revision: Revision;
+  vaultId: string;
+  snapshotRevision?: Revision;
+  bootstrapStatus?: string;
+  bootstrapUrl?: string;
+  bootstrapExpiresAt?: string;
 }
 
-export const DEFAULT_SETTINGS: MyPluginSettings = {
-	serverUrl: 'https://...',
-	clientName: 'Main Computer',
-	clientSecret: 'Made by server',
-	revision: 0
+export const DEFAULT_SETTINGS: SyncPluginSettings = {
+  serverUrl: "",
+  clientName: "Main computer",
+  clientId: "",
+  clientSecret: "",
+  revision: "0",
+  vaultId: "",
 };
 
-const isHttpUrl = (value: string): boolean => {
-	try {
-		return new URL(value.trim()).protocol === 'http:';
-	} catch {
-		return value.trim().toLowerCase().startsWith('http://');
-	}
-};
+export class SyncSettingTab extends PluginSettingTab {
+  private countdownTimer: number | null = null;
+  constructor(app: App, readonly plugin: ObsidianSyncPlugin) { super(app, plugin); }
 
-export class SampleSettingTab extends PluginSettingTab {
-	plugin: MyPlugin;
+  display(): void {
+    if (this.countdownTimer !== null) window.clearInterval(this.countdownTimer);
+    const { containerEl } = this;
+    containerEl.empty();
+    const warning = activeDocument.createDocumentFragment();
+    warning.appendText("HTTP carries encrypted-in-transit vault data only when the server uses HTTPS.");
+    if (this.plugin.settings.serverUrl.startsWith("http://")) warning.createEl("div", { cls: "obsidian-sync-server-url-warning", text: "Warning: credentials and vault contents are exposed on untrusted networks over HTTP." });
+    new Setting(containerEl).setName("Server URL").setDesc(warning).addText((text) => text
+      .setPlaceholder("https://sync.example.com")
+      .setValue(this.plugin.settings.serverUrl)
+      .onChange(async (value) => { this.plugin.settings.serverUrl = value.trim().replace(/\/$/, ""); await this.plugin.saveSettings(); }));
 
-	constructor(app: App, plugin: MyPlugin) {
-		super(app, plugin);
-		this.plugin = plugin;
-	}
+    let pendingClientName = this.plugin.settings.clientName;
+    new Setting(containerEl).setName("Client name").setDesc("A unique readable name shown to other clients.").addText((text) => text
+      .setValue(this.plugin.settings.clientName)
+      .onChange((value) => { pendingClientName = value.trim(); }))
+      .addButton((button) => button.setButtonText("Update").onClick(async () => {
+        try {
+          this.plugin.settings.clientName = await this.plugin.coordinator.http.renameClient(pendingClientName);
+          await this.plugin.saveSettings();
+        } catch (error) { new Notice(`Could not update client name: ${formatError(error)}`); }
+      }));
 
-	display(): void {
-		const { containerEl } = this;
+    new Setting(containerEl).setName("Client ID").setDesc("Stable identity assigned by the server.").addText((text) => text
+      .setValue(this.plugin.settings.clientId || "Not registered").setDisabled(true));
 
-		containerEl.empty();
-		new Setting(containerEl)
-		.setName("Client Name")
-		.setDesc("Name that this client is registered as")	
-		.addButton((button) =>
-			button
-				.setIcon('upload')
-				.setTooltip('Refresh client secret')
-				.setCta()
-				.setClass('obsidian-sync-client-secret-refresh')
-				.onClick(() => this.refreshClientName(this.plugin.settings.clientName)),
-		)
-		.addText((text) =>
-			text
-				.setPlaceholder('Main Computer')
-				.setValue(this.plugin.settings.clientName)
-				.onChange(async (value) => {
-					this.plugin.settings.clientName = value;
-					await this.plugin.saveSettings();
-				}),
-		);
-		const serverUrlDesc = activeDocument.createDocumentFragment();
-		serverUrlDesc.appendText("Enter the URL of the server to connect to");
-		const serverUrlWarning = serverUrlDesc.createDiv({
-			cls: 'obsidian-sync-server-url-warning',
-			text: 'Warning: use HTTPS instead of regular HTTP for your server URL.',
-		});
+    new Setting(containerEl).setName("Client secret").setDesc("Keep this bearer credential private.")
+      .addText((text) => { text.setValue(this.plugin.settings.clientSecret).setDisabled(true); text.inputEl.type = "password"; })
+      .addButton((button) => button.setButtonText("Rotate").onClick(async () => {
+        try {
+          this.plugin.settings.clientSecret = await this.plugin.coordinator.http.rotateSecret();
+          await this.plugin.saveSettings();
+          this.display();
+        } catch (error) { new Notice(`Could not rotate secret: ${formatError(error)}`); }
+      }));
 
-		const serverUrlSetting = new Setting(containerEl)
-			.setName("Server URL")
-			.setDesc(serverUrlDesc)
-			.addText((text) =>
-				text
-					.setPlaceholder('https://...')
-					.setValue(this.plugin.settings.serverUrl)
-					.onChange(async (value) => {
-						this.plugin.settings.serverUrl = value;
-						updateServerUrlWarning(value);
-						await this.plugin.saveSettings();
-					}),
-			);
+    new Setting(containerEl).setName("Sync state").setDesc(`${this.plugin.syncStatus.current}; last fully applied revision ${this.plugin.coordinator.metadata.revision}`)
+      .addButton((button) => button.setButtonText("Retry sync").onClick(() => void this.plugin.coordinator.retry()));
 
-		const updateServerUrlWarning = (value: string) => {
-			const showWarning = isHttpUrl(value);
-			serverUrlSetting.settingEl.toggleClass(
-				'obsidian-sync-server-url-setting--warning',
-				showWarning,
-			);
-			serverUrlWarning.toggle(showWarning);
-		};
+    new Setting(containerEl).setName("Pending conflicts").setDesc(`${this.plugin.coordinator.metadata.conflicts.length} unresolved`)
+      .addButton((button) => button.setButtonText("Resolve conflicts").setDisabled(this.plugin.coordinator.metadata.conflicts.length === 0)
+        .onClick(() => this.plugin.openConflictModal()));
 
-		updateServerUrlWarning(this.plugin.settings.serverUrl);
+    new Setting(containerEl).setName("Bootstrap another client").setDesc("Captures a revision and creates a single-use download link valid for five minutes.")
+      .addButton((button) => button.setButtonText("Generate bootstrap zip").setCta().onClick(async () => {
+        try { await this.plugin.coordinator.generateBootstrapZip(); this.plugin.settings.bootstrapStatus = "building"; this.display(); }
+        catch (error) { new Notice(formatError(error)); }
+      }));
 
+    if (this.plugin.settings.bootstrapStatus) {
+      const setting = new Setting(containerEl).setName("Bootstrap status");
+      const countdown = activeDocument.createElement("span");
+      setting.descEl.append(countdown);
+      const update = () => {
+        const expiry = this.plugin.settings.bootstrapExpiresAt ? new Date(this.plugin.settings.bootstrapExpiresAt).getTime() : 0;
+        const remaining = Math.max(0, expiry - Date.now());
+        countdown.setText(this.plugin.settings.bootstrapStatus === "ready" ? `Ready — expires in ${Math.ceil(remaining / 1000)} seconds` : this.plugin.settings.bootstrapStatus ?? "");
+      };
+      update();
+      this.countdownTimer = window.setInterval(update, 1000);
+      if (this.plugin.settings.bootstrapUrl) {
+        const bootstrapUrl = this.plugin.settings.bootstrapUrl;
+        setting.addButton((button) => button.setButtonText("Copy link").onClick(async () => { await navigator.clipboard.writeText(bootstrapUrl); }))
+          .addButton((button) => button.setButtonText("Open").onClick(() => window.open(bootstrapUrl, "_blank")));
+      }
+    }
+  }
 
-		new Setting(containerEl)
-		.setName("Client Secret")
-		.setDesc("DO NOT SHARE THIS WITH ANYONE!!!")			
-		.addButton((button) =>
-			button
-				.setIcon('refresh-cw')
-				.setTooltip('Refresh client secret')
-				.setCta()
-				.setClass('obsidian-sync-client-secret-refresh')
-				.onClick(() => this.refreshClientSecret()),
-		)
-		.addText((text) =>
-			text
-				.setPlaceholder('Made by server')
-				.setValue(this.plugin.settings.clientSecret)
-				.setDisabled(true)
-				.onChange(async (value) => {
-					this.plugin.settings.clientSecret = value;
-					await this.plugin.saveSettings();
-				}),
-		);
-
-		new Setting(containerEl)
-		.setName("Last Synced Revision")
-		.setDesc("Last synced revision of the client")
-		.addText((text) =>
-			text
-				.setPlaceholder('0')
-				.setValue(this.plugin.settings.revision.toString())
-				.setDisabled(true)
-		);
-	}
-
-	private async refreshClientSecret(): Promise<void> {
-		try {
-			const response = await requestUrl({
-				url: this.plugin.settings.serverUrl + '/reset-client-secret',
-				method: 'POST',
-				contentType: 'application/json',
-				body: serialize({
-					type: MessageType.AUTH_ACK,
-					client_name: this.plugin.settings.clientName,
-					token: this.plugin.settings.clientSecret
-				}),
-				throw: false,
-			});
-			const raw = typeof response.json === 'string' ? response.json : response.text;
-			let message = deserialize(raw);
-			if(message.type === MessageType.AUTH_INIT){
-				this.plugin.settings.clientSecret = message.token;
-				// refresh setting pane
-				this.display();
-				await this.plugin.saveSettings();
-			}else{
-				new Notice('Error refreshing client secret: ' + message.type);
-			}
-		} catch (error) {
-			new Notice('Error refreshing client secret: ' + error);
-		}
-	}
-
-	private async refreshClientName(newClientName: string): Promise<void> {
-		try {
-			const response = await requestUrl({
-				url: this.plugin.settings.serverUrl + '/reset-client-name',
-				method: 'POST',
-				contentType: 'application/json',
-				body: serialize({
-					type: MessageType.RESET_CLIENT_NAME,
-					new_client_name: newClientName,
-					token: this.plugin.settings.clientSecret
-				}),
-				throw: false,
-			});
-			const raw = typeof response.json === 'string' ? response.json : response.text;
-			let message = deserialize(raw);
-			if(message.type === MessageType.AUTH_INIT){
-				this.plugin.settings.clientName = message.client_name;
-				// refresh setting pane
-				this.display();
-				await this.plugin.saveSettings();
-			}else{
-				new Notice('Error refreshing client secret: ' + message.type);
-			}
-		} catch (error) {
-			new Notice('Error refreshing client secret: ' + error);
-		}
-	}
-
-
+  hide(): void {
+    if (this.countdownTimer !== null) window.clearInterval(this.countdownTimer);
+    this.countdownTimer = null;
+  }
 }
+
+function formatError(error: unknown): string { return error instanceof Error ? error.message : String(error); }

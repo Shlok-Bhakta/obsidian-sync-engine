@@ -1,5 +1,6 @@
 import { sql } from "bun";
 import migration0001 from "./migrations/0001_init.sql" with { type: "file" };
+import migration0002 from "./migrations/0002_revision_sync.sql" with { type: "file" };
 // import migration0002 from "./migrations/0002_blob_storage.sql" with { type: "file" };
 // import migration0003 from "./migrations/0003_bootstrap_blob_staging.sql" with { type: "file" };
 // import migration0004 from "./migrations/0004_yjs_compaction_index.sql" with { type: "file" };
@@ -14,6 +15,10 @@ const migrationsManifest: Migration[] = [
     {
         name: "0001_init",
         sql: migration0001,
+    },
+    {
+        name: "0002_revision_sync",
+        sql: migration0002,
     },
     // {
     //     name: "0002_blob_storage",
@@ -88,8 +93,11 @@ async function applyMigrations() {
         if (migrations.find(m => m.name === migration.name)) {
             continue;
         }
-        await sql.unsafe(await Bun.file(migration.sql).text());
+        const migrationSql = await Bun.file(migration.sql).text();
+        await sql.begin(async (tx) => {
+            await tx.unsafe(migrationSql);
+            await tx`INSERT INTO migrations (name, created_at) VALUES (${migration.name}, NOW());`;
+        });
         console.log(`Applied migration ${migration.name}`);
-        await sql`INSERT INTO migrations (name, created_at) VALUES (${migration.name}, NOW());`;
     }
 }

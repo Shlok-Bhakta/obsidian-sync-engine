@@ -1,343 +1,45 @@
-import {
-	Editor,
-	MarkdownView,
-	MarkdownFileInfo,
-	Modal,
-	Notice,
-	Plugin,
-	normalizePath,
-	requestUrl,
-	type RequestUrlResponse,
-	type TFile,
-} from 'obsidian';
-import {
-	DEFAULT_SETTINGS,
-	MyPluginSettings,
-	SampleSettingTab,
-} from './settings';
-import { WebsocketsHelper } from './websockets/websockets';
-// Remember to rename these classes and interfaces!
+import { Plugin } from "obsidian";
+import { DEFAULT_SETTINGS, SyncSettingTab, type SyncPluginSettings } from "./settings";
+import { SyncCoordinator } from "./sync/SyncCoordinator";
+import { ConflictModal } from "./ui/ConflictModal";
+import { SyncStatus } from "./ui/SyncStatus";
+import { presenceExtension } from "./presence/PresenceExtension";
 
-export default class MyPlugin extends Plugin {
-	settings!: MyPluginSettings;
-	ws: WebsocketsHelper | null = null;
-	private isUploadingVault = false;
+export default class ObsidianSyncPlugin extends Plugin {
+  settings!: SyncPluginSettings;
+  coordinator!: SyncCoordinator;
+  syncStatus!: SyncStatus;
 
-	async onload() {
-		await this.loadSettings();
+  async onload(): Promise<void> {
+    await this.loadSettings();
+    this.syncStatus = new SyncStatus(this.addStatusBarItem());
+    this.coordinator = new SyncCoordinator(this, this.settings, () => this.saveSettings(), this.syncStatus);
+    this.addSettingTab(new SyncSettingTab(this.app, this));
+    this.registerEditorExtension(presenceExtension());
 
-		// connect to server over ws
-		this.ws = new WebsocketsHelper(this);
-		this.syncAdapterWrites();
+    this.registerEvent(this.app.workspace.on("editor-change", (editor, info) => {
+      if (info.file) void this.coordinator.handleEditorChange(editor, info.file);
+    }));
+    this.addCommand({ id: "retry-sync", name: "Retry sync", callback: () => void this.coordinator.retry() });
+    this.addCommand({ id: "resolve-sync-conflicts", name: "Resolve sync conflicts", callback: () => this.openConflictModal() });
+    this.addCommand({ id: "generate-bootstrap-zip", name: "Generate bootstrap zip", callback: () => void this.coordinator.generateBootstrapZip() });
+    await this.coordinator.start();
+  }
 
-		this.addRibbonIcon('upload', 'Upload entire vault', () => {
-			void this.uploadEntireVaultToServer();
-		});
-		
-		// on type push entire file to server
-		this.registerEvent(
-			this.app.workspace.on('editor-change', (editor, info) => {
-				const file = info.file;
-				if (!file) {
-					return;
-				}
+  onunload(): void { void this.coordinator?.stop(); }
 
-				void this.uploadEditorFile(editor, file);
-			}),
-		);
+  async loadSettings(): Promise<void> {
+    const saved = (await this.loadData()) as Partial<SyncPluginSettings> | null;
+    this.settings = { ...DEFAULT_SETTINGS, ...saved };
+    this.settings.revision = String(saved?.revision ?? "0");
+    this.settings.vaultId ||= crypto.randomUUID();
+  }
 
-		// // This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		// const statusBarItemEl = this.addStatusBarItem();
-		// statusBarItemEl.setText('Status bar text');
+  async saveSettings(): Promise<void> { await this.saveData(this.settings); }
 
-		// // This adds a simple command that can be triggered anywhere
-		// this.addCommand({
-		// 	id: 'open-modal-simple',
-		// 	name: 'Open modal (simple)',
-		// 	callback: () => {
-		// 		new SampleModal(this.app).open();
-		// 	},
-		// });
-		// // This adds an editor command that can perform some operation on the current editor instance
-		// this.addCommand({
-		// 	id: 'replace-selected',
-		// 	name: 'Replace selected content',
-		// 	editorCallback: (
-		// 		editor: Editor,
-		// 		_ctx: MarkdownView | MarkdownFileInfo,
-		// 	) => {
-		// 		editor.replaceSelection('Sample editor command');
-		// 	},
-		// });
-		// // This adds a complex command that can check whether the current state of the app allows execution of the command
-		// this.addCommand({
-		// 	id: 'open-modal-complex',
-		// 	name: 'Open modal (complex)',
-		// 	checkCallback: (checking: boolean) => {
-		// 		// Conditions to check
-		// 		const markdownView =
-		// 			this.app.workspace.getActiveViewOfType(MarkdownView);
-		// 		if (markdownView) {
-		// 			// If checking is true, we're simply "checking" if the command can be run.
-		// 			// If checking is false, then we want to actually perform the operation.
-		// 			if (!checking) {
-		// 				new SampleModal(this.app).open();
-		// 			}
-
-		// 			// This command will only show up in Command Palette when the check function returns true
-		// 			return true;
-		// 		}
-		// 		return false;
-		// 	},
-		// });
-
-		// This adds a settings tab so the user can configure various aspects of the plugin
-		this.addSettingTab(new SampleSettingTab(this.app, this));
-
-		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-		// Using this function will automatically remove the event listener when this plugin is disabled.
-		// this.registerDomEvent(activeDocument, 'click', (_evt: MouseEvent) => {
-		// 	new Notice('Click');
-		// });
-
-		// // When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-		// this.registerInterval(
-		// 	window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000),
-		// );
-	}
-
-	onunload() {
-		if(this.ws){
-			void this.ws.close();
-			this.ws = null;
-		}
-	}
-
-	private syncAdapterWrites(): void {
-		const adapter = this.app.vault.adapter;
-		const write = adapter.write;
-		const writeBinary = adapter.writeBinary;
-
-		adapter.write = async (path, data, options) => {
-			await write.call(adapter, path, data, options);
-			void this.uploadWrittenConfigFile(path);
-		};
-		adapter.writeBinary = async (path, data, options) => {
-			await writeBinary.call(adapter, path, data, options);
-			void this.uploadWrittenConfigFile(path);
-		};
-
-		this.register(() => {
-			adapter.write = write;
-			adapter.writeBinary = writeBinary;
-		});
-	}
-
-	private async uploadWrittenConfigFile(path: string): Promise<void> {
-		if (!this.shouldSyncAdapterWrite(path)) {
-			return;
-		}
-
-		try {
-			await this.uploadVaultFile(path);
-		} catch (error) {
-			console.error(`Failed to sync ${path}`, error);
-			new Notice(`Failed to sync ${path}: ${this.formatError(error)}`);
-		}
-	}
-
-	private shouldSyncAdapterWrite(path: string): boolean {
-		const normalizedPath = normalizePath(path);
-		const configDir = normalizePath(this.app.vault.configDir);
-		const metadataDir = normalizePath(
-			`${this.manifest.dir ?? `${configDir}/plugins/${this.manifest.id}`}/sync-metadata`,
-		);
-
-		if (
-			normalizedPath === metadataDir ||
-			normalizedPath.startsWith(`${metadataDir}/`)
-		) {
-			return false;
-		}
-
-		return (
-			normalizedPath === configDir ||
-			normalizedPath.startsWith(`${configDir}/`)
-		);
-	}
-
-	async loadSettings() {
-		this.settings = Object.assign(
-			{},
-			DEFAULT_SETTINGS,
-			(await this.loadData()) as Partial<MyPluginSettings>,
-		);
-	}
-
-	async saveSettings() {
-		await this.saveData(this.settings);
-	}
-
-	private async uploadEntireVaultToServer(): Promise<void> {
-		if (this.isUploadingVault) {
-			new Notice('Vault upload is already running');
-			return;
-		}
-
-		this.isUploadingVault = true;
-
-		try {
-			const files = await this.listVaultFiles('');
-			let uploaded = 0;
-			let failed = 0;
-			const concurrency = 8;
-
-			new Notice(`Uploading ${files.length} vault files to server`);
-
-			let nextIndex = 0;
-			const uploadWorker = async () => {
-				while (nextIndex < files.length) {
-					const filePath = files[nextIndex];
-					nextIndex += 1;
-
-					if (filePath === undefined) {
-						continue;
-					}
-
-					try {
-						await this.uploadVaultFile(filePath);
-						uploaded += 1;
-					} catch (error) {
-						failed += 1;
-						console.error(`Failed to upload ${filePath}`, error);
-					}
-				}
-			};
-
-			const workerCount = Math.min(concurrency, files.length);
-			await Promise.all(
-				Array.from({ length: workerCount }, () => uploadWorker()),
-			);
-
-			new Notice(
-				`Vault upload finished: ${uploaded} uploaded, ${failed} failed`,
-			);
-		} catch (error) {
-			console.error('Vault upload failed', error);
-			new Notice('Vault upload failed: ' + this.formatError(error));
-		} finally {
-			this.isUploadingVault = false;
-		}
-	}
-
-	private async listVaultFiles(folderPath: string): Promise<string[]> {
-		const listedFiles = await this.app.vault.adapter.list(folderPath);
-		const nestedFiles = await Promise.all(
-			listedFiles.folders.map((childFolderPath) =>
-				this.listVaultFiles(childFolderPath),
-			),
-		);
-
-		return [...listedFiles.files, ...nestedFiles.flat()];
-	}
-
-	private async uploadVaultFile(filePath: string): Promise<void> {
-		const body = await this.app.vault.adapter.readBinary(filePath);
-		const response = await requestUrl({
-			url: this.settings.serverUrl + '/files',
-			method: 'POST',
-			contentType: 'application/octet-stream',
-			headers: {
-				'X-Obsidian-Path': encodeURIComponent(filePath),
-				'Authorization': this.settings.clientSecret,
-			},
-			body,
-			throw: false,
-		});
-
-		if (response.status >= 400) {
-			throw new Error(
-				`Server returned ${response.status}: ${response.text}`,
-			);
-		}
-	}
-
-	private async uploadEditorFile(editor: Editor, file: TFile): Promise<void> {
-		try {
-			const response = await requestUrl({
-				url: this.settings.serverUrl + '/files',
-				method: 'POST',
-				contentType: 'application/octet-stream',
-				headers: {
-					'X-Obsidian-Path': encodeURIComponent(file.path),
-					'Authorization': this.settings.clientSecret,
-				},
-				body: editor.getValue(),
-				throw: false,
-			});
-
-			if (response.status >= 400) {
-				throw new Error(
-					`Server returned ${response.status}: ${response.text}`,
-				);
-			}
-
-			await this.writeSyncMetadata(file);
-		} catch (error) {
-			console.error(`Failed to sync ${file.path}`, error);
-			new Notice(`Failed to sync ${file.path}: ${this.formatError(error)}`);
-		}
-	}
-
-	private async writeSyncMetadata(file: TFile): Promise<void> {
-		const metadataDir = normalizePath(
-			`${this.manifest.dir ?? `.obsidian/plugins/${this.manifest.id}`}/sync-metadata`,
-		);
-		await this.ensureFolder(metadataDir);
-
-		const metadataPath = normalizePath(
-			`${metadataDir}/${file.path.replace(/[\\/]/g, '__')}.json`,
-		);
-		await this.app.vault.adapter.write(
-			metadataPath,
-			JSON.stringify(
-				{
-					path: file.path,
-					timestamp: new Date().toISOString(),
-				},
-				null,
-				2,
-			),
-		);
-	}
-
-	private async ensureFolder(path: string): Promise<void> {
-		if (await this.app.vault.adapter.exists(path)) {
-			return;
-		}
-
-		try {
-			await this.app.vault.adapter.mkdir(path);
-		} catch (error) {
-			if (!(await this.app.vault.adapter.exists(path))) {
-				throw error;
-			}
-		}
-	}
-
-	private formatError(error: unknown): string {
-		return error instanceof Error ? error.message : String(error);
-	}
-}
-
-class SampleModal extends Modal {
-	onOpen() {
-		const { contentEl } = this;
-		contentEl.setText('Woah!');
-	}
-
-	onClose() {
-		const { contentEl } = this;
-		contentEl.empty();
-	}
+  openConflictModal(): void {
+    const records = this.coordinator.metadata.conflicts;
+    if (records.length === 0) return;
+    new ConflictModal(this.app, records, (choices) => this.coordinator.resolveConflicts(choices)).open();
+  }
 }

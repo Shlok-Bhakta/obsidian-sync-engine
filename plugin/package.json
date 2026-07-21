@@ -1,23 +1,28 @@
 {
-	"name": "obsidian-sample-plugin",
+	"name": "obsidian-revision-sync",
 	"version": "1.0.0",
-	"description": "This is a sample plugin for Obsidian (https://obsidian.md)",
+	"description": "Revision-driven eventually consistent synchronization for Obsidian.",
 	"main": "main.js",
 	"type": "module",
 	"scripts": {
 		"dev": "node esbuild.config.mjs",
 		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
 		"version": "node version-bump.mjs && git add manifest.json versions.json",
-		"lint": "eslint ."
+		"lint": "eslint .",
+		"test": "bun test src"
 	},
 	"keywords": [],
 	"license": "0-BSD",
 	"dependencies": {
-		"obsidian-sync-protocol": "file:../shared/protocol"
+		"@codemirror/state": "^6.5.0",
+		"@codemirror/view": "^6.38.6",
+		"obsidian-sync-protocol": "file:../shared/protocol",
+		"yjs": "^13.6.31"
 	},
 	"devDependencies": {
 		"@eslint/js": "^9.39.4",
 		"@types/node": "^22.15.17",
+		"@types/bun": "latest",
 		"esbuild": "0.25.5",
 		"eslint": "^9.39.4",
 		"eslint-plugin-obsidianmd": "^0.3.0",

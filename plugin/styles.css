@@ -20,3 +20,22 @@
 	padding: 0 8px;
 	width: var(--input-height);
 }
+
+.obsidian-sync-status { color: var(--text-muted); }
+.obsidian-sync-status--syncing { color: var(--text-accent); }
+.obsidian-sync-status--conflict, .obsidian-sync-status--error { color: var(--text-error); }
+.obsidian-sync-status--up-to-date { color: var(--text-success); }
+
+.obsidian-sync-remote-selection { background: color-mix(in srgb, var(--sync-presence-color) 24%, transparent); }
+.obsidian-sync-remote-caret { border-left: 2px solid var(--sync-presence-color); height: 1.2em; position: relative; }
+.obsidian-sync-remote-caret-label {
+	background: var(--sync-presence-color);
+	border-radius: 3px;
+	color: var(--text-on-accent);
+	font-size: var(--font-ui-smaller);
+	left: -2px;
+	padding: 1px 4px;
+	position: absolute;
+	top: -1.4em;
+	white-space: nowrap;
+}

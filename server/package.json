@@ -1,11 +1,17 @@
 {
   "name": "server",
   "scripts": {
-    "dev": "bun run --hot src/index.ts"
+    "dev": "bun run --hot src/index.ts",
+    "typecheck": "bunx tsc --noEmit",
+    "test": "bun test",
+    "test:integration": "RUN_POSTGRES_TESTS=1 bun test src/sync/engine.integration.test.ts"
   },
   "dependencies": {
+    "fflate": "^0.8.3",
     "hono": "^4.12.27",
-    "obsidian-sync-protocol": "file:../shared/protocol"
+    "obsidian-sync-protocol": "file:../shared/protocol",
+    "yjs": "^13.6.31",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/bun": "latest"
