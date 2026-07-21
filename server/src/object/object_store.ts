@@ -84,8 +84,8 @@ export class ObjectStore {
     pathForFile(file: string): string {
         return join(this.rootDirectory, file);
     }
-
-    async outbox(rev: number): Promise<ObjectStoreOutboxItem[]> {
+    // to create the client inbox
+    async inbox(rev: number): Promise<ObjectStoreOutboxItem[]> {
         const result = await sql<{ file_path: string; last_updated_revision: string }[]>`
             SELECT file_path, last_updated_revision FROM files
             WHERE last_updated_revision > ${rev}
@@ -143,4 +143,17 @@ export function registerObjectStoreRoutes(app: Hono, store = objectStore) {
             throw error;
         }
     });
+
+    app.get('/inbox', async (c) => {
+        const authorization = c.req.header("Authorization");
+        if (!authorization) {
+            return c.json({ error: "Authorization is required" }, 400);
+        }
+        const clientId = await getClientIdFromAuthorization(authorization);
+        
+        const rev = Number(c.req.query("rev"));
+        const inbox = await store.inbox(rev);
+        return c.json(inbox, 200);
+    });
+
 }

@@ -77,7 +77,7 @@ describe("object store", () => {
             id: client.id,
         }];
         await Promise.all(content.map(c => objectStore.upload(c)));
-        const outbox = await objectStore.outbox(1);
+        const outbox = await objectStore.inbox(1);
         expect(outbox.map(o => o.path)).not.toContain("test.txt");
         expect(outbox.map(o => o.path)).toContain("test2.txt");
         expect(outbox.map(o => o.path)).toContain("test3.txt");
@@ -101,7 +101,7 @@ describe("object store", () => {
             id: client.id,
         }];
         await Promise.all(content.map(c => objectStore.upload(c)));
-        const outbox = await objectStore.outbox(4);
+        const outbox = await objectStore.inbox(4);
         expect(outbox.map(o => o.path)).not.toContain("test.txt");
         expect(outbox.map(o => o.path)).not.toContain("test2.txt");
         expect(outbox.map(o => o.path)).not.toContain("test3.txt");
