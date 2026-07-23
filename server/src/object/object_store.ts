@@ -21,6 +21,7 @@ export type ObjectStoreUploadResult = {
 export type ObjectStoreOutboxItem = {
     path: string;
     lastUpdatedRevision: number;
+    isDeleted: boolean;
 };
 
 // Simple content-addressed object store for blob uploads.
@@ -41,6 +42,10 @@ export class ObjectStore {
             bytesWritten,
        
         };
+    }
+
+    async delete(path: string): Promise<void> {
+        await sql`UPDATE files SET file_is_deleted = TRUE, updated_at = NOW(), last_updated_revision = NEXTVAL('global_revision') WHERE file_path = ${path}`;
     }
 
     async download(path: string): Promise<ArrayBuffer> {
@@ -86,14 +91,16 @@ export class ObjectStore {
     }
     // to create the client inbox
     async inbox(rev: number): Promise<ObjectStoreOutboxItem[]> {
-        const result = await sql<{ file_path: string; last_updated_revision: string }[]>`
-            SELECT file_path, last_updated_revision FROM files
+        const result = await sql<{ file_path: string; last_updated_revision: string; file_is_deleted: boolean }[]>`
+            SELECT file_path, last_updated_revision, file_is_deleted FROM files
             WHERE last_updated_revision > ${rev}
             ORDER BY last_updated_revision DESC
         `;
-        return result.map((r: { file_path: string; last_updated_revision: string }) => ({
+        // console.log("result", result);
+        return result.map((r: { file_path: string; last_updated_revision: string; file_is_deleted: boolean }) => ({
             path: r.file_path,
             lastUpdatedRevision: Number(r.last_updated_revision),
+            isDeleted: r.file_is_deleted,
         }));
     }
 }
