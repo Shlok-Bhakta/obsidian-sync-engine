@@ -7,6 +7,13 @@ import { createClientFixture, createTestApp, FileRow } from "../test/fixtures";
 import { ObjectStore, ObjectStoreUploadContent } from "./object_store";
 import { describe, it, expect } from "bun:test";
 
+function decode(data: ArrayBuffer | null): string {
+    if (!data) {
+        throw new Error("expected file data, got null");
+    }
+    return new TextDecoder().decode(data);
+}
+
 describe("object store", () => {
     it("can upload a file", async () => {
         const client = await createClientFixture({ client_name: "alice" });
@@ -19,8 +26,7 @@ describe("object store", () => {
         const file = await objectStore.upload(content);
         expect(file.path).toBe("test.txt");
         // verify the file landed
-        const data: ArrayBuffer = await objectStore.download(file.path);
-        const text = new TextDecoder().decode(data);
+        const text = decode(await objectStore.download(file.path));
         expect(text).toBe("Hello, world!");
         // expect revision to be incremented
         const fileRows = await sql<FileRow[]>`
@@ -53,8 +59,7 @@ describe("object store", () => {
         expect(file2.path).toBe("test.txt");
 
         // verify the file landed
-        const data: ArrayBuffer = await objectStore.download(file.path);
-        const text = new TextDecoder().decode(data);
+        const text = decode(await objectStore.download(file.path));
         expect(text).toBe("Hello, world 2!");
         // expect revision to be incremented
         const fileRowsSecond = await sql<FileRow[]>`
@@ -253,5 +258,115 @@ describe("object store", () => {
         } finally {
             await rm(tmp, { recursive: true, force: true });
         }
+    });
+    it("rejects a path traversal attempt on upload with 400", async () => {
+        const client = await createClientFixture({ client_name: "alice" });
+        const app = createTestApp();
+        const res = await app.request("/files", {
+            method: "POST",
+            headers: { Authorization: client.client_secret, "X-Obsidian-Path": "../../etc/passwd" },
+            body: "pwned",
+        });
+        expect(res.status).toBe(400);
+
+        const fileRows = await sql<FileRow[]>`SELECT * FROM files`;
+        expect(fileRows.length).toBe(0);
+    });
+    it("rejects a path traversal attempt on download and delete with 400", async () => {
+        const client = await createClientFixture({ client_name: "alice" });
+        const app = createTestApp();
+        const traversal = encodeURIComponent("../../etc/passwd");
+
+        const getRes = await app.request(`/files?path=${traversal}`, {
+            headers: { Authorization: client.client_secret },
+        });
+        expect(getRes.status).toBe(400);
+
+        const deleteRes = await app.request(`/files?path=${traversal}`, {
+            method: "DELETE",
+            headers: { Authorization: client.client_secret },
+        });
+        expect(deleteRes.status).toBe(400);
+    });
+    it("deletes a file whose path was sent encodeURIComponent-encoded, matching the plugin", async () => {
+        const client = await createClientFixture({ client_name: "alice" });
+        const app = createTestApp();
+        const rawPath = "folder/na me.txt";
+        const encodedPath = encodeURIComponent(rawPath);
+
+        await app.request("/files", {
+            method: "POST",
+            headers: { Authorization: client.client_secret, "X-Obsidian-Path": encodedPath },
+            body: "Hello, world!",
+        });
+
+        const deleteRes = await app.request(`/files?path=${encodedPath}`, {
+            method: "DELETE",
+            headers: { Authorization: client.client_secret },
+        });
+        expect(deleteRes.status).toBe(200);
+        const body = await deleteRes.json() as { path: string; revision: number };
+        expect(body.path).toBe(rawPath);
+
+        const fileRows = await sql<FileRow[]>`SELECT * FROM files WHERE file_path = ${rawPath}`;
+        expect(fileRows.length).toBe(1);
+        expect(fileRows[0].file_is_deleted).toBe(true);
+    });
+    it("returns 404 when deleting a file that doesn't exist", async () => {
+        const client = await createClientFixture({ client_name: "alice" });
+        const app = createTestApp();
+        const res = await app.request(`/files?path=${encodeURIComponent("does-not-exist.txt")}`, {
+            method: "DELETE",
+            headers: { Authorization: client.client_secret },
+        });
+        expect(res.status).toBe(404);
+    });
+    it("re-uploading a soft-deleted file clears the tombstone and appears as a put in the inbox", async () => {
+        const client = await createClientFixture({ client_name: "alice" });
+        const objectStore = new ObjectStore();
+        await objectStore.upload({ path: "test.txt", content: "v1", id: client.id });
+        await objectStore.delete("test.txt");
+        await objectStore.upload({ path: "test.txt", content: "v2", id: client.id });
+
+        const fileRows = await sql<FileRow[]>`SELECT * FROM files WHERE file_path = ${"test.txt"}`;
+        expect(fileRows[0].file_is_deleted).toBe(false);
+
+        const inbox = await objectStore.inbox(0);
+        const entry = inbox.find((i) => i.path === "test.txt");
+        expect(entry?.isDeleted).toBe(false);
+
+        const text = decode(await objectStore.download("test.txt"));
+        expect(text).toBe("v2");
+    });
+    it("returns 404 when downloading a soft-deleted file", async () => {
+        const client = await createClientFixture({ client_name: "alice" });
+        const app = createTestApp();
+        await app.request("/files", {
+            method: "POST",
+            headers: { Authorization: client.client_secret, "X-Obsidian-Path": "test.txt" },
+            body: "Hello, world!",
+        });
+        await app.request("/files?path=test.txt", {
+            method: "DELETE",
+            headers: { Authorization: client.client_secret },
+        });
+
+        const res = await app.request("/files?path=test.txt", {
+            headers: { Authorization: client.client_secret },
+        });
+        expect(res.status).toBe(404);
+    });
+    it("returns 401 for GET/DELETE /files with an invalid client secret", async () => {
+        const app = createTestApp();
+        const getRes = await app.request("/files?path=test.txt", {
+            headers: { Authorization: "bogus-secret" },
+        });
+        expect(getRes.status).toBe(401);
+
+        const deleteRes = await app.request("/files?path=test.txt", {
+            method: "DELETE",
+            headers: { Authorization: "bogus-secret" },
+        });
+        expect(deleteRes.status).toBe(401);
     });
 });
