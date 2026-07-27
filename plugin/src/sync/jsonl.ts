@@ -29,7 +29,16 @@ export async function appendLine<T>(
 ): Promise<void> {
 	const existing = await fs.exists(path) ? await fs.read(path) : "";
 	const serialized = JSON.stringify(lineObj);
-	const data = existing.length > 0 ? existing + serialized + "\n" : serialized + "\n";
+	let data: string;
+	if (existing.length === 0) {
+		data = serialized + "\n";
+	} else if (existing.endsWith("\n")) {
+		data = existing + serialized + "\n";
+	} else {
+		// Existing content is missing its trailing newline (e.g. written by
+		// something other than appendLine) — fix it up so lines don't merge.
+		data = existing + "\n" + serialized + "\n";
+	}
 	await fs.write(path, data);
 }
 

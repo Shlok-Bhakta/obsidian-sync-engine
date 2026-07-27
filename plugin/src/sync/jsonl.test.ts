@@ -40,4 +40,18 @@ describe("jsonl", () => {
 		const lines = await readLines<{ a: number }>(fs, "log.jsonl");
 		expect(lines).toEqual([{ a: 2 }, { a: 3 }]);
 	});
+
+	test("appendLine onto a file missing its trailing newline stays parseable", async () => {
+		const fs = new MemorySyncFs();
+		// Simulate content written by something other than appendLine, without
+		// a trailing newline.
+		await fs.write("log.jsonl", '{"a":1}');
+		await appendLine(fs, "log.jsonl", { a: 2 });
+
+		const raw = await fs.read("log.jsonl");
+		expect(raw).toBe('{"a":1}\n{"a":2}\n');
+
+		const lines = await readLines<{ a: number }>(fs, "log.jsonl");
+		expect(lines).toEqual([{ a: 1 }, { a: 2 }]);
+	});
 });
