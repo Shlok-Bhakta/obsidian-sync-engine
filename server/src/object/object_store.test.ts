@@ -1,5 +1,8 @@
-import { sql } from "bun";
+import { $, sql } from "bun";
 import { testClient } from "hono/testing";
+import { join } from "node:path";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { createClientFixture, createTestApp, FileRow } from "../test/fixtures";
 import { ObjectStore, ObjectStoreUploadContent } from "./object_store";
 import { describe, it, expect } from "bun:test";
@@ -24,6 +27,7 @@ describe("object store", () => {
             SELECT * FROM files WHERE file_path = ${file.path}
         `;
         expect(Number(fileRows[0].last_updated_revision)).toBeGreaterThan(0);
+        expect(file.revision).toBe(Number(fileRows[0].last_updated_revision));
     });
     it("can upload 2 files with the same path", async () => {
         const client = await createClientFixture({ client_name: "alice" });
@@ -108,7 +112,7 @@ describe("object store", () => {
         expect(outbox.map(o => o.path)).not.toContain("test3.txt");
         expect(outbox.length).toBe(0);
     });
-    it("can give the correct inbox via API", async () => {
+    it("can give the correct inbox via API as ascending NDJSON", async () => {
         const client = await createClientFixture({ client_name: "alice" });
         const app = createTestApp();
         const api = testClient(app);
@@ -117,35 +121,37 @@ describe("object store", () => {
             { path: "test2.txt", content: "Hello, world 2!" },
             { path: "test3.txt", content: "Hello, world 3!" },
         ];
-        await Promise.all(uploads.map(({ path, content }) =>
-            app.request("/files", {
+        // Sequential so revisions are deterministic (1, 2, 3).
+        for (const { path, content } of uploads) {
+            await app.request("/files", {
                 method: "POST",
                 headers: {
                     Authorization: client.client_secret,
                     "X-Obsidian-Path": path,
                 },
                 body: content,
-            }),
-        ));
+            });
+        }
         const res = await api.inbox.$get(
             { query: { rev: "1" } },
             { headers: { Authorization: client.client_secret } },
         );
-        const outbox = await res.json() as { inbox: { path: string; lastUpdatedRevision: number }[] };
-        // expect(outbox.inbox.map(o => o.path)).not.toContain("test.txt");
-        // expect(outbox.inbox.map(o => o.path)).toContain("test2.txt");
-        // expect(outbox.inbox.map(o => o.path)).toContain("test3.txt");
-        expect(outbox.inbox.length).toBe(2);
+        expect(res.headers.get("Content-Type")).toContain("application/x-ndjson");
+        const text = await res.text();
+        const lines = text.trim().split("\n").map((line) => JSON.parse(line) as { rev: number; op: string; path: string });
+        expect(lines.length).toBe(2);
+        expect(lines.map((l) => l.path)).not.toContain("test.txt");
+        expect(lines.map((l) => l.path)).toEqual(["test2.txt", "test3.txt"]);
+        expect(lines.every((l) => l.op === "put")).toBe(true);
+        // strictly ascending by rev
+        expect(lines[0].rev).toBeLessThan(lines[1].rev);
 
         const res2 = await api.inbox.$get(
             { query: { rev: "4" } },
             { headers: { Authorization: client.client_secret } },
         );
-        const inbox = await res2.json() as { inbox: { path: string; lastUpdatedRevision: number }[] };
-        expect(inbox.inbox.map(o => o.path)).not.toContain("test.txt");
-        expect(inbox.inbox.map(o => o.path)).not.toContain("test2.txt");
-        expect(inbox.inbox.map(o => o.path)).not.toContain("test3.txt");
-        expect(inbox.inbox.length).toBe(0);
+        const text2 = await res2.text();
+        expect(text2).toBe("");
     });
     it("can delete a file", async () => {
         const client = await createClientFixture({ client_name: "alice" });
@@ -161,5 +167,91 @@ describe("object store", () => {
         console.log("outbox", outbox);
         expect(outbox.map(o => o.path)).toContain("test.txt");
         expect(outbox.map(o => o.isDeleted)).toContain(true);
-    }); 
+    });
+    it("delete returns the new revision and shows up as a delete op in the inbox", async () => {
+        const client = await createClientFixture({ client_name: "alice" });
+        const app = createTestApp();
+        const api = testClient(app);
+        await app.request("/files", {
+            method: "POST",
+            headers: { Authorization: client.client_secret, "X-Obsidian-Path": "test.txt" },
+            body: "Hello, world!",
+        });
+        const deleteRes = await api.files.$delete(
+            { query: { path: "test.txt" } },
+            { headers: { Authorization: client.client_secret } },
+        );
+        const deleteBody = await deleteRes.json() as { path: string; revision: number };
+        expect(deleteBody.path).toBe("test.txt");
+        expect(deleteBody.revision).toBe(2);
+
+        const res = await api.inbox.$get(
+            { query: { rev: "0" } },
+            { headers: { Authorization: client.client_secret } },
+        );
+        const lines = (await res.text()).trim().split("\n").map((line) => JSON.parse(line) as { rev: number; op: string; path: string });
+        const deleteLine = lines.find((l) => l.path === "test.txt");
+        expect(deleteLine?.op).toBe("delete");
+        expect(deleteLine?.rev).toBe(2);
+    });
+    it("can download a file via the API", async () => {
+        const client = await createClientFixture({ client_name: "alice" });
+        const app = createTestApp();
+        const api = testClient(app);
+        await app.request("/files", {
+            method: "POST",
+            headers: { Authorization: client.client_secret, "X-Obsidian-Path": "test.txt" },
+            body: "Hello, world!",
+        });
+        const res = await api.files.$get(
+            { query: { path: "test.txt" } },
+            { headers: { Authorization: client.client_secret } },
+        );
+        expect(res.status).toBe(200);
+        const text = await res.text();
+        expect(text).toBe("Hello, world!");
+    });
+    it("upload response includes the assigned revision", async () => {
+        const client = await createClientFixture({ client_name: "alice" });
+        const app = createTestApp();
+        const res = await app.request("/files", {
+            method: "POST",
+            headers: { Authorization: client.client_secret, "X-Obsidian-Path": "test.txt" },
+            body: "Hello, world!",
+        });
+        const body = await res.json() as { path: string; bytesWritten: number; revision: number };
+        expect(body.path).toBe("test.txt");
+        expect(body.revision).toBe(1);
+    });
+    it("computes the current tip revision for bootstrap stamping", async () => {
+        const client = await createClientFixture({ client_name: "alice" });
+        const objectStore = new ObjectStore();
+        expect(await objectStore.getTipRevision()).toBe(0);
+        await objectStore.upload({ path: "test.txt", content: "Hello, world!", id: client.id });
+        await objectStore.upload({ path: "test2.txt", content: "Hello, world 2!", id: client.id });
+        expect(await objectStore.getTipRevision()).toBe(2);
+    });
+    it("stamps the current tip revision (not 0) into the bootstrap zip's data.json", async () => {
+        const client = await createClientFixture({ client_name: "alice" });
+        const objectStore = new ObjectStore();
+        const pluginDataPath = ".obsidian/plugins/obsidian-sync-engine/data.json";
+        await objectStore.upload({ path: pluginDataPath, content: "{}", id: client.id });
+        await objectStore.upload({ path: "note.md", content: "hello", id: client.id });
+        expect(await objectStore.getTipRevision()).toBe(2);
+
+        const tmp = await mkdtemp(join(tmpdir(), "obsidian-bootstrap-test-"));
+        const zipPath = join(tmp, "vault.zip");
+        try {
+            await objectStore.bootstrap_zip_create(zipPath);
+            const extractDir = join(tmp, "extracted");
+            await $`unzip -qq ${zipPath} -d ${extractDir}`;
+            const settings = await Bun.file(join(extractDir, pluginDataPath)).json() as Record<string, unknown>;
+            expect(settings.revision).toBe(2);
+            expect(settings.lastPulledRev).toBeUndefined();
+            expect(typeof settings.clientName).toBe("string");
+            expect(typeof settings.clientSecret).toBe("string");
+        } finally {
+            await rm(tmp, { recursive: true, force: true });
+        }
+    });
 });

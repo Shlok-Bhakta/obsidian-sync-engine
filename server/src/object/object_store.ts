@@ -16,6 +16,7 @@ export type ObjectStoreUploadContent = {
 export type ObjectStoreUploadResult = {
     path: string;
     bytesWritten: number;
+    revision: number;
 };
 
 export type ObjectStoreOutboxItem = {
@@ -32,7 +33,7 @@ export class ObjectStore {
         const path = this.pathForFile(decodeURIComponent(content.path));
         
         const bytesWritten = await Bun.write(path, content.content, { createPath: true });
-        const [lastUpdatedRevision] = await sql<{ last_updated_revision: number }[]>`
+        const [row] = await sql<{ last_updated_revision: number }[]>`
             INSERT INTO files (file_path, author_id) VALUES (${decodeURIComponent(content.path)}, ${content.id})
             ON CONFLICT (file_path) DO UPDATE SET author_id = ${content.id}, 
             last_updated_revision = EXCLUDED.last_updated_revision, updated_at = NOW() RETURNING last_updated_revision
@@ -40,12 +41,24 @@ export class ObjectStore {
         return {
             path: decodeURIComponent(content.path),
             bytesWritten,
-       
+            revision: Number(row.last_updated_revision),
         };
     }
 
-    async delete(path: string): Promise<void> {
-        await sql`UPDATE files SET file_is_deleted = TRUE, updated_at = NOW(), last_updated_revision = NEXTVAL('global_revision') WHERE file_path = ${path}`;
+    async delete(path: string): Promise<{ revision: number }> {
+        const [row] = await sql<{ last_updated_revision: number }[]>`
+            UPDATE files SET file_is_deleted = TRUE, updated_at = NOW(), last_updated_revision = NEXTVAL('global_revision')
+            WHERE file_path = ${path} RETURNING last_updated_revision
+        `;
+        return { revision: row ? Number(row.last_updated_revision) : 0 };
+    }
+
+    /** Current global tip revision: highest revision stamped on any file, or 0 if none exist. */
+    async getTipRevision(): Promise<number> {
+        const [row] = await sql<{ tip: string | null }[]>`
+            SELECT MAX(last_updated_revision) AS tip FROM files
+        `;
+        return row?.tip ? Number(row.tip) : 0;
     }
 
     async download(path: string): Promise<ArrayBuffer> {
@@ -68,6 +81,7 @@ export class ObjectStore {
             const pick = () => name_choices[Math.floor(Math.random() * name_choices.length)];
             const clientName = `${pick()}-${pick()}`;
             const clientSecret = await createClient(clientName);
+            const revision = await this.getTipRevision();
 
             const pluginDir = join(vaultDir, ".obsidian/plugins/obsidian-sync-engine");
             await mkdir(pluginDir, { recursive: true });
@@ -77,7 +91,7 @@ export class ObjectStore {
                 ...settings,
                 clientName,
                 clientSecret,
-                lastPulledRev: 0,
+                revision,
             }, null, 2));
 
             await $`zip -qr ${path} .`.cwd(vaultDir);
@@ -94,7 +108,7 @@ export class ObjectStore {
         const result = await sql<{ file_path: string; last_updated_revision: string; file_is_deleted: boolean }[]>`
             SELECT file_path, last_updated_revision, file_is_deleted FROM files
             WHERE last_updated_revision > ${rev}
-            ORDER BY last_updated_revision DESC
+            ORDER BY last_updated_revision ASC
         `;
         // console.log("result", result);
         return result.map((r: { file_path: string; last_updated_revision: string; file_is_deleted: boolean }) => ({
@@ -156,10 +170,54 @@ export function registerObjectStoreRoutes(app: Hono, store = objectStore) {
             if (!authorization) {
                 return c.json({ error: "Authorization is required" }, 400);
             }
-            const clientId = await getClientIdFromAuthorization(authorization);
+            await getClientIdFromAuthorization(authorization);
 
             const rev = Number(c.req.query("rev"));
             const inbox = await store.inbox(rev);
-            return c.json({"inbox": inbox}, 200);
+            const lines = inbox.map((item) => JSON.stringify({
+                rev: item.lastUpdatedRevision,
+                op: item.isDeleted ? "delete" : "put",
+                path: item.path,
+            }));
+            const body = lines.length > 0 ? lines.join("\n") + "\n" : "";
+            return new Response(body, {
+                status: 200,
+                headers: { "Content-Type": "application/x-ndjson" },
+            });
+        })
+        .get('/files', async (c) => {
+            const authorization = c.req.header("Authorization");
+            if (!authorization) {
+                return c.json({ error: "Authorization is required" }, 400);
+            }
+            const path = c.req.query("path") ?? c.req.header("X-Obsidian-Path");
+            if (!path) {
+                return c.json({ error: "path is required" }, 400);
+            }
+            await getClientIdFromAuthorization(authorization);
+
+            try {
+                const data = await store.download(path);
+                return new Response(data, {
+                    status: 200,
+                    headers: { "Content-Type": "application/octet-stream" },
+                });
+            } catch {
+                return c.json({ error: "Not found" }, 404);
+            }
+        })
+        .delete('/files', async (c) => {
+            const authorization = c.req.header("Authorization");
+            if (!authorization) {
+                return c.json({ error: "Authorization is required" }, 400);
+            }
+            const path = c.req.query("path") ?? c.req.header("X-Obsidian-Path");
+            if (!path) {
+                return c.json({ error: "path is required" }, 400);
+            }
+            await getClientIdFromAuthorization(authorization);
+
+            const { revision } = await store.delete(path);
+            return c.json({ path, revision }, 200);
         });
 }
