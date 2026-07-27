@@ -1,6 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { MemorySyncFs } from "./fs";
-import { applyInbox, readInbox, writeInbox, type InboxOp } from "./inbox";
+import {
+	appendInbox,
+	applyInbox,
+	readInbox,
+	writeInbox,
+	type InboxOp,
+} from "./inbox";
 
 const INBOX = "inbox.jsonl";
 
@@ -111,13 +117,46 @@ describe("inbox", () => {
 			},
 			getRevision: revision.get,
 			setRevision: revision.set,
-			shouldSkipPath: (path) => path === "pending.md",
+			shouldSkipApply: (op) => op.path === "pending.md",
 		});
 
 		// pending.md's content was never applied...
 		expect(applied).toEqual(["a.md", "c.md"]);
 		// ...but its revision was still consumed, and the line dropped.
 		expect(revision.get()).toBe(3);
+		expect(await readInbox(fs, INBOX)).toEqual([]);
+	});
+
+	test("applyInbox skips by rev via shouldSkipApply (self-echo) but still advances revision, drops the line, and consumes it", async () => {
+		const fs = new MemorySyncFs();
+		await writeInbox(fs, INBOX, [
+			{ rev: 1, op: "put", path: "a.md" },
+			{ rev: 2, op: "put", path: "echoed.md" },
+			{ rev: 3, op: "put", path: "c.md" },
+		]);
+
+		const revision = makeRevisionStore(0);
+		const applied: string[] = [];
+		const echoRevs = new Set([2]);
+
+		await applyInbox(fs, INBOX, {
+			applyPut: async (path) => {
+				applied.push(path);
+			},
+			applyDelete: async (path) => {
+				applied.push(path);
+			},
+			getRevision: revision.get,
+			setRevision: revision.set,
+			shouldSkipApply: (op) => echoRevs.delete(op.rev),
+		});
+
+		// echoed.md's content was never (re-)applied to the vault...
+		expect(applied).toEqual(["a.md", "c.md"]);
+		// ...but its revision was still consumed, the line dropped, and the
+		// echo entry itself consumed so a later reused rev isn't misread.
+		expect(revision.get()).toBe(3);
+		expect(echoRevs.size).toBe(0);
 		expect(await readInbox(fs, INBOX)).toEqual([]);
 	});
 
@@ -143,5 +182,46 @@ describe("inbox", () => {
 		expect(applied).toEqual(["b.md"]);
 		expect(revision.get()).toBe(2);
 		expect(await readInbox(fs, INBOX)).toEqual([]);
+	});
+
+	test("appendInbox serializes concurrent fetch-and-append calls so no lines are lost", async () => {
+		const fs = new MemorySyncFs();
+		let releaseFirstWrite = () => {};
+		const gate = new Promise<void>((resolve) => {
+			releaseFirstWrite = resolve;
+		});
+		let writeCount = 0;
+		const originalWrite = fs.write.bind(fs);
+		fs.write = async (path: string, data: string) => {
+			writeCount++;
+			if (writeCount === 1) {
+				// Hold the first append's write open so a naive (non-mutexed)
+				// second append would read stale data and clobber it.
+				await gate;
+			}
+			await originalWrite(path, data);
+		};
+
+		const first = appendInbox(fs, INBOX, [{ rev: 1, op: "put", path: "a.md" }]);
+		const second = appendInbox(fs, INBOX, [
+			{ rev: 2, op: "put", path: "b.md" },
+		]);
+
+		releaseFirstWrite();
+		await Promise.all([first, second]);
+
+		expect(await readInbox(fs, INBOX)).toEqual([
+			{ rev: 1, op: "put", path: "a.md" },
+			{ rev: 2, op: "put", path: "b.md" },
+		]);
+	});
+
+	test("appendInbox is a no-op for an empty batch", async () => {
+		const fs = new MemorySyncFs();
+		await writeInbox(fs, INBOX, [{ rev: 1, op: "put", path: "a.md" }]);
+		await appendInbox(fs, INBOX, []);
+		expect(await readInbox(fs, INBOX)).toEqual([
+			{ rev: 1, op: "put", path: "a.md" },
+		]);
 	});
 });

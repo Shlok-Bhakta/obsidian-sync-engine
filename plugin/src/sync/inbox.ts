@@ -16,13 +16,39 @@ export async function readInbox(fs: SyncFs, path: string): Promise<InboxOp[]> {
 	return readLines<InboxOp>(fs, path);
 }
 
+/**
+ * Append freshly-fetched ops onto the inbox file.
+ *
+ * The read-modify-write runs inside `mutexFor(path)`, the same mutex key
+ * `applyInbox` uses for this path, so a fetch-and-append can never interleave
+ * with (or race) a concurrent apply or another append and lose lines.
+ */
+export async function appendInbox(
+	fs: SyncFs,
+	path: string,
+	ops: InboxOp[],
+): Promise<void> {
+	if (ops.length === 0) {
+		return;
+	}
+	return mutexFor(path).run(async () => {
+		const existing = await readInbox(fs, path);
+		await writeInbox(fs, path, [...existing, ...ops]);
+	});
+}
+
 export type ApplyInboxOptions = {
 	applyPut: (path: string) => Promise<void>;
 	applyDelete: (path: string) => Promise<void>;
 	getRevision: () => number | Promise<number>;
 	setRevision: (rev: number) => void | Promise<void>;
-	/** Paths that still have a local change pending outbound; inbound updates for them are skipped. */
-	shouldSkipPath?: (path: string) => boolean;
+	/**
+	 * Called for each line before it would be applied. Return true to skip the
+	 * vault mutation (`applyPut`/`applyDelete` is not called) while still
+	 * advancing the revision past it and dropping the line. Used both for
+	 * paths with a pending local edit and for self-echoed revisions.
+	 */
+	shouldSkipApply?: (op: InboxOp) => boolean;
 };
 
 /**
@@ -30,14 +56,14 @@ export type ApplyInboxOptions = {
  *
  * Mirrors outbox's `drain`: the whole apply (including handler calls) runs
  * inside a single mutex acquisition for this inbox path, so a concurrent
- * fetch-and-append can never interleave its read-modify-write with this one.
+ * fetch-and-append (`appendInbox`) can never interleave its read-modify-write
+ * with this one.
  *
  * For each line, in ascending `rev` order:
  * - if it's already covered by the current revision, drop it without
  *   reapplying (defends against replaying an inbox left over from a prior run);
- * - else if `shouldSkipPath` matches its path, skip calling `applyPut`/
- *   `applyDelete` (a local edit is still pending outbound for that path) but
- *   still advance the revision past it and drop it;
+ * - else if `shouldSkipApply` matches, skip calling `applyPut`/`applyDelete`
+ *   but still advance the revision past it and drop it;
  * - else call `applyPut`/`applyDelete`. On success, advance the revision and
  *   drop the line. On failure, STOP immediately, leaving that line and every
  *   line after it in the inbox file for the next attempt.
@@ -63,8 +89,8 @@ export async function applyInbox(
 			}
 
 			try {
-				if (options.shouldSkipPath?.(line.path)) {
-					// Leave the local (still-pending-outbound) version alone.
+				if (options.shouldSkipApply?.(line)) {
+					// Leave the vault alone (pending local edit, or our own echo).
 				} else if (line.op === "put") {
 					await options.applyPut(line.path);
 				} else {
