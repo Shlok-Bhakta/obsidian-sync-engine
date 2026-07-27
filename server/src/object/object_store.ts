@@ -1,9 +1,17 @@
-import { Hono } from "hono";
-import { join } from "node:path";
+import { Context, Hono } from "hono";
+import { join, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { cp, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { $, sql } from "bun";
 import { createClient, getClientIdFromAuthorization } from "../auth/auth";
+
+/** Thrown when a client-supplied path would resolve outside the object store root. */
+export class PathTraversalError extends Error {
+    constructor(path: string) {
+        super(`Path escapes object store root: ${path}`);
+        this.name = "PathTraversalError";
+    }
+}
 
 export const DEFAULT_OBJECT_STORE_DIR = join(import.meta.dir, "../../" + process.env.OBJECT_STORE_DIR || "object-data");
 
@@ -16,6 +24,7 @@ export type ObjectStoreUploadContent = {
 export type ObjectStoreUploadResult = {
     path: string;
     bytesWritten: number;
+    revision: number;
 };
 
 export type ObjectStoreOutboxItem = {
@@ -28,28 +37,57 @@ export type ObjectStoreOutboxItem = {
 export class ObjectStore {
     constructor(private readonly rootDirectory = DEFAULT_OBJECT_STORE_DIR) {}
 
+    /**
+     * All store methods take already-decoded paths. Callers (routes) are responsible for
+     * decoding: query params are decoded once by the URL parser already, headers are not.
+     */
     async upload(content: ObjectStoreUploadContent): Promise<ObjectStoreUploadResult> {
-        const path = this.pathForFile(decodeURIComponent(content.path));
-        
-        const bytesWritten = await Bun.write(path, content.content, { createPath: true });
-        const [lastUpdatedRevision] = await sql<{ last_updated_revision: number }[]>`
-            INSERT INTO files (file_path, author_id) VALUES (${decodeURIComponent(content.path)}, ${content.id})
+        const filePath = this.pathForFile(content.path);
+
+        const bytesWritten = await Bun.write(filePath, content.content, { createPath: true });
+        const [row] = await sql<{ last_updated_revision: number }[]>`
+            INSERT INTO files (file_path, author_id) VALUES (${content.path}, ${content.id})
             ON CONFLICT (file_path) DO UPDATE SET author_id = ${content.id}, 
+            file_is_deleted = FALSE,
             last_updated_revision = EXCLUDED.last_updated_revision, updated_at = NOW() RETURNING last_updated_revision
         `;
         return {
-            path: decodeURIComponent(content.path),
+            path: content.path,
             bytesWritten,
-       
+            revision: Number(row.last_updated_revision),
         };
     }
 
-    async delete(path: string): Promise<void> {
-        await sql`UPDATE files SET file_is_deleted = TRUE, updated_at = NOW(), last_updated_revision = NEXTVAL('global_revision') WHERE file_path = ${path}`;
+    /** Soft-deletes a file. Returns null if no file exists at that path. */
+    async delete(path: string): Promise<{ revision: number } | null> {
+        this.pathForFile(path); // validate path stays within the store root
+
+        const [row] = await sql<{ last_updated_revision: number }[]>`
+            UPDATE files SET file_is_deleted = TRUE, updated_at = NOW(), last_updated_revision = NEXTVAL('global_revision')
+            WHERE file_path = ${path} RETURNING last_updated_revision
+        `;
+        return row ? { revision: Number(row.last_updated_revision) } : null;
     }
 
-    async download(path: string): Promise<ArrayBuffer> {
-        return Bun.file(this.pathForFile(decodeURIComponent(path))).arrayBuffer();
+    /** Current global tip revision: highest revision stamped on any file (including deletes), or 0 if none exist. */
+    async getTipRevision(): Promise<number> {
+        const [row] = await sql<{ tip: string | null }[]>`
+            SELECT MAX(last_updated_revision) AS tip FROM files
+        `;
+        return row?.tip ? Number(row.tip) : 0;
+    }
+
+    /** Downloads a file's bytes. Returns null if the file doesn't exist or is soft-deleted. */
+    async download(path: string): Promise<ArrayBuffer | null> {
+        const filePath = this.pathForFile(path);
+
+        const [row] = await sql<{ file_is_deleted: boolean }[]>`
+            SELECT file_is_deleted FROM files WHERE file_path = ${path}
+        `;
+        if (!row || row.file_is_deleted) {
+            return null;
+        }
+        return Bun.file(filePath).arrayBuffer();
     }
 
     async bootstrap_zip_create(path: string): Promise<void> {
@@ -57,7 +95,23 @@ export class ObjectStore {
         const vaultDir = join(tmp, "vault");
         try {
             await mkdir(this.rootDirectory, { recursive: true });
+            // Snapshot the tip BEFORE copying: if we read it after the copy, a file
+            // landing between copy and read could be reflected in the tip without its
+            // bytes making it into the zip, so the client would never fetch it (it
+            // thinks it's already past that revision). Reading before the copy means
+            // the worst case is an extra file the client already has bytes for
+            // (harmless) rather than a missing one (unrecoverable without a re-bootstrap).
+            const revision = await this.getTipRevision();
             await cp(this.rootDirectory, vaultDir, { recursive: true });
+
+            // Bootstrap should not ship tombstoned files; the client learns about
+            // deletes via the inbox once it starts polling from `revision`.
+            const deletedFiles = await sql<{ file_path: string }[]>`
+                SELECT file_path FROM files WHERE file_is_deleted = TRUE
+            `;
+            await Promise.all(deletedFiles.map(({ file_path }) =>
+                rm(join(vaultDir, file_path), { force: true }),
+            ));
 
             const name_choices = [
                 "acrobat", "banana", "camera", "diamond", "elephant",
@@ -77,7 +131,7 @@ export class ObjectStore {
                 ...settings,
                 clientName,
                 clientSecret,
-                lastPulledRev: 0,
+                revision,
             }, null, 2));
 
             await $`zip -qr ${path} .`.cwd(vaultDir);
@@ -86,15 +140,21 @@ export class ObjectStore {
         }
     }
 
+    /** Resolves `file` against the store root, throwing PathTraversalError if it would escape. */
     pathForFile(file: string): string {
-        return join(this.rootDirectory, file);
+        const resolvedRoot = resolve(this.rootDirectory);
+        const candidate = resolve(resolvedRoot, file);
+        if (candidate !== resolvedRoot && !candidate.startsWith(resolvedRoot + sep)) {
+            throw new PathTraversalError(file);
+        }
+        return candidate;
     }
     // to create the client inbox
     async inbox(rev: number): Promise<ObjectStoreOutboxItem[]> {
         const result = await sql<{ file_path: string; last_updated_revision: string; file_is_deleted: boolean }[]>`
             SELECT file_path, last_updated_revision, file_is_deleted FROM files
             WHERE last_updated_revision > ${rev}
-            ORDER BY last_updated_revision DESC
+            ORDER BY last_updated_revision ASC
         `;
         // console.log("result", result);
         return result.map((r: { file_path: string; last_updated_revision: string; file_is_deleted: boolean }) => ({
@@ -107,11 +167,27 @@ export class ObjectStore {
 
 export const objectStore = new ObjectStore();
 
+/**
+ * Resolves the file path for a request, decoding exactly once regardless of source:
+ * query params are already percent-decoded by the URL parser, headers are not.
+ */
+function resolvePathFromRequest(c: Context): string | undefined {
+    const queryPath = c.req.query("path");
+    if (queryPath !== undefined) {
+        return queryPath;
+    }
+    const headerPath = c.req.header("X-Obsidian-Path");
+    if (headerPath === undefined) {
+        return undefined;
+    }
+    return decodeURIComponent(headerPath);
+}
+
 export function registerObjectStoreRoutes(app: Hono, store = objectStore) {
     // Chain so Hono accumulates route types (needed by testClient inference).
     return app
         .post('/files', async (c) => {
-            const path = c.req.header("X-Obsidian-Path");
+            const path = resolvePathFromRequest(c);
             const authorization = c.req.header("Authorization");
             if (!authorization) {
                 return c.json({ error: "Authorization is required" }, 400);
@@ -122,12 +198,19 @@ export function registerObjectStoreRoutes(app: Hono, store = objectStore) {
 
             const clientId = await getClientIdFromAuthorization(authorization);
             console.log("clientId", clientId);
-            const result = await store.upload({
-                path: path,
-                content: await c.req.arrayBuffer(),
-                id: clientId
-            });
-            return c.json(result, 200);
+            try {
+                const result = await store.upload({
+                    path: path,
+                    content: await c.req.arrayBuffer(),
+                    id: clientId
+                });
+                return c.json(result, 200);
+            } catch (error) {
+                if (error instanceof PathTraversalError) {
+                    return c.json({ error: "Invalid path" }, 400);
+                }
+                throw error;
+            }
         })
         .get('/bootstrap.zip', async (c) => {
             const tmp = await mkdtemp(join(tmpdir(), "obsidian-bootstrap-"));
@@ -156,10 +239,78 @@ export function registerObjectStoreRoutes(app: Hono, store = objectStore) {
             if (!authorization) {
                 return c.json({ error: "Authorization is required" }, 400);
             }
-            const clientId = await getClientIdFromAuthorization(authorization);
+            await getClientIdFromAuthorization(authorization);
 
             const rev = Number(c.req.query("rev"));
             const inbox = await store.inbox(rev);
-            return c.json({"inbox": inbox}, 200);
+            const lines = inbox.map((item) => JSON.stringify({
+                rev: item.lastUpdatedRevision,
+                op: item.isDeleted ? "delete" : "put",
+                path: item.path,
+            }));
+            const body = lines.length > 0 ? lines.join("\n") + "\n" : "";
+            return new Response(body, {
+                status: 200,
+                headers: { "Content-Type": "application/x-ndjson" },
+            });
+        })
+        .get('/files', async (c) => {
+            const authorization = c.req.header("Authorization");
+            if (!authorization) {
+                return c.json({ error: "Authorization is required" }, 400);
+            }
+            const path = resolvePathFromRequest(c);
+            if (!path) {
+                return c.json({ error: "path is required" }, 400);
+            }
+            try {
+                await getClientIdFromAuthorization(authorization);
+            } catch {
+                return c.json({ error: "Unauthorized" }, 401);
+            }
+
+            try {
+                const data = await store.download(path);
+                if (!data) {
+                    return c.json({ error: "Not found" }, 404);
+                }
+                return new Response(data, {
+                    status: 200,
+                    headers: { "Content-Type": "application/octet-stream" },
+                });
+            } catch (error) {
+                if (error instanceof PathTraversalError) {
+                    return c.json({ error: "Invalid path" }, 400);
+                }
+                return c.json({ error: "Not found" }, 404);
+            }
+        })
+        .delete('/files', async (c) => {
+            const authorization = c.req.header("Authorization");
+            if (!authorization) {
+                return c.json({ error: "Authorization is required" }, 400);
+            }
+            const path = resolvePathFromRequest(c);
+            if (!path) {
+                return c.json({ error: "path is required" }, 400);
+            }
+            try {
+                await getClientIdFromAuthorization(authorization);
+            } catch {
+                return c.json({ error: "Unauthorized" }, 401);
+            }
+
+            try {
+                const result = await store.delete(path);
+                if (!result) {
+                    return c.json({ error: "Not found" }, 404);
+                }
+                return c.json({ path, revision: result.revision }, 200);
+            } catch (error) {
+                if (error instanceof PathTraversalError) {
+                    return c.json({ error: "Invalid path" }, 400);
+                }
+                throw error;
+            }
         });
 }
