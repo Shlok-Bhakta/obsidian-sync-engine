@@ -369,4 +369,82 @@ describe("object store", () => {
         });
         expect(deleteRes.status).toBe(401);
     });
+    it("round-trips a path containing a literal % through query-string download and delete without double-decoding", async () => {
+        const client = await createClientFixture({ client_name: "alice" });
+        const app = createTestApp();
+        // Literal '%' followed by valid hex digits: if the query value were
+        // decodeURIComponent'd twice, "%41" would silently become "A" instead
+        // of staying literal, corrupting the path without throwing.
+        const rawPath = "50%41.txt";
+        const encodedPath = encodeURIComponent(rawPath);
+
+        await app.request("/files", {
+            method: "POST",
+            headers: { Authorization: client.client_secret, "X-Obsidian-Path": encodedPath },
+            body: "Hello, world!",
+        });
+        const fileRows = await sql<FileRow[]>`SELECT * FROM files WHERE file_path = ${rawPath}`;
+        expect(fileRows.length).toBe(1);
+
+        const downloadRes = await app.request(`/files?path=${encodedPath}`, {
+            headers: { Authorization: client.client_secret },
+        });
+        expect(downloadRes.status).toBe(200);
+        expect(await downloadRes.text()).toBe("Hello, world!");
+
+        const deleteRes = await app.request(`/files?path=${encodedPath}`, {
+            method: "DELETE",
+            headers: { Authorization: client.client_secret },
+        });
+        expect(deleteRes.status).toBe(200);
+        const body = await deleteRes.json() as { path: string; revision: number };
+        expect(body.path).toBe(rawPath);
+    });
+    it("excludes soft-deleted files from the bootstrap zip", async () => {
+        const client = await createClientFixture({ client_name: "alice" });
+        const objectStore = new ObjectStore();
+        const pluginDataPath = ".obsidian/plugins/obsidian-sync-engine/data.json";
+        await objectStore.upload({ path: pluginDataPath, content: "{}", id: client.id });
+        await objectStore.upload({ path: "keep.md", content: "keep me", id: client.id });
+        await objectStore.upload({ path: "gone.md", content: "delete me", id: client.id });
+        await objectStore.delete("gone.md");
+
+        const tmp = await mkdtemp(join(tmpdir(), "obsidian-bootstrap-test-"));
+        const zipPath = join(tmp, "vault.zip");
+        try {
+            await objectStore.bootstrap_zip_create(zipPath);
+            const extractDir = join(tmp, "extracted");
+            await $`unzip -qq ${zipPath} -d ${extractDir}`;
+
+            expect(await Bun.file(join(extractDir, "keep.md")).exists()).toBe(true);
+            expect(await Bun.file(join(extractDir, "gone.md")).exists()).toBe(false);
+        } finally {
+            await rm(tmp, { recursive: true, force: true });
+        }
+    });
+    it("stamps a tip revision that includes soft-delete revisions", async () => {
+        const client = await createClientFixture({ client_name: "alice" });
+        const objectStore = new ObjectStore();
+        const pluginDataPath = ".obsidian/plugins/obsidian-sync-engine/data.json";
+        await objectStore.upload({ path: pluginDataPath, content: "{}", id: client.id });
+        await objectStore.upload({ path: "keep.md", content: "keep me", id: client.id });
+        await objectStore.upload({ path: "gone.md", content: "delete me", id: client.id });
+        const { revision: deleteRevision } = (await objectStore.delete("gone.md"))!;
+
+        const tmp = await mkdtemp(join(tmpdir(), "obsidian-bootstrap-test-"));
+        const zipPath = join(tmp, "vault.zip");
+        try {
+            await objectStore.bootstrap_zip_create(zipPath);
+            const extractDir = join(tmp, "extracted");
+            await $`unzip -qq ${zipPath} -d ${extractDir}`;
+            const settings = await Bun.file(
+                join(extractDir, ".obsidian/plugins/obsidian-sync-engine/data.json"),
+            ).json() as Record<string, unknown>;
+            // The tip must be >= the delete's revision so a fresh client never
+            // re-fetches a tombstone it already excludes from the bootstrap.
+            expect(settings.revision).toBe(deleteRevision);
+        } finally {
+            await rm(tmp, { recursive: true, force: true });
+        }
+    });
 });
