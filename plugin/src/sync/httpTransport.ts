@@ -32,18 +32,10 @@ export class RemoteFileNotFoundError extends Error {
 
 /** Split an NDJSON response body into parsed, schema-validated inbox lines. */
 function parseNdjson(body: string): InboxOp[] {
-	const ops: InboxOp[] = [];
-	for (const line of body.split("\n")) {
-		if (line.trim().length === 0) {
-			continue;
-		}
-		try {
-			ops.push(inboxOpSchema.parse(JSON.parse(line)));
-		} catch (error) {
-			console.warn("Skipping invalid inbox line", error);
-		}
-	}
-	return ops;
+	return body
+		.split("\n")
+		.filter((line) => line.trim().length > 0)
+		.map((line) => inboxOpSchema.parse(JSON.parse(line)));
 }
 
 function assertOk(response: RequestUrlResponse, action: string): void {

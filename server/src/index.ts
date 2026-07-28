@@ -7,16 +7,12 @@ import { registerObjectStoreRoutes, objectStore } from './object/object_store';
 // second iteration. MVP uses HTTP polling only — do not register them here yet.
 // import { registerWebSocketRoutes } from './websockets/websockets';
 
+await bootstrapDB();
+const filled = await objectStore.backfillContentFromLegacyDisk();
+if (filled > 0) {
+  console.log(`Backfilled ${filled} legacy on-disk object(s) into BYTEA`);
+}
 
-bootstrapDB().then(async () => {
-  const filled = await objectStore.backfillContentFromLegacyDisk();
-  if (filled > 0) {
-    console.log(`Backfilled ${filled} legacy on-disk object(s) into BYTEA`);
-  }
-}).catch((error) => {
-  console.error("Database bootstrap failed", error);
-  process.exit(1);
-});
 const app = new Hono()
 
 app.get('/', (c) => {
