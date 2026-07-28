@@ -8,14 +8,41 @@ import type { VaultBlobFs } from "./engine";
  * describe.
  */
 export class ObsidianFs implements VaultBlobFs {
+	/**
+	 * Depth counter, >0 while a write/writeBinary/remove call made *through
+	 * this instance* is in flight (including nested/concurrent calls).
+	 * Callers that monkeypatch `adapter.write`/`writeBinary` to detect local
+	 * edits (see vaultSync.ts) check `isWriting` to avoid re-enqueueing a
+	 * write that originated here — e.g. the sync engine applying a remote
+	 * put/delete — which would otherwise loop it straight back out.
+	 */
+	private writeDepth = 0;
+
 	constructor(private readonly adapter: DataAdapter) {}
+
+	get isWriting(): boolean {
+		return this.writeDepth > 0;
+	}
+
+	private async trackWrite<T>(fn: () => Promise<T>): Promise<T> {
+		this.writeDepth++;
+		try {
+			return await fn();
+		} finally {
+			this.writeDepth--;
+		}
+	}
 
 	async read(path: string): Promise<string> {
 		return this.adapter.read(normalizePath(path));
 	}
 
 	async write(path: string, data: string): Promise<void> {
-		await this.adapter.write(normalizePath(path), data);
+		const normalized = normalizePath(path);
+		await this.trackWrite(async () => {
+			await this.ensureParentDir(normalized);
+			await this.adapter.write(normalized, data);
+		});
 	}
 
 	async exists(path: string): Promise<boolean> {
@@ -31,11 +58,24 @@ export class ObsidianFs implements VaultBlobFs {
 	}
 
 	async writeBinary(path: string, data: ArrayBuffer): Promise<void> {
-		await this.adapter.writeBinary(normalizePath(path), data);
+		const normalized = normalizePath(path);
+		await this.trackWrite(async () => {
+			await this.ensureParentDir(normalized);
+			await this.adapter.writeBinary(normalized, data);
+		});
 	}
 
 	async remove(path: string): Promise<void> {
-		await this.adapter.remove(normalizePath(path));
+		const normalized = normalizePath(path);
+		await this.trackWrite(async () => {
+			// Idempotent: applying a remote delete for a path already gone
+			// locally (or retried after a partial failure) should be a no-op,
+			// not an error.
+			if (!(await this.adapter.exists(normalized))) {
+				return;
+			}
+			await this.adapter.remove(normalized);
+		});
 	}
 
 	/** Recursively lists every file path in the vault, mirroring the old main.ts `listVaultFiles`. */
@@ -51,5 +91,26 @@ export class ObsidianFs implements VaultBlobFs {
 			),
 		);
 		return [...listed.files, ...nested.flat()];
+	}
+
+	/** Ensures the directory containing `normalizedPath` exists, creating intermediate folders as needed. */
+	private async ensureParentDir(normalizedPath: string): Promise<void> {
+		const separatorIndex = normalizedPath.lastIndexOf("/");
+		if (separatorIndex <= 0) {
+			return;
+		}
+		const parent = normalizedPath.slice(0, separatorIndex);
+		if (await this.adapter.exists(parent)) {
+			return;
+		}
+		try {
+			await this.adapter.mkdir(parent);
+		} catch (error) {
+			// Another writer may have created it concurrently; only surface the
+			// error if the directory still doesn't exist.
+			if (!(await this.adapter.exists(parent))) {
+				throw error;
+			}
+		}
 	}
 }

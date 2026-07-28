@@ -73,6 +73,9 @@ export class SyncEngine {
 	/** Revisions returned by our own `upload`/`deleteRemote` calls, awaiting self-echo through the inbox. */
 	private readonly echoRevs = new Set<number>();
 
+	/** Most recently requested op per path, for paths currently debouncing (not yet written to the outbox). Read by `flush`. */
+	private readonly pendingOps = new Map<string, "put" | "delete">();
+
 	constructor(options: SyncEngineOptions) {
 		this.fs = options.fs;
 		this.transport = options.transport;
@@ -94,14 +97,29 @@ export class SyncEngine {
 	}
 
 	private scheduleEnqueue(path: string, op: "put" | "delete"): void {
-		this.debouncer.trigger(path, () => {
-			void enqueueOutbox(this.fs, this.outboxPath, {
-				op,
-				path,
-				ts: Date.now(),
-			}).then(() => this.refreshPending(path));
-		});
+		this.pendingOps.set(path, op);
+		this.debouncer.trigger(path, () => this.flushOne(path));
 		void this.refreshPending(path);
+	}
+
+	private async flushOne(path: string): Promise<void> {
+		const op = this.pendingOps.get(path);
+		if (op === undefined) {
+			return;
+		}
+		this.pendingOps.delete(path);
+		await enqueueOutbox(this.fs, this.outboxPath, { op, path, ts: Date.now() });
+		await this.refreshPending(path);
+	}
+
+	/**
+	 * Immediately writes every debounced-but-not-yet-enqueued local change to
+	 * the outbox, as if each one's quiet period had already elapsed. Used
+	 * before a manual seed + tick so bulk-enqueued puts aren't left waiting
+	 * out the debounce window.
+	 */
+	async flush(): Promise<void> {
+		await this.debouncer.flush();
 	}
 
 	/**
@@ -144,6 +162,15 @@ export class SyncEngine {
 	private async drainOutboxOnce(): Promise<void> {
 		const processedPaths = new Set<string>();
 		await drainOutbox(this.fs, this.outboxPath, async (op) => {
+			if (op.op === "put" && !(await this.fs.exists(op.path))) {
+				// The file was deleted locally before this put could be pushed
+				// (e.g. a delete queued right behind it). There's nothing to
+				// upload — drop the line without erroring so the delete behind
+				// it isn't blocked from draining on the same tick.
+				processedPaths.add(op.path);
+				return;
+			}
+
 			const result =
 				op.op === "put"
 					? await this.pushPut(op.path)

@@ -1,4 +1,9 @@
-import { normalizePath, requestUrl, type TAbstractFile } from 'obsidian';
+import {
+	normalizePath,
+	requestUrl,
+	TFile,
+	type TAbstractFile,
+} from 'obsidian';
 import type MyPlugin from './main';
 import { SyncEngine } from './sync/engine';
 import { HttpTransport } from './sync/httpTransport';
@@ -70,16 +75,15 @@ function isConfigPath(plugin: MyPlugin, path: string): boolean {
  */
 function hookAdapterWrites(
 	plugin: MyPlugin,
-	engine: SyncEngine,
-	isExcluded: (path: string) => boolean,
+	enqueuePutIfLocal: (path: string) => void,
 ): void {
 	const adapter = plugin.app.vault.adapter;
 	const write = adapter.write.bind(adapter);
 	const writeBinary = adapter.writeBinary.bind(adapter);
 
 	const maybeEnqueue = (path: string) => {
-		if (isConfigPath(plugin, path) && !isExcluded(path)) {
-			engine.enqueuePut(path);
+		if (isConfigPath(plugin, path)) {
+			enqueuePutIfLocal(path);
 		}
 	};
 
@@ -100,8 +104,8 @@ function hookAdapterWrites(
 
 /**
  * Builds the SyncEngine for this plugin instance and wires it up to vault
- * events (editor edits, deletes, config writes) and a periodic tick. Called
- * once from `onload`.
+ * events (note modify/create, deletes, config writes) and a periodic tick.
+ * Called once from `onload`.
  */
 export function registerVaultSync(plugin: MyPlugin): VaultSync {
 	const fs = new ObsidianFs(plugin.app.vault.adapter);
@@ -128,28 +132,53 @@ export function registerVaultSync(plugin: MyPlugin): VaultSync {
 		debounceMs: DEBOUNCE_MS,
 	});
 
-	const isExcluded = (path: string) => isSyncEngineOwnedPath(plugin, path);
+	// Suppressed whenever the write/delete originated from *this* fs instance
+	// (e.g. the engine applying a remote put/delete) rather than from the
+	// user editing the vault, so applying an inbound change can never
+	// re-enqueue itself as an outbound one.
+	const isLocallyOriginated = (path: string) =>
+		!fs.isWriting && !isSyncEngineOwnedPath(plugin, path);
 
+	const enqueuePutIfLocal = (path: string) => {
+		if (isLocallyOriginated(path)) {
+			engine.enqueuePut(path);
+		}
+	};
+	const enqueueDeleteIfLocal = (path: string) => {
+		if (isLocallyOriginated(path)) {
+			engine.enqueueDelete(path);
+		}
+	};
+
+	// Notes: rely on the vault's `modify`/`create` events (fired once Obsidian
+	// has flushed to disk) rather than `editor-change`, so the engine always
+	// reads back what was actually written rather than a stale/half-typed
+	// buffer.
 	plugin.registerEvent(
-		plugin.app.workspace.on('editor-change', (_editor, info) => {
-			const file = info.file;
-			if (!file || isExcluded(file.path)) {
-				return;
+		plugin.app.vault.on('modify', (file: TAbstractFile) => {
+			if (file instanceof TFile) {
+				enqueuePutIfLocal(file.path);
 			}
-			engine.enqueuePut(file.path);
 		}),
 	);
-
+	plugin.registerEvent(
+		plugin.app.vault.on('create', (file: TAbstractFile) => {
+			if (file instanceof TFile) {
+				enqueuePutIfLocal(file.path);
+			}
+		}),
+	);
 	plugin.registerEvent(
 		plugin.app.vault.on('delete', (file: TAbstractFile) => {
-			if (isExcluded(file.path)) {
-				return;
+			// Folders have no content to sync — only their (already-deleted)
+			// child files matter, and those get their own 'delete' events.
+			if (file instanceof TFile) {
+				enqueueDeleteIfLocal(file.path);
 			}
-			engine.enqueueDelete(file.path);
 		}),
 	);
 
-	hookAdapterWrites(plugin, engine, isExcluded);
+	hookAdapterWrites(plugin, enqueuePutIfLocal);
 
 	plugin.registerInterval(
 		window.setInterval(() => {
@@ -178,5 +207,8 @@ export async function seedServerFromVault(
 		(path) => !isSyncEngineOwnedPath(plugin, path),
 	);
 	await sync.engine.seedFromVault(() => files);
+	// Bulk-seeded puts would otherwise sit out the debounce window; flush them
+	// straight to the outbox so the immediately-following tick actually pushes them.
+	await sync.engine.flush();
 	await sync.engine.tick();
 }

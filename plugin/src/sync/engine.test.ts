@@ -377,6 +377,124 @@ describe("SyncEngine", () => {
 		}
 	});
 
+	test("flush writes debounced puts to the outbox immediately, without waiting out the debounce window", async () => {
+		jest.useFakeTimers();
+		try {
+			const fs = new MemoryVaultFs();
+			await fs.write("a.md", "a");
+			await fs.write("b.md", "b");
+			const transport = new FakeTransport();
+			const revision = makeRevisionStore(0);
+			const engine = new SyncEngine({
+				fs,
+				transport,
+				outboxPath: OUTBOX,
+				inboxPath: INBOX,
+				getRevision: revision.get,
+				setRevision: revision.set,
+				debounceMs: 1000,
+			});
+
+			engine.enqueuePut("a.md");
+			engine.enqueuePut("b.md");
+
+			// Nothing should be in the outbox yet — both are still debouncing.
+			expect(await listOutbox(fs, OUTBOX)).toEqual([]);
+
+			await engine.flush();
+
+			const ops = await listOutbox(fs, OUTBOX);
+			expect(ops.map((op) => op.path).sort()).toEqual(["a.md", "b.md"]);
+
+			// The original timers must be defused, not just raced ahead of.
+			jest.advanceTimersByTime(5000);
+			await flushMicrotasks();
+			expect((await listOutbox(fs, OUTBOX)).length).toBe(2);
+		} finally {
+			jest.useRealTimers();
+		}
+	});
+
+	test("seedFromVault + flush + tick pushes every seeded file without waiting on the debounce timer", async () => {
+		const fs = new MemoryVaultFs();
+		await fs.write("a.md", "a");
+		await fs.write("b.md", "b");
+		const transport = new FakeTransport();
+		const revision = makeRevisionStore(0);
+		const engine = new SyncEngine({
+			fs,
+			transport,
+			outboxPath: OUTBOX,
+			inboxPath: INBOX,
+			getRevision: revision.get,
+			setRevision: revision.set,
+			debounceMs: 1000,
+		});
+
+		await engine.seedFromVault(() => fs.listAllFiles());
+		await engine.flush();
+		await engine.tick();
+
+		expect(transport.uploads.map((u) => u.path).sort()).toEqual([
+			"a.md",
+			"b.md",
+		]);
+		expect(await listOutbox(fs, OUTBOX)).toEqual([]);
+	});
+
+	test("draining a put for a file that's been deleted locally skips the upload without erroring", async () => {
+		const fs = new MemoryVaultFs();
+		await fs.write("a.md", "content");
+		const transport = new FakeTransport();
+		const revision = makeRevisionStore(0);
+
+		await enqueueOutbox(fs, OUTBOX, { op: "put", path: "a.md", ts: 1 });
+		await fs.remove("a.md"); // deleted locally before the put could be pushed
+
+		const engine = new SyncEngine({
+			fs,
+			transport,
+			outboxPath: OUTBOX,
+			inboxPath: INBOX,
+			getRevision: revision.get,
+			setRevision: revision.set,
+			debounceMs: 0,
+		});
+
+		await engine.tick();
+
+		expect(transport.uploads).toEqual([]);
+		expect(transport.calls).not.toContain("upload");
+		expect(await listOutbox(fs, OUTBOX)).toEqual([]);
+	});
+
+	test("a put for a locally-deleted file is dropped without blocking the delete queued behind it", async () => {
+		const fs = new MemoryVaultFs();
+		await fs.write("a.md", "content");
+		const transport = new FakeTransport();
+		const revision = makeRevisionStore(0);
+
+		await enqueueOutbox(fs, OUTBOX, { op: "put", path: "a.md", ts: 1 });
+		await fs.remove("a.md");
+		await enqueueOutbox(fs, OUTBOX, { op: "delete", path: "a.md", ts: 2 });
+
+		const engine = new SyncEngine({
+			fs,
+			transport,
+			outboxPath: OUTBOX,
+			inboxPath: INBOX,
+			getRevision: revision.get,
+			setRevision: revision.set,
+			debounceMs: 0,
+		});
+
+		await engine.tick();
+
+		expect(transport.uploads).toEqual([]);
+		expect(transport.deletes).toEqual(["a.md"]);
+		expect(await listOutbox(fs, OUTBOX)).toEqual([]);
+	});
+
 	test("a remote delete throws when fs.remove is missing, stopping the apply and keeping the inbox line", async () => {
 		const fs = new MemoryVaultFs();
 		const vaultFs: VaultBlobFs = fs;
