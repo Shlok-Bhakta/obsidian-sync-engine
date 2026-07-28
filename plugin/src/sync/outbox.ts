@@ -63,13 +63,7 @@ export async function drain(
 		let lines = await readLines<OutboxOp>(fs, outboxPath);
 		while (lines.length > 0) {
 			const op = lines[0]!;
-			try {
-				await handler(op);
-			} catch (error) {
-				// Keep this line and everything after it; rethrow so callers
-				// can report a failed tick instead of silent success.
-				throw error;
-			}
+			await handler(op);
 
 			const current = await readLines<OutboxOp>(fs, outboxPath);
 			const head = current[0];

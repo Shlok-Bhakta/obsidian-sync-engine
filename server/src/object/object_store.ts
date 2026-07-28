@@ -142,6 +142,49 @@ export class ObjectStore {
         return toArrayBuffer(row.content);
     }
 
+    /**
+     * One-shot upgrade helper: for rows with NULL content, copy bytes from the
+     * legacy filesystem object store (OBJECT_STORE_DIR) if present. Safe to call
+     * repeatedly — only fills missing BYTEA values and never bumps revisions.
+     */
+    async backfillContentFromLegacyDisk(): Promise<number> {
+        const missing = await sql<{ file_path: string }[]>`
+            SELECT file_path FROM files
+            WHERE file_is_deleted = FALSE AND content IS NULL
+        `;
+        let filled = 0;
+        for (const { file_path } of missing) {
+            let diskPath: string;
+            try {
+                diskPath = resolve(this.rootDirectory, file_path);
+                if (
+                    diskPath !== resolve(this.rootDirectory) &&
+                    !diskPath.startsWith(resolve(this.rootDirectory) + "/")
+                ) {
+                    continue;
+                }
+            } catch {
+                continue;
+            }
+            const file = Bun.file(diskPath);
+            if (!(await file.exists())) {
+                continue;
+            }
+            const bytes = Buffer.from(await file.arrayBuffer());
+            const result = await sql`
+                UPDATE files
+                SET content = ${bytes}, updated_at = NOW()
+                WHERE file_path = ${file_path}
+                  AND file_is_deleted = FALSE
+                  AND content IS NULL
+            `;
+            if (Number(result.count ?? 0) > 0) {
+                filled++;
+            }
+        }
+        return filled;
+    }
+
     async bootstrap_zip_create(path: string): Promise<void> {
         const tmp = await mkdtemp(join(tmpdir(), "obsidian-bootstrap-copy-"));
         const vaultDir = join(tmp, "vault");

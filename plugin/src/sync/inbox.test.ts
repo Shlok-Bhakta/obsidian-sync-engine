@@ -75,8 +75,9 @@ describe("inbox", () => {
 		const revision = makeRevisionStore(0);
 		const applied: string[] = [];
 
-		await expect(
-			applyInbox(fs, INBOX, {
+		let applyError: unknown;
+		try {
+			await applyInbox(fs, INBOX, {
 				applyPut: async (path) => {
 					applied.push(path);
 					if (path === "b.md") {
@@ -88,8 +89,12 @@ describe("inbox", () => {
 				},
 				getRevision: revision.get,
 				setRevision: revision.set,
-			}),
-		).rejects.toThrow("write failed");
+			});
+		} catch (error) {
+			applyError = error;
+		}
+		expect(applyError).toBeInstanceOf(Error);
+		expect((applyError as Error).message).toBe("write failed");
 
 		expect(applied).toEqual(["a.md", "b.md"]);
 		expect(revision.get()).toBe(1);

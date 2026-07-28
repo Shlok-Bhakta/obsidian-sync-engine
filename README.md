@@ -14,11 +14,12 @@ not registered on the server entrypoint yet.
 - `.obsidian` config / other plugin settings (deferred; incomplete and privacy-sensitive)
 - Live WebSocket push (deferred)
 
-## Limits
+## Upgrading from the filesystem object store
 
-- Max upload body: **10 MiB** (server `maxRequestBodySize`)
-- Oversized or permanently rejected files are **dead-lettered** so they do not block other paths
-- Paths must be vault-relative and canonical (no `..`, absolute paths, or backslashes)
+Primary file bytes now live in Postgres (`BYTEA`). On startup the server copies
+any still-missing bytes from `OBJECT_STORE_DIR` into NULL `content` rows once.
+Point `OBJECT_STORE_DIR` at your previous object-data directory when upgrading
+an existing deployment, then restart once.
 
 ## Conflict / convergence policy
 

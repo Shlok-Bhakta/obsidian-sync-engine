@@ -51,11 +51,25 @@ function getDataJsonPath(plugin: ObsidianSyncPlugin): string {
  */
 function isSyncEngineOwnedPath(plugin: ObsidianSyncPlugin, path: string): boolean {
 	const normalized = normalizePath(path);
-	return (
+	const pluginDir = getPluginDir(plugin);
+	if (
 		normalized === getOutboxPath(plugin) ||
 		normalized === getInboxPath(plugin) ||
 		normalized === getDataJsonPath(plugin)
-	);
+	) {
+		return true;
+	}
+	// Queue sidecars written during recovery / dead-lettering.
+	if (
+		normalized.startsWith(`${pluginDir}/`) &&
+		(normalized.endsWith(".jsonl") ||
+			normalized.endsWith(".jsonl.corrupt") ||
+			normalized.endsWith(".jsonl.tmp") ||
+			normalized.endsWith("dead-letter.jsonl"))
+	) {
+		return true;
+	}
+	return false;
 }
 
 /**

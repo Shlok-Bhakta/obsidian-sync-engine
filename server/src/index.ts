@@ -2,13 +2,21 @@ import { Hono } from 'hono'
 import { websocket } from 'hono/bun'
 import { bootstrapDB } from './db/MigrationRunner'
 import { registerAuthRoutes } from './auth/auth';
-import { registerObjectStoreRoutes } from './object/object_store';
+import { registerObjectStoreRoutes, objectStore } from './object/object_store';
 // Deferred: WebSocket routes live in ./websockets/websockets.ts for the
 // second iteration. MVP uses HTTP polling only — do not register them here yet.
 // import { registerWebSocketRoutes } from './websockets/websockets';
 
 
-bootstrapDB();
+bootstrapDB().then(async () => {
+  const filled = await objectStore.backfillContentFromLegacyDisk();
+  if (filled > 0) {
+    console.log(`Backfilled ${filled} legacy on-disk object(s) into BYTEA`);
+  }
+}).catch((error) => {
+  console.error("Database bootstrap failed", error);
+  process.exit(1);
+});
 const app = new Hono()
 
 app.get('/', (c) => {

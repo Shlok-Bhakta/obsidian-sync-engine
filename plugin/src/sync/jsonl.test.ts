@@ -29,16 +29,29 @@ describe("jsonl", () => {
 		]);
 	});
 
-	test("readLines quarantines a corrupt tail and keeps valid lines", async () => {
+	test("readLines quarantines a corrupt final line and keeps valid lines", async () => {
 		const fs = new MemorySyncFs();
-		await fs.write("log.jsonl", '{"a":1}\n{"a":2\n{"a":3}\n');
+		await fs.write("log.jsonl", '{"a":1}\n{"a":2}\n{"a":');
 		const lines = await readLines<{ a: number }>(fs, "log.jsonl");
-		expect(lines).toEqual([{ a: 1 }, { a: 3 }]);
+		expect(lines).toEqual([{ a: 1 }, { a: 2 }]);
 		expect(await fs.exists("log.jsonl.corrupt")).toBe(true);
-		expect(await fs.read("log.jsonl.corrupt")).toContain('{"a":2');
+		expect(await fs.read("log.jsonl.corrupt")).toContain('{"a":');
 		expect(await readLines<{ a: number }>(fs, "log.jsonl")).toEqual([
 			{ a: 1 },
-			{ a: 3 },
+			{ a: 2 },
 		]);
+	});
+
+	test("readLines refuses to skip a corrupt middle line", async () => {
+		const fs = new MemorySyncFs();
+		await fs.write("log.jsonl", '{"a":1}\n{"a":2\n{"a":3}\n');
+		let error: unknown;
+		try {
+			await readLines(fs, "log.jsonl");
+		} catch (err) {
+			error = err;
+		}
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toMatch(/middle/);
 	});
 });

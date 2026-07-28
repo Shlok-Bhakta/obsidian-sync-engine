@@ -117,7 +117,7 @@ export class SyncEngine {
 	/** Load durable outbox paths into the conflict guard before the first pull. */
 	async hydrate(): Promise<void> {
 		const ops = await listOutbox(this.fs, this.outboxPath);
-		this.pendingOutboxPaths.clear();
+		// Union with anything already marked pending (in-flight enqueue during startup).
 		for (const op of ops) {
 			this.pendingOutboxPaths.add(op.path);
 		}
@@ -148,10 +148,6 @@ export class SyncEngine {
 				path,
 				ts: Date.now(),
 			});
-		} catch (error) {
-			// Keep the path pending so a concurrent pull cannot clobber it
-			// after a failed durability write; surface the failure to callers.
-			throw error;
 		} finally {
 			this.enqueueInFlight.delete(path);
 			await this.refreshPending(path);
@@ -166,12 +162,14 @@ export class SyncEngine {
 	}
 
 	/**
-	 * Immediately run any debounced network tick and wait for in-flight
-	 * enqueues. Used before seed/unload so nothing sits only in memory.
+	 * Wait for in-flight durable enqueues and run any debounced network tick.
+	 * Used before seed/unload so nothing sits only in memory.
 	 */
 	async flush(): Promise<void> {
 		while (this.enqueueInFlight.size > 0) {
-			await Promise.resolve();
+			await new Promise<void>((resolve) => {
+				setTimeout(resolve, 0);
+			});
 		}
 		await this.debouncer.flush();
 	}
@@ -221,11 +219,11 @@ export class SyncEngine {
 	}
 
 	private async runTick(): Promise<SyncTickResult> {
-		await this.ensureHydrated();
 		let pushed = 0;
 		let applied = 0;
 		let deadLettered = 0;
 		try {
+			await this.ensureHydrated();
 			const drainResult = await this.drainOutboxOnce();
 			pushed = drainResult.pushed;
 			deadLettered = drainResult.deadLettered;
@@ -277,13 +275,7 @@ export class SyncEngine {
 	}
 
 	private isPermanentFailure(error: unknown): boolean {
-		if (error instanceof PermanentRemoteError) {
-			return true;
-		}
-		if (error instanceof Error) {
-			return /\b(413|400)\b/.test(error.message);
-		}
-		return false;
+		return error instanceof PermanentRemoteError;
 	}
 
 	private async deadLetter(op: OutboxOp, error: unknown): Promise<void> {

@@ -21,8 +21,10 @@ bun run dev
 | --- | --- |
 | `DATABASE_URL` | Postgres connection string |
 | `BOOTSTRAP_TOKEN` | Required for `GET /bootstrap.zip` |
-| `OBJECT_STORE_DIR` | Temp staging for bootstrap zip builds only (bytes live in Postgres) |
+| `OBJECT_STORE_DIR` | Legacy on-disk store used only to backfill NULL BYTEA rows on upgrade |
 | `PORT` / `HOST` | Listen address (default `3000` / `0.0.0.0`) |
+
+Prefer `Authorization: Bearer $BOOTSTRAP_TOKEN` over `?token=` (query strings often land in access logs).
 
 ## Test
 

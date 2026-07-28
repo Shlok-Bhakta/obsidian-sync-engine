@@ -51,7 +51,7 @@ class MemoryVaultFs implements VaultBlobFs {
 	}
 }
 
-/** Vault fs without remove — exercises applyRemoteDelete failure paths. */
+/** Vault fs whose remove always fails — exercises applyRemoteDelete failure paths. */
 class MemoryVaultFsNoRemove implements VaultBlobFs {
 	private readonly inner = new MemoryVaultFs();
 
@@ -62,6 +62,10 @@ class MemoryVaultFsNoRemove implements VaultBlobFs {
 	readBinary = this.inner.readBinary.bind(this.inner);
 	writeBinary = this.inner.writeBinary.bind(this.inner);
 	listAllFiles = this.inner.listAllFiles.bind(this.inner);
+
+	async remove(path: string): Promise<void> {
+		throw new Error(`remove not supported for ${path}`);
+	}
 }
 
 /**

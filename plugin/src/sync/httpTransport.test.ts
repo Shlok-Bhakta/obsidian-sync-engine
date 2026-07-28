@@ -163,11 +163,20 @@ describe("HttpTransport", () => {
 		});
 		const transport = makeTransport(request);
 
-		await expect(transport.upload("a.md", "x")).rejects.toBeInstanceOf(
-			PermanentRemoteError,
-		);
-		await expect(transport.deleteRemote("a.md")).rejects.toBeInstanceOf(
-			PermanentRemoteError,
-		);
+		let uploadError: unknown;
+		try {
+			await transport.upload("a.md", "x");
+		} catch (error) {
+			uploadError = error;
+		}
+		expect(uploadError).toBeInstanceOf(PermanentRemoteError);
+
+		let deleteError: unknown;
+		try {
+			await transport.deleteRemote("a.md");
+		} catch (error) {
+			deleteError = error;
+		}
+		expect(deleteError).toBeInstanceOf(PermanentRemoteError);
 	});
 });

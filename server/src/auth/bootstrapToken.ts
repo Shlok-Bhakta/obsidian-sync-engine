@@ -1,9 +1,12 @@
+import { timingSafeEqual } from "node:crypto";
+
 /**
  * Bootstrap zip downloads mint a new client credential and ship vault bytes.
  * They must never be open to the network without a shared admin token.
  *
- * Set BOOTSTRAP_TOKEN in the server environment. Clients (or operators) pass
- * it as `Authorization: Bearer <token>` or `?token=<token>` on GET /bootstrap.zip.
+ * Set BOOTSTRAP_TOKEN in the server environment. Prefer
+ * `Authorization: Bearer <token>` (query `?token=` is accepted but may leak
+ * into access logs).
  */
 export function getConfiguredBootstrapToken(): string | null {
 	const raw = process.env.BOOTSTRAP_TOKEN?.trim();
@@ -27,6 +30,17 @@ export function extractBootstrapToken(opts: {
 	return query && query.length > 0 ? query : null;
 }
 
+function tokensEqual(a: string, b: string): boolean {
+	const left = Buffer.from(a);
+	const right = Buffer.from(b);
+	if (left.length !== right.length) {
+		// Still compare equal-length buffers to keep runtime roughly flat.
+		timingSafeEqual(left, left);
+		return false;
+	}
+	return timingSafeEqual(left, right);
+}
+
 export function assertBootstrapAuthorized(opts: {
 	authorizationHeader: string | undefined;
 	queryToken: string | undefined;
@@ -40,7 +54,7 @@ export function assertBootstrapAuthorized(opts: {
 		};
 	}
 	const provided = extractBootstrapToken(opts);
-	if (!provided || provided !== configured) {
+	if (!provided || !tokensEqual(provided, configured)) {
 		return {
 			ok: false,
 			status: 401,
