@@ -1,5 +1,6 @@
 import { App, Notice, PluginSettingTab, Setting, requestUrl } from 'obsidian';
 import ObsidianSyncPlugin from './main';
+import { ensureAuthenticated } from './auth';
 import { deserialize, MessageType, serialize } from 'obsidian-sync-protocol';
 
 export interface ObsidianSyncSettings {
@@ -42,7 +43,7 @@ export class SyncSettingTab extends PluginSettingTab {
 		.addButton((button) =>
 			button
 				.setIcon('upload')
-				.setTooltip('Refresh client secret')
+				.setTooltip('Refresh client name on server')
 				.setCta()
 				.setClass('obsidian-sync-client-secret-refresh')
 				.onClick(() => this.refreshClientName(this.plugin.settings.clientName)),
@@ -88,10 +89,19 @@ export class SyncSettingTab extends PluginSettingTab {
 
 		updateServerUrlWarning(this.plugin.settings.serverUrl);
 
+		new Setting(containerEl)
+		.setName("Pair with server")
+		.setDesc("First client on an empty server receives a secret. Existing clients verify their secret over HTTP.")
+		.addButton((button) =>
+			button
+				.setButtonText('Pair now')
+				.setCta()
+				.onClick(() => void this.pairWithServer()),
+		);
 
 		new Setting(containerEl)
 		.setName("Client secret")
-		.setDesc("Do not share this with anyone!!!")			
+		.setDesc("Issued by the server on first pair. Paste a secret here if restoring a client; do not share it.")
 		.addButton((button) =>
 			button
 				.setIcon('refresh-cw')
@@ -104,7 +114,6 @@ export class SyncSettingTab extends PluginSettingTab {
 			text
 				.setPlaceholder('Made by server')
 				.setValue(this.plugin.settings.clientSecret)
-				.setDisabled(true)
 				.onChange(async (value) => {
 					this.plugin.settings.clientSecret = value;
 					await this.plugin.saveSettings();
@@ -130,6 +139,16 @@ export class SyncSettingTab extends PluginSettingTab {
 				.setCta()
 				.onClick(() => void this.plugin.seedFromVault()),
 		);
+	}
+
+	private async pairWithServer(): Promise<void> {
+		try {
+			await ensureAuthenticated(this.plugin);
+			new Notice('Paired with sync server');
+			this.display();
+		} catch (error) {
+			new Notice('Pairing failed: ' + (error instanceof Error ? error.message : String(error)));
+		}
 	}
 
 	private async refreshClientSecret(): Promise<void> {
@@ -181,10 +200,10 @@ export class SyncSettingTab extends PluginSettingTab {
 				this.display();
 				await this.plugin.saveSettings();
 			}else{
-				new Notice('Error refreshing client secret: ' + message.type);
+				new Notice('Error refreshing client name: ' + message.type);
 			}
 		} catch (error) {
-			new Notice('Error refreshing client secret: ' + String(error));
+			new Notice('Error refreshing client name: ' + String(error));
 		}
 	}
 

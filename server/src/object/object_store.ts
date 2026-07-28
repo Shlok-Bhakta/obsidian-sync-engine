@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { cp, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { $, sql } from "bun";
 import { createClient, getClientIdFromAuthorization } from "../auth/auth";
+import { assertBootstrapAuthorized } from "../auth/bootstrapToken";
 
 /** Thrown when a client-supplied path would resolve outside the object store root. */
 export class PathTraversalError extends Error {
@@ -232,6 +233,14 @@ export function registerObjectStoreRoutes(app: Hono, store = objectStore) {
             }
         })
         .get('/bootstrap.zip', async (c) => {
+            const authz = assertBootstrapAuthorized({
+                authorizationHeader: c.req.header("Authorization"),
+                queryToken: c.req.query("token"),
+            });
+            if (!authz.ok) {
+                return c.json({ error: authz.error }, authz.status);
+            }
+
             const tmp = await mkdtemp(join(tmpdir(), "obsidian-bootstrap-"));
             const zipPath = join(tmp, "vault.zip");
 

@@ -1,3 +1,9 @@
+/**
+ * Deferred: WebSocket client transport will be used for the second iteration
+ * of sync (live push / lower latency). The MVP product path is HTTP polling
+ * via ensureAuthenticated + SyncEngine.tick. Keep this helper for the
+ * follow-up; do not construct it from main.ts until that iteration.
+ */
 import { deserialize, Message, MessageType, PROTOCOL_VERSION, serialize } from "obsidian-sync-protocol";
 import { ObsidianSyncSettings } from "../settings";
 import ObsidianSyncPlugin from "../main";
