@@ -86,7 +86,10 @@ describe("object store", () => {
             content: "Hello, world 3!",
             id: client.id,
         }];
-        await Promise.all(content.map(c => objectStore.upload(c)));
+        // Sequential so revisions are deterministic (1, 2, 3).
+        for (const c of content) {
+            await objectStore.upload(c);
+        }
         const outbox = await objectStore.inbox(1);
         expect(outbox.map(o => o.path)).not.toContain("test.txt");
         expect(outbox.map(o => o.path)).toContain("test2.txt");
@@ -110,7 +113,9 @@ describe("object store", () => {
             content: "Hello, world 3!",
             id: client.id,
         }];
-        await Promise.all(content.map(c => objectStore.upload(c)));
+        for (const c of content) {
+            await objectStore.upload(c);
+        }
         const outbox = await objectStore.inbox(4);
         expect(outbox.map(o => o.path)).not.toContain("test.txt");
         expect(outbox.map(o => o.path)).not.toContain("test2.txt");
