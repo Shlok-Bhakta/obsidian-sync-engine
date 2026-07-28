@@ -120,6 +120,16 @@ export class SampleSettingTab extends PluginSettingTab {
 				.setValue(this.plugin.settings.revision.toString())
 				.setDisabled(true)
 		);
+
+		new Setting(containerEl)
+		.setName("Seed server from this vault")
+		.setDesc("Enqueue every file currently in the vault to push to the server. Use this once to bootstrap a fresh server, or after restoring a vault.")
+		.addButton((button) =>
+			button
+				.setButtonText('Seed server')
+				.setCta()
+				.onClick(() => void this.plugin.seedFromVault()),
+		);
 	}
 
 	private async refreshClientSecret(): Promise<void> {

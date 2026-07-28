@@ -1,169 +1,51 @@
-import {
-	Editor,
-	MarkdownView,
-	MarkdownFileInfo,
-	Modal,
-	Notice,
-	Plugin,
-	normalizePath,
-	requestUrl,
-	type RequestUrlResponse,
-	type TFile,
-} from 'obsidian';
+import { Modal, Notice, Plugin, type WorkspaceLeaf } from 'obsidian';
 import {
 	DEFAULT_SETTINGS,
 	MyPluginSettings,
 	SampleSettingTab,
 } from './settings';
-import { WebsocketsHelper } from './websockets/websockets';
+import { SyncStatusView, SYNC_STATUS_VIEW_TYPE } from './ui/syncStatusView';
+import {
+	registerVaultSync,
+	seedServerFromVault,
+	type VaultSync,
+} from './vaultSync';
 // Remember to rename these classes and interfaces!
 
 export default class MyPlugin extends Plugin {
 	settings!: MyPluginSettings;
-	ws: WebsocketsHelper | null = null;
-	private isUploadingVault = false;
+	sync!: VaultSync;
+	private isSeeding = false;
 
 	async onload() {
 		await this.loadSettings();
 
-		// connect to server over ws
-		this.ws = new WebsocketsHelper(this);
-		this.syncAdapterWrites();
+		this.sync = registerVaultSync(this);
 
-		this.addRibbonIcon('upload', 'Upload entire vault', () => {
-			void this.uploadEntireVaultToServer();
-		});
-		
-		// on type push entire file to server
-		this.registerEvent(
-			this.app.workspace.on('editor-change', (editor, info) => {
-				const file = info.file;
-				if (!file) {
-					return;
-				}
-
-				void this.uploadEditorFile(editor, file);
-			}),
+		this.registerView(
+			SYNC_STATUS_VIEW_TYPE,
+			(leaf) => new SyncStatusView(leaf, this, this.sync),
 		);
 
-		// // This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		// const statusBarItemEl = this.addStatusBarItem();
-		// statusBarItemEl.setText('Status bar text');
+		this.addRibbonIcon('upload', 'Seed server from this vault', () => {
+			void this.seedFromVault();
+		});
+		this.addRibbonIcon('refresh-cw', 'Open sync status', () => {
+			void this.openSyncStatusView();
+		});
 
-		// // This adds a simple command that can be triggered anywhere
-		// this.addCommand({
-		// 	id: 'open-modal-simple',
-		// 	name: 'Open modal (simple)',
-		// 	callback: () => {
-		// 		new SampleModal(this.app).open();
-		// 	},
-		// });
-		// // This adds an editor command that can perform some operation on the current editor instance
-		// this.addCommand({
-		// 	id: 'replace-selected',
-		// 	name: 'Replace selected content',
-		// 	editorCallback: (
-		// 		editor: Editor,
-		// 		_ctx: MarkdownView | MarkdownFileInfo,
-		// 	) => {
-		// 		editor.replaceSelection('Sample editor command');
-		// 	},
-		// });
-		// // This adds a complex command that can check whether the current state of the app allows execution of the command
-		// this.addCommand({
-		// 	id: 'open-modal-complex',
-		// 	name: 'Open modal (complex)',
-		// 	checkCallback: (checking: boolean) => {
-		// 		// Conditions to check
-		// 		const markdownView =
-		// 			this.app.workspace.getActiveViewOfType(MarkdownView);
-		// 		if (markdownView) {
-		// 			// If checking is true, we're simply "checking" if the command can be run.
-		// 			// If checking is false, then we want to actually perform the operation.
-		// 			if (!checking) {
-		// 				new SampleModal(this.app).open();
-		// 			}
+		this.addCommand({
+			id: 'seed-server-from-vault',
+			name: 'Seed server from this vault',
+			callback: () => void this.seedFromVault(),
+		});
+		this.addCommand({
+			id: 'open-sync-status',
+			name: 'Open sync status',
+			callback: () => void this.openSyncStatusView(),
+		});
 
-		// 			// This command will only show up in Command Palette when the check function returns true
-		// 			return true;
-		// 		}
-		// 		return false;
-		// 	},
-		// });
-
-		// This adds a settings tab so the user can configure various aspects of the plugin
 		this.addSettingTab(new SampleSettingTab(this.app, this));
-
-		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-		// Using this function will automatically remove the event listener when this plugin is disabled.
-		// this.registerDomEvent(activeDocument, 'click', (_evt: MouseEvent) => {
-		// 	new Notice('Click');
-		// });
-
-		// // When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-		// this.registerInterval(
-		// 	window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000),
-		// );
-	}
-
-	onunload() {
-		if(this.ws){
-			void this.ws.close();
-			this.ws = null;
-		}
-	}
-
-	private syncAdapterWrites(): void {
-		const adapter = this.app.vault.adapter;
-		const write = adapter.write;
-		const writeBinary = adapter.writeBinary;
-
-		adapter.write = async (path, data, options) => {
-			await write.call(adapter, path, data, options);
-			void this.uploadWrittenConfigFile(path);
-		};
-		adapter.writeBinary = async (path, data, options) => {
-			await writeBinary.call(adapter, path, data, options);
-			void this.uploadWrittenConfigFile(path);
-		};
-
-		this.register(() => {
-			adapter.write = write;
-			adapter.writeBinary = writeBinary;
-		});
-	}
-
-	private async uploadWrittenConfigFile(path: string): Promise<void> {
-		if (!this.shouldSyncAdapterWrite(path)) {
-			return;
-		}
-
-		try {
-			await this.uploadVaultFile(path);
-		} catch (error) {
-			console.error(`Failed to sync ${path}`, error);
-			new Notice(`Failed to sync ${path}: ${this.formatError(error)}`);
-		}
-	}
-
-	private shouldSyncAdapterWrite(path: string): boolean {
-		const normalizedPath = normalizePath(path);
-		const configDir = normalizePath(this.app.vault.configDir);
-		const metadataDir = normalizePath(
-			`${this.manifest.dir ?? `${configDir}/plugins/${this.manifest.id}`}/sync-metadata`,
-		);
-
-		if (
-			normalizedPath === metadataDir ||
-			normalizedPath.startsWith(`${metadataDir}/`)
-		) {
-			return false;
-		}
-
-		return (
-			normalizedPath === configDir ||
-			normalizedPath.startsWith(`${configDir}/`)
-		);
 	}
 
 	async loadSettings() {
@@ -178,151 +60,34 @@ export default class MyPlugin extends Plugin {
 		await this.saveData(this.settings);
 	}
 
-	private async uploadEntireVaultToServer(): Promise<void> {
-		if (this.isUploadingVault) {
-			new Notice('Vault upload is already running');
+	/** Enqueues every file currently in the vault and pushes them out. Used for first-time bootstrap. */
+	async seedFromVault(): Promise<void> {
+		if (this.isSeeding) {
+			new Notice('Seeding is already running');
 			return;
 		}
 
-		this.isUploadingVault = true;
-
+		this.isSeeding = true;
 		try {
-			const files = await this.listVaultFiles('');
-			let uploaded = 0;
-			let failed = 0;
-			const concurrency = 8;
-
-			new Notice(`Uploading ${files.length} vault files to server`);
-
-			let nextIndex = 0;
-			const uploadWorker = async () => {
-				while (nextIndex < files.length) {
-					const filePath = files[nextIndex];
-					nextIndex += 1;
-
-					if (filePath === undefined) {
-						continue;
-					}
-
-					try {
-						await this.uploadVaultFile(filePath);
-						uploaded += 1;
-					} catch (error) {
-						failed += 1;
-						console.error(`Failed to upload ${filePath}`, error);
-					}
-				}
-			};
-
-			const workerCount = Math.min(concurrency, files.length);
-			await Promise.all(
-				Array.from({ length: workerCount }, () => uploadWorker()),
-			);
-
-			new Notice(
-				`Vault upload finished: ${uploaded} uploaded, ${failed} failed`,
-			);
+			new Notice('Seeding server from this vault…');
+			await seedServerFromVault(this, this.sync);
+			new Notice('Vault seeded');
 		} catch (error) {
-			console.error('Vault upload failed', error);
-			new Notice('Vault upload failed: ' + this.formatError(error));
+			console.error('Seeding server from vault failed', error);
+			new Notice('Seeding failed: ' + this.formatError(error));
 		} finally {
-			this.isUploadingVault = false;
+			this.isSeeding = false;
 		}
 	}
 
-	private async listVaultFiles(folderPath: string): Promise<string[]> {
-		const listedFiles = await this.app.vault.adapter.list(folderPath);
-		const nestedFiles = await Promise.all(
-			listedFiles.folders.map((childFolderPath) =>
-				this.listVaultFiles(childFolderPath),
-			),
-		);
-
-		return [...listedFiles.files, ...nestedFiles.flat()];
-	}
-
-	private async uploadVaultFile(filePath: string): Promise<void> {
-		const body = await this.app.vault.adapter.readBinary(filePath);
-		const response = await requestUrl({
-			url: this.settings.serverUrl + '/files',
-			method: 'POST',
-			contentType: 'application/octet-stream',
-			headers: {
-				'X-Obsidian-Path': encodeURIComponent(filePath),
-				'Authorization': this.settings.clientSecret,
-			},
-			body,
-			throw: false,
-		});
-
-		if (response.status >= 400) {
-			throw new Error(
-				`Server returned ${response.status}: ${response.text}`,
-			);
+	async openSyncStatusView(): Promise<void> {
+		const existing = this.app.workspace.getLeavesOfType(SYNC_STATUS_VIEW_TYPE);
+		const leaf: WorkspaceLeaf =
+			existing[0] ?? this.app.workspace.getRightLeaf(false) ?? this.app.workspace.getLeaf(true);
+		if (existing.length === 0) {
+			await leaf.setViewState({ type: SYNC_STATUS_VIEW_TYPE, active: true });
 		}
-	}
-
-	private async uploadEditorFile(editor: Editor, file: TFile): Promise<void> {
-		try {
-			const response = await requestUrl({
-				url: this.settings.serverUrl + '/files',
-				method: 'POST',
-				contentType: 'application/octet-stream',
-				headers: {
-					'X-Obsidian-Path': encodeURIComponent(file.path),
-					'Authorization': this.settings.clientSecret,
-				},
-				body: editor.getValue(),
-				throw: false,
-			});
-
-			if (response.status >= 400) {
-				throw new Error(
-					`Server returned ${response.status}: ${response.text}`,
-				);
-			}
-
-			await this.writeSyncMetadata(file);
-		} catch (error) {
-			console.error(`Failed to sync ${file.path}`, error);
-			new Notice(`Failed to sync ${file.path}: ${this.formatError(error)}`);
-		}
-	}
-
-	private async writeSyncMetadata(file: TFile): Promise<void> {
-		const metadataDir = normalizePath(
-			`${this.manifest.dir ?? `.obsidian/plugins/${this.manifest.id}`}/sync-metadata`,
-		);
-		await this.ensureFolder(metadataDir);
-
-		const metadataPath = normalizePath(
-			`${metadataDir}/${file.path.replace(/[\\/]/g, '__')}.json`,
-		);
-		await this.app.vault.adapter.write(
-			metadataPath,
-			JSON.stringify(
-				{
-					path: file.path,
-					timestamp: new Date().toISOString(),
-				},
-				null,
-				2,
-			),
-		);
-	}
-
-	private async ensureFolder(path: string): Promise<void> {
-		if (await this.app.vault.adapter.exists(path)) {
-			return;
-		}
-
-		try {
-			await this.app.vault.adapter.mkdir(path);
-		} catch (error) {
-			if (!(await this.app.vault.adapter.exists(path))) {
-				throw error;
-			}
-		}
+		await this.app.workspace.revealLeaf(leaf);
 	}
 
 	private formatError(error: unknown): string {
