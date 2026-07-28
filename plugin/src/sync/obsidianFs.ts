@@ -1,5 +1,6 @@
 import { normalizePath, type DataAdapter } from "obsidian";
 import type { VaultBlobFs } from "./engine";
+import { ancestorDirs } from "./paths";
 
 /**
  * VaultBlobFs backed by Obsidian's `app.vault.adapter`. All reads/writes go
@@ -93,22 +94,28 @@ export class ObsidianFs implements VaultBlobFs {
 		return [...listed.files, ...nested.flat()];
 	}
 
-	/** Ensures the directory containing `normalizedPath` exists, creating intermediate folders as needed. */
+	/**
+	 * Ensures every ancestor directory of `normalizedPath` exists, creating
+	 * them one level at a time from the root down. `DataAdapter.mkdir` is NOT
+	 * recursive, so for `a/b/c.md` this must `mkdir("a")` before `mkdir("a/b")`
+	 * — creating `a/b` first would fail because `a` doesn't exist yet.
+	 */
 	private async ensureParentDir(normalizedPath: string): Promise<void> {
-		const separatorIndex = normalizedPath.lastIndexOf("/");
-		if (separatorIndex <= 0) {
-			return;
+		for (const dir of ancestorDirs(normalizedPath)) {
+			await this.ensureDir(dir);
 		}
-		const parent = normalizedPath.slice(0, separatorIndex);
-		if (await this.adapter.exists(parent)) {
+	}
+
+	private async ensureDir(path: string): Promise<void> {
+		if (await this.adapter.exists(path)) {
 			return;
 		}
 		try {
-			await this.adapter.mkdir(parent);
+			await this.adapter.mkdir(path);
 		} catch (error) {
 			// Another writer may have created it concurrently; only surface the
 			// error if the directory still doesn't exist.
-			if (!(await this.adapter.exists(parent))) {
+			if (!(await this.adapter.exists(path))) {
 				throw error;
 			}
 		}
