@@ -1,4 +1,5 @@
 import type { RequestUrlParam, RequestUrlResponse } from "obsidian";
+import { inboxOpSchema } from "obsidian-sync-protocol";
 import { PermanentRemoteError, type SyncTransport } from "./engine";
 import type { InboxOp } from "./inbox";
 
@@ -29,12 +30,12 @@ export class RemoteFileNotFoundError extends Error {
 	}
 }
 
-/** Split an NDJSON response body into parsed inbox lines. */
+/** Split an NDJSON response body into parsed, schema-validated inbox lines. */
 function parseNdjson(body: string): InboxOp[] {
 	return body
 		.split("\n")
 		.filter((line) => line.trim().length > 0)
-		.map((line) => JSON.parse(line) as InboxOp);
+		.map((line) => inboxOpSchema.parse(JSON.parse(line)));
 }
 
 function assertOk(response: RequestUrlResponse, action: string): void {

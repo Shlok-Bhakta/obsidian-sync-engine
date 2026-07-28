@@ -449,6 +449,180 @@ describe("object store", () => {
             await rm(tmp, { recursive: true, force: true });
         }
     });
+    it("bootstrap zip contains bytes uploaded via the HTTP API (BYTEA-only storage)", async () => {
+        const client = await createClientFixture({ client_name: "alice" });
+        const app = createTestApp();
+        await app.request("/files", {
+            method: "POST",
+            headers: { Authorization: client.client_secret, "X-Obsidian-Path": "note.md" },
+            body: "hello from api",
+        });
+
+        // Confirm bytes live only in Postgres, never touched the filesystem object store dir.
+        const fileRows = await sql<FileRow[]>`SELECT * FROM files WHERE file_path = ${"note.md"}`;
+        expect(fileRows.length).toBe(1);
+        expect(fileRows[0].content).not.toBeNull();
+        expect(fileRows[0].content?.toString()).toBe("hello from api");
+
+        const objectStore = new ObjectStore();
+        const tmp = await mkdtemp(join(tmpdir(), "obsidian-bootstrap-test-"));
+        const zipPath = join(tmp, "vault.zip");
+        try {
+            await objectStore.bootstrap_zip_create(zipPath);
+            const extractDir = join(tmp, "extracted");
+            await $`unzip -qq ${zipPath} -d ${extractDir}`;
+            const content = await Bun.file(join(extractDir, "note.md")).text();
+            expect(content).toBe("hello from api");
+        } finally {
+            await rm(tmp, { recursive: true, force: true });
+        }
+    });
+
+    describe("path validation", () => {
+        it.each([
+            ["parent-directory traversal", "../x"],
+            ["absolute unix path", "/etc/passwd"],
+            ["backslash", "a\\b"],
+            ["current-directory segment", "a/./b"],
+        ])("rejects %s (%p) on upload with 400", async (_label, rawPath) => {
+            const client = await createClientFixture({ client_name: "alice" });
+            const app = createTestApp();
+            const res = await app.request("/files", {
+                method: "POST",
+                headers: {
+                    Authorization: client.client_secret,
+                    "X-Obsidian-Path": encodeURIComponent(rawPath),
+                },
+                body: "pwned",
+            });
+            expect(res.status).toBe(400);
+
+            const fileRows = await sql<FileRow[]>`SELECT * FROM files`;
+            expect(fileRows.length).toBe(0);
+        });
+
+        it("rejects an empty path on upload with 400", async () => {
+            const client = await createClientFixture({ client_name: "alice" });
+            const app = createTestApp();
+            const res = await app.request("/files", {
+                method: "POST",
+                headers: {
+                    Authorization: client.client_secret,
+                    "X-Obsidian-Path": encodeURIComponent(""),
+                },
+                body: "pwned",
+            });
+            expect(res.status).toBe(400);
+        });
+    });
+
+    describe("revision serialization under concurrency", () => {
+        it("advisory lock forces commit order to match revision order even when the earlier writer is slower", async () => {
+            const client = await createClientFixture({ client_name: "alice" });
+            const objectStore = new ObjectStore();
+            const commitOrder: string[] = [];
+
+            const slow = sql.begin(async (tx) => {
+                await tx`SELECT pg_advisory_xact_lock(hashtext('obsidian-sync-revision'))`;
+                await tx`SELECT pg_sleep(0.05)`;
+                const [row] = await tx<{ last_updated_revision: number }[]>`
+                    INSERT INTO files (file_path, author_id, content, file_is_deleted)
+                    VALUES ('slow.txt', ${client.id}, ${Buffer.from("slow")}, FALSE)
+                    RETURNING last_updated_revision
+                `;
+                commitOrder.push("slow");
+                return Number(row.last_updated_revision);
+            });
+
+            // Give "slow" a head start so it acquires the advisory lock first.
+            await new Promise((resolveDelay) => setTimeout(resolveDelay, 15));
+
+            const fast = sql.begin(async (tx) => {
+                // Blocks here until "slow" commits and releases the advisory lock,
+                // even though this transaction itself does no work before that.
+                await tx`SELECT pg_advisory_xact_lock(hashtext('obsidian-sync-revision'))`;
+                const [row] = await tx<{ last_updated_revision: number }[]>`
+                    INSERT INTO files (file_path, author_id, content, file_is_deleted)
+                    VALUES ('fast.txt', ${client.id}, ${Buffer.from("fast")}, FALSE)
+                    RETURNING last_updated_revision
+                `;
+                commitOrder.push("fast");
+                return Number(row.last_updated_revision);
+            });
+
+            const [slowRevision, fastRevision] = await Promise.all([slow, fast]);
+
+            // "fast" cannot commit before "slow" releases the lock, so it can never
+            // be observed by a client (via inbox) ahead of "slow".
+            expect(commitOrder).toEqual(["slow", "fast"]);
+            expect(slowRevision).toBeLessThan(fastRevision);
+
+            const inbox = await objectStore.inbox(0);
+            expect(inbox.map((i) => i.path)).toEqual(["slow.txt", "fast.txt"]);
+            expect(inbox.map((i) => i.lastUpdatedRevision)).toEqual([slowRevision, fastRevision]);
+        });
+
+        it("many parallel uploads produce strictly increasing revisions with no gaps, matching inbox order", async () => {
+            const client = await createClientFixture({ client_name: "alice" });
+            const objectStore = new ObjectStore();
+            const fileCount = 20;
+
+            const uploads = await Promise.all(
+                Array.from({ length: fileCount }, (_, i) =>
+                    objectStore.upload({
+                        path: `parallel-${i}.txt`,
+                        content: `content-${i}`,
+                        id: client.id,
+                    }),
+                ),
+            );
+
+            const revisions = uploads.map((u) => u.revision).sort((a, b) => a - b);
+            expect(revisions).toEqual(Array.from({ length: fileCount }, (_, i) => i + 1));
+
+            const inbox = await objectStore.inbox(0);
+            expect(inbox.length).toBe(fileCount);
+            const inboxRevisions = inbox.map((i) => i.lastUpdatedRevision);
+            expect(inboxRevisions).toEqual([...inboxRevisions].sort((a, b) => a - b));
+            expect(new Set(inboxRevisions).size).toBe(fileCount);
+
+            // Every committed revision's path downloads the bytes that were
+            // actually uploaded for it (metadata and bytes describe one version).
+            for (const upload of uploads) {
+                const text = decode(await objectStore.download(upload.path));
+                const expectedIndex = upload.path.replace("parallel-", "").replace(".txt", "");
+                expect(text).toBe(`content-${expectedIndex}`);
+            }
+        });
+
+        it("concurrent uploads to the same path serialize atomically: revision and bytes describe one committed version", async () => {
+            const client = await createClientFixture({ client_name: "alice" });
+            const objectStore = new ObjectStore();
+            const variants = ["v-A", "v-B", "v-C"];
+
+            const uploads = await Promise.all(
+                variants.map((content) =>
+                    objectStore.upload({ path: "same-path.txt", content, id: client.id }),
+                ),
+            );
+
+            const revisions = uploads.map((u) => u.revision).sort((a, b) => a - b);
+            expect(revisions).toEqual([1, 2, 3]);
+
+            const winningRevision = Math.max(...uploads.map((u) => u.revision));
+            const winnerIndex = uploads.findIndex((u) => u.revision === winningRevision);
+            const expectedWinningContent = variants[winnerIndex];
+
+            const fileRows = await sql<FileRow[]>`SELECT * FROM files WHERE file_path = ${"same-path.txt"}`;
+            expect(fileRows.length).toBe(1);
+            expect(Number(fileRows[0].last_updated_revision)).toBe(winningRevision);
+            expect(fileRows[0].content?.toString()).toBe(expectedWinningContent);
+
+            const downloaded = decode(await objectStore.download("same-path.txt"));
+            expect(downloaded).toBe(expectedWinningContent);
+        });
+    });
+
     it("stamps a tip revision that includes soft-delete revisions", async () => {
         const client = await createClientFixture({ client_name: "alice" });
         const objectStore = new ObjectStore();

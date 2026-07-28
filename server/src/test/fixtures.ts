@@ -20,6 +20,7 @@ export type FileRow = {
 	last_updated_revision: string;
 	file_is_deleted: boolean;
 	author_id: string;
+	content: Buffer | null;
 	created_at: Date;
 	updated_at: Date;
 };

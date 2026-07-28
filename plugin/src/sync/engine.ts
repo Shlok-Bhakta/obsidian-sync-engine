@@ -7,6 +7,7 @@ import {
 	list as listOutbox,
 	type OutboxOp,
 } from "./outbox";
+import { canonicalizeSyncPath } from "./paths";
 
 export type SyncTransport = {
 	upload(
@@ -137,7 +138,8 @@ export class SyncEngine {
 	 * Awaitable enqueue for callers that must know the intent landed on disk
 	 * (seed, unload flush). Still schedules a debounced network tick.
 	 */
-	async enqueueDurable(path: string, op: "put" | "delete"): Promise<void> {
+	async enqueueDurable(rawPath: string, op: "put" | "delete"): Promise<void> {
+		const path = canonicalizeSyncPath(rawPath);
 		this.pendingOutboxPaths.add(path);
 		this.enqueueInFlight.add(path);
 		try {

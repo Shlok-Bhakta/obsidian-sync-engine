@@ -1,3 +1,40 @@
+/** Thrown by `canonicalizeSyncPath` when a path cannot be made safe to sync. */
+export class InvalidSyncPathError extends Error {
+	constructor(readonly path: string) {
+		super(`Invalid sync path: ${path}`);
+		this.name = "InvalidSyncPathError";
+	}
+}
+
+/**
+ * Normalizes a vault path before it is handed to the transport, mirroring
+ * the server's stricter canonicalization (`server/src/object/paths.ts`) so
+ * obviously-bad paths are rejected locally instead of round-tripping to the
+ * server for a 400.
+ *
+ * Backslashes are converted to forward slashes, empty and `.` segments are
+ * dropped (defends against a stray `a//b` or trailing slash), but a `..`
+ * segment is always rejected rather than silently resolved, since Obsidian
+ * vault paths should never need to escape a directory.
+ */
+export function canonicalizeSyncPath(path: string): string {
+	if (typeof path !== "string" || path.length === 0 || path.includes("\0")) {
+		throw new InvalidSyncPathError(path);
+	}
+	const segments = path
+		.replace(/\\/g, "/")
+		.split("/")
+		.filter((segment) => segment.length > 0 && segment !== ".");
+
+	if (segments.length === 0 || segments.includes("..")) {
+		throw new InvalidSyncPathError(path);
+	}
+	if (/^[a-zA-Z]:$/.test(segments[0]!) || path.startsWith("/")) {
+		throw new InvalidSyncPathError(path);
+	}
+	return segments.join("/");
+}
+
 /**
  * Returns the ancestor directory paths of `path`, root-most first, so a
  * caller can `mkdir` each one in turn. Obsidian's `DataAdapter.mkdir` is NOT

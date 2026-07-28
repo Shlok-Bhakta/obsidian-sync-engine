@@ -1,28 +1,29 @@
 import { Context, Hono } from "hono";
-import { join, resolve, sep } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { cp, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { $, sql } from "bun";
 import { createClient, getClientIdFromAuthorization } from "../auth/auth";
 import { assertBootstrapAuthorized } from "../auth/bootstrapToken";
+import { canonicalizePath, InvalidPathError } from "./paths";
 
-/** Thrown when a client-supplied path would resolve outside the object store root. */
-export class PathTraversalError extends Error {
-    constructor(path: string) {
-        super(`Path escapes object store root: ${path}`);
-        this.name = "PathTraversalError";
-    }
-}
+export { InvalidPathError };
 
-export const DEFAULT_OBJECT_STORE_DIR = (() => {
-    const override = process.env.OBJECT_STORE_DIR;
-    if (override) {
-        return override.startsWith("/")
-            ? override
-            : join(import.meta.dir, "../../", override);
-    }
-    return join(import.meta.dir, "../../object-data");
-})();
+export const DEFAULT_OBJECT_STORE_DIR = resolve(
+    import.meta.dir,
+    "../../",
+    process.env.OBJECT_STORE_DIR ?? "object-data",
+);
+
+/**
+ * Advisory-lock key shared by every upload/delete. Holding it from the
+ * moment we ask Postgres for the next revision until the transaction
+ * commits (or rolls back) guarantees commit order matches revision order:
+ * a transaction cannot observe/assign a revision while another
+ * revision-assigning transaction is still in flight, so a lower revision
+ * can never commit after a client has already observed a higher one.
+ */
+const REVISION_LOCK_KEY = "obsidian-sync-revision";
 
 export type ObjectStoreUploadContent = {
     path: string;
@@ -42,7 +43,30 @@ export type ObjectStoreOutboxItem = {
     isDeleted: boolean;
 };
 
-// Simple content-addressed object store for blob uploads.
+type FileContentRow = { last_updated_revision: number };
+
+/** Normalizes any upload body shape into a Buffer suitable for a BYTEA column. */
+async function toBuffer(content: Bun.BlobOrStringOrBuffer): Promise<Buffer> {
+    if (typeof content === "string") {
+        return Buffer.from(content, "utf-8");
+    }
+    if (content instanceof Blob) {
+        return Buffer.from(await content.arrayBuffer());
+    }
+    if (ArrayBuffer.isView(content)) {
+        return Buffer.from(content.buffer, content.byteOffset, content.byteLength);
+    }
+    return Buffer.from(content);
+}
+
+/** Copies a Buffer/Uint8Array read back from Postgres into a right-sized ArrayBuffer. */
+function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+    return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+}
+
+// Object store backed entirely by Postgres: file bytes live in the `files.content`
+// BYTEA column alongside their metadata, written in the same transaction so there is
+// no window where metadata and bytes can disagree (no dual-write race with disk).
 export class ObjectStore {
     constructor(private readonly rootDirectory = DEFAULT_OBJECT_STORE_DIR) {}
 
@@ -51,36 +75,49 @@ export class ObjectStore {
      * decoding: query params are decoded once by the URL parser already, headers are not.
      */
     async upload(content: ObjectStoreUploadContent): Promise<ObjectStoreUploadResult> {
-        const filePath = this.pathForFile(content.path);
+        const path = canonicalizePath(content.path);
+        const buffer = await toBuffer(content.content);
 
-        const bytesWritten = await Bun.write(filePath, content.content, { createPath: true });
-        const [row] = await sql<{ last_updated_revision: number }[]>`
-            INSERT INTO files (file_path, author_id) VALUES (${content.path}, ${content.id})
-            ON CONFLICT (file_path) DO UPDATE SET author_id = ${content.id}, 
-            file_is_deleted = FALSE,
-            last_updated_revision = EXCLUDED.last_updated_revision, updated_at = NOW() RETURNING last_updated_revision
-        `;
+        const [row] = (await sql.begin(async (tx) => {
+            await tx`SELECT pg_advisory_xact_lock(hashtext(${REVISION_LOCK_KEY}))`;
+            return tx<FileContentRow[]>`
+                INSERT INTO files (file_path, author_id, content, file_is_deleted)
+                VALUES (${path}, ${content.id}, ${buffer}, FALSE)
+                ON CONFLICT (file_path) DO UPDATE SET
+                    author_id = EXCLUDED.author_id,
+                    content = EXCLUDED.content,
+                    file_is_deleted = FALSE,
+                    last_updated_revision = EXCLUDED.last_updated_revision,
+                    updated_at = NOW()
+                RETURNING last_updated_revision
+            `;
+        })) as FileContentRow[];
+
         return {
-            path: content.path,
-            bytesWritten,
+            path,
+            bytesWritten: buffer.byteLength,
             revision: Number(row.last_updated_revision),
         };
     }
 
     /** Soft-deletes a file. Idempotent: unknown paths get a tombstone revision. */
     async delete(path: string, authorId: string): Promise<{ revision: number }> {
-        this.pathForFile(path); // validate path stays within the store root
+        const canonicalPath = canonicalizePath(path);
 
-        const [row] = await sql<{ last_updated_revision: number }[]>`
-            INSERT INTO files (file_path, author_id, file_is_deleted)
-            VALUES (${path}, ${authorId}, TRUE)
-            ON CONFLICT (file_path) DO UPDATE SET
-                author_id = ${authorId},
-                file_is_deleted = TRUE,
-                updated_at = NOW(),
-                last_updated_revision = NEXTVAL('global_revision')
-            RETURNING last_updated_revision
-        `;
+        const [row] = (await sql.begin(async (tx) => {
+            await tx`SELECT pg_advisory_xact_lock(hashtext(${REVISION_LOCK_KEY}))`;
+            return tx<FileContentRow[]>`
+                INSERT INTO files (file_path, author_id, file_is_deleted, content)
+                VALUES (${canonicalPath}, ${authorId}, TRUE, NULL)
+                ON CONFLICT (file_path) DO UPDATE SET
+                    author_id = EXCLUDED.author_id,
+                    file_is_deleted = TRUE,
+                    content = NULL,
+                    updated_at = NOW(),
+                    last_updated_revision = NEXTVAL('global_revision')
+                RETURNING last_updated_revision
+            `;
+        })) as FileContentRow[];
         return { revision: Number(row.last_updated_revision) };
     }
 
@@ -92,41 +129,44 @@ export class ObjectStore {
         return row?.tip ? Number(row.tip) : 0;
     }
 
-    /** Downloads a file's bytes. Returns null if the file doesn't exist or is soft-deleted. */
+    /** Downloads a file's bytes. Returns null if the file doesn't exist, is soft-deleted, or has no content. */
     async download(path: string): Promise<ArrayBuffer | null> {
-        const filePath = this.pathForFile(path);
+        const canonicalPath = canonicalizePath(path);
 
-        const [row] = await sql<{ file_is_deleted: boolean }[]>`
-            SELECT file_is_deleted FROM files WHERE file_path = ${path}
+        const [row] = await sql<{ file_is_deleted: boolean; content: Buffer | null }[]>`
+            SELECT file_is_deleted, content FROM files WHERE file_path = ${canonicalPath}
         `;
-        if (!row || row.file_is_deleted) {
+        if (!row || row.file_is_deleted || row.content === null) {
             return null;
         }
-        return Bun.file(filePath).arrayBuffer();
+        return toArrayBuffer(row.content);
     }
 
     async bootstrap_zip_create(path: string): Promise<void> {
         const tmp = await mkdtemp(join(tmpdir(), "obsidian-bootstrap-copy-"));
         const vaultDir = join(tmp, "vault");
         try {
-            await mkdir(this.rootDirectory, { recursive: true });
-            // Snapshot the tip BEFORE copying: if we read it after the copy, a file
-            // landing between copy and read could be reflected in the tip without its
-            // bytes making it into the zip, so the client would never fetch it (it
-            // thinks it's already past that revision). Reading before the copy means
-            // the worst case is an extra file the client already has bytes for
+            await mkdir(vaultDir, { recursive: true });
+
+            // Snapshot the tip BEFORE reading file rows: if we read it after, a file
+            // landing between the read and the tip snapshot could be reflected in the
+            // tip without its bytes making it into the zip, so the client would never
+            // fetch it (it thinks it's already past that revision). Reading before
+            // means the worst case is an extra file the client already has bytes for
             // (harmless) rather than a missing one (unrecoverable without a re-bootstrap).
             const revision = await this.getTipRevision();
-            await cp(this.rootDirectory, vaultDir, { recursive: true });
 
             // Bootstrap should not ship tombstoned files; the client learns about
             // deletes via the inbox once it starts polling from `revision`.
-            const deletedFiles = await sql<{ file_path: string }[]>`
-                SELECT file_path FROM files WHERE file_is_deleted = TRUE
+            const files = await sql<{ file_path: string; content: Buffer | null }[]>`
+                SELECT file_path, content FROM files
+                WHERE file_is_deleted = FALSE AND content IS NOT NULL
             `;
-            await Promise.all(deletedFiles.map(({ file_path }) =>
-                rm(join(vaultDir, file_path), { force: true }),
-            ));
+            for (const file of files) {
+                const dest = join(vaultDir, file.file_path);
+                await mkdir(dirname(dest), { recursive: true });
+                await Bun.write(dest, file.content as Buffer);
+            }
 
             const name_choices = [
                 "acrobat", "banana", "camera", "diamond", "elephant",
@@ -166,15 +206,6 @@ export class ObjectStore {
         }
     }
 
-    /** Resolves `file` against the store root, throwing PathTraversalError if it would escape. */
-    pathForFile(file: string): string {
-        const resolvedRoot = resolve(this.rootDirectory);
-        const candidate = resolve(resolvedRoot, file);
-        if (candidate !== resolvedRoot && !candidate.startsWith(resolvedRoot + sep)) {
-            throw new PathTraversalError(file);
-        }
-        return candidate;
-    }
     // to create the client inbox
     async inbox(rev: number): Promise<ObjectStoreOutboxItem[]> {
         const result = await sql<{ file_path: string; last_updated_revision: string; file_is_deleted: boolean }[]>`
@@ -223,7 +254,6 @@ export function registerObjectStoreRoutes(app: Hono, store = objectStore) {
             }
 
             const clientId = await getClientIdFromAuthorization(authorization);
-            console.log("clientId", clientId);
             try {
                 const result = await store.upload({
                     path: path,
@@ -232,7 +262,7 @@ export function registerObjectStoreRoutes(app: Hono, store = objectStore) {
                 });
                 return c.json(result, 200);
             } catch (error) {
-                if (error instanceof PathTraversalError) {
+                if (error instanceof InvalidPathError) {
                     return c.json({ error: "Invalid path" }, 400);
                 }
                 throw error;
@@ -313,7 +343,7 @@ export function registerObjectStoreRoutes(app: Hono, store = objectStore) {
                     headers: { "Content-Type": "application/octet-stream" },
                 });
             } catch (error) {
-                if (error instanceof PathTraversalError) {
+                if (error instanceof InvalidPathError) {
                     return c.json({ error: "Invalid path" }, 400);
                 }
                 return c.json({ error: "Not found" }, 404);
@@ -333,7 +363,7 @@ export function registerObjectStoreRoutes(app: Hono, store = objectStore) {
                 const result = await store.delete(path, clientId);
                 return c.json({ path, revision: result.revision }, 200);
             } catch (error) {
-                if (error instanceof PathTraversalError) {
+                if (error instanceof InvalidPathError) {
                     return c.json({ error: "Invalid path" }, 400);
                 }
                 if (error instanceof Error && error.message === "Invalid authorization") {
