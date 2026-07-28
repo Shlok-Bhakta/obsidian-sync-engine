@@ -67,15 +67,21 @@ export class ObjectStore {
         };
     }
 
-    /** Soft-deletes a file. Returns null if no file exists at that path. */
-    async delete(path: string): Promise<{ revision: number } | null> {
+    /** Soft-deletes a file. Idempotent: unknown paths get a tombstone revision. */
+    async delete(path: string, authorId: string): Promise<{ revision: number }> {
         this.pathForFile(path); // validate path stays within the store root
 
         const [row] = await sql<{ last_updated_revision: number }[]>`
-            UPDATE files SET file_is_deleted = TRUE, updated_at = NOW(), last_updated_revision = NEXTVAL('global_revision')
-            WHERE file_path = ${path} RETURNING last_updated_revision
+            INSERT INTO files (file_path, author_id, file_is_deleted)
+            VALUES (${path}, ${authorId}, TRUE)
+            ON CONFLICT (file_path) DO UPDATE SET
+                author_id = ${authorId},
+                file_is_deleted = TRUE,
+                updated_at = NOW(),
+                last_updated_revision = NEXTVAL('global_revision')
+            RETURNING last_updated_revision
         `;
-        return row ? { revision: Number(row.last_updated_revision) } : null;
+        return { revision: Number(row.last_updated_revision) };
     }
 
     /** Current global tip revision: highest revision stamped on any file (including deletes), or 0 if none exist. */
@@ -323,20 +329,15 @@ export function registerObjectStoreRoutes(app: Hono, store = objectStore) {
                 return c.json({ error: "path is required" }, 400);
             }
             try {
-                await getClientIdFromAuthorization(authorization);
-            } catch {
-                return c.json({ error: "Unauthorized" }, 401);
-            }
-
-            try {
-                const result = await store.delete(path);
-                if (!result) {
-                    return c.json({ error: "Not found" }, 404);
-                }
+                const clientId = await getClientIdFromAuthorization(authorization);
+                const result = await store.delete(path, clientId);
                 return c.json({ path, revision: result.revision }, 200);
             } catch (error) {
                 if (error instanceof PathTraversalError) {
                     return c.json({ error: "Invalid path" }, 400);
+                }
+                if (error instanceof Error && error.message === "Invalid authorization") {
+                    return c.json({ error: "Unauthorized" }, 401);
                 }
                 throw error;
             }

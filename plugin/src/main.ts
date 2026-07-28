@@ -27,9 +27,6 @@ export default class ObsidianSyncPlugin extends Plugin {
 			(leaf) => new SyncStatusView(leaf, this, this.sync),
 		);
 
-		this.addRibbonIcon('upload', 'Seed server from this vault', () => {
-			void this.seedFromVault();
-		});
 		this.addRibbonIcon('refresh-cw', 'Open sync status', () => {
 			void this.openSyncStatusView();
 		});

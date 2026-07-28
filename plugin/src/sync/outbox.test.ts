@@ -61,12 +61,14 @@ describe("outbox", () => {
 		await enqueue(fs, OUTBOX, { op: "delete", path: "c.md", ts: 3 });
 
 		const seen: OutboxOp[] = [];
-		await drain(fs, OUTBOX, async (op) => {
-			seen.push(op);
-			if (op.path === "b.md") {
-				throw new Error("upload failed");
-			}
-		});
+		await expect(
+			drain(fs, OUTBOX, async (op) => {
+				seen.push(op);
+				if (op.path === "b.md") {
+					throw new Error("upload failed");
+				}
+			}),
+		).rejects.toThrow("upload failed");
 
 		expect(seen).toEqual([
 			{ op: "put", path: "a.md", ts: 1 },

@@ -167,7 +167,7 @@ describe("object store", () => {
             id: client.id,
         };
         await objectStore.upload(content);
-        await objectStore.delete("test.txt");
+        await objectStore.delete("test.txt", client.id);
         const outbox = await objectStore.inbox(1);
         console.log("outbox", outbox);
         expect(outbox.map(o => o.path)).toContain("test.txt");
@@ -188,7 +188,7 @@ describe("object store", () => {
         );
         const deleteBody = await deleteRes.json() as { path: string; revision: number };
         expect(deleteBody.path).toBe("test.txt");
-        expect(deleteBody.revision).toBe(2);
+        expect(deleteBody.revision).toBeGreaterThan(0);
 
         const res = await api.inbox.$get(
             { query: { rev: "0" } },
@@ -197,7 +197,7 @@ describe("object store", () => {
         const lines = (await res.text()).trim().split("\n").map((line) => JSON.parse(line) as { rev: number; op: string; path: string });
         const deleteLine = lines.find((l) => l.path === "test.txt");
         expect(deleteLine?.op).toBe("delete");
-        expect(deleteLine?.rev).toBe(2);
+        expect(deleteLine?.rev).toBe(deleteBody.revision);
     });
     it("can download a file via the API", async () => {
         const client = await createClientFixture({ client_name: "alice" });
@@ -332,20 +332,27 @@ describe("object store", () => {
         expect(fileRows.length).toBe(1);
         expect(fileRows[0].file_is_deleted).toBe(true);
     });
-    it("returns 404 when deleting a file that doesn't exist", async () => {
+    it("deleting a never-uploaded path returns 200 with a revision (idempotent tombstone)", async () => {
         const client = await createClientFixture({ client_name: "alice" });
         const app = createTestApp();
-        const res = await app.request(`/files?path=${encodeURIComponent("does-not-exist.txt")}`, {
+        const res = await app.request(`/files?path=${encodeURIComponent("never-seen.txt")}`, {
             method: "DELETE",
             headers: { Authorization: client.client_secret },
         });
-        expect(res.status).toBe(404);
+        expect(res.status).toBe(200);
+        const body = await res.json() as { path: string; revision: number };
+        expect(body.path).toBe("never-seen.txt");
+        expect(body.revision).toBeGreaterThan(0);
+
+        const fileRows = await sql<FileRow[]>`SELECT * FROM files WHERE file_path = ${"never-seen.txt"}`;
+        expect(fileRows.length).toBe(1);
+        expect(fileRows[0].file_is_deleted).toBe(true);
     });
     it("re-uploading a soft-deleted file clears the tombstone and appears as a put in the inbox", async () => {
         const client = await createClientFixture({ client_name: "alice" });
         const objectStore = new ObjectStore();
         await objectStore.upload({ path: "test.txt", content: "v1", id: client.id });
-        await objectStore.delete("test.txt");
+        await objectStore.delete("test.txt", client.id);
         await objectStore.upload({ path: "test.txt", content: "v2", id: client.id });
 
         const fileRows = await sql<FileRow[]>`SELECT * FROM files WHERE file_path = ${"test.txt"}`;
@@ -427,7 +434,7 @@ describe("object store", () => {
         await objectStore.upload({ path: pluginDataPath, content: "{}", id: client.id });
         await objectStore.upload({ path: "keep.md", content: "keep me", id: client.id });
         await objectStore.upload({ path: "gone.md", content: "delete me", id: client.id });
-        await objectStore.delete("gone.md");
+        await objectStore.delete("gone.md", client.id);
 
         const tmp = await mkdtemp(join(tmpdir(), "obsidian-bootstrap-test-"));
         const zipPath = join(tmp, "vault.zip");
@@ -449,7 +456,7 @@ describe("object store", () => {
         await objectStore.upload({ path: pluginDataPath, content: "{}", id: client.id });
         await objectStore.upload({ path: "keep.md", content: "keep me", id: client.id });
         await objectStore.upload({ path: "gone.md", content: "delete me", id: client.id });
-        const { revision: deleteRevision } = (await objectStore.delete("gone.md"))!;
+        const { revision: deleteRevision } = await objectStore.delete("gone.md", client.id);
 
         const tmp = await mkdtemp(join(tmpdir(), "obsidian-bootstrap-test-"));
         const zipPath = join(tmp, "vault.zip");

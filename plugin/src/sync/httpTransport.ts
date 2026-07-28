@@ -1,5 +1,5 @@
 import type { RequestUrlParam, RequestUrlResponse } from "obsidian";
-import type { SyncTransport } from "./engine";
+import { PermanentRemoteError, type SyncTransport } from "./engine";
 import type { InboxOp } from "./inbox";
 
 /**
@@ -38,6 +38,12 @@ function parseNdjson(body: string): InboxOp[] {
 }
 
 function assertOk(response: RequestUrlResponse, action: string): void {
+	if (response.status === 413 || response.status === 400) {
+		throw new PermanentRemoteError(
+			`${action} failed with status ${response.status}: ${response.text}`,
+			response.status,
+		);
+	}
 	if (response.status >= 400) {
 		throw new Error(
 			`${action} failed with status ${response.status}: ${response.text}`,

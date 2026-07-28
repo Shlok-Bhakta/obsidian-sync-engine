@@ -96,8 +96,10 @@ export async function applyInbox(
 				} else {
 					await options.applyDelete(line.path);
 				}
-			} catch {
-				return;
+			} catch (error) {
+				// Leave this line and everything after it for the next attempt,
+				// but surface the failure so callers do not report success.
+				throw error;
 			}
 
 			await options.setRevision(line.rev);

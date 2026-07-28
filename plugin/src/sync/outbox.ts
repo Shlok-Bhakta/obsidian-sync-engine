@@ -67,8 +67,10 @@ export async function drain(
 			const op = lines[0]!;
 			try {
 				await handler(op);
-			} catch {
-				return;
+			} catch (error) {
+				// Keep this line and everything after it; rethrow so callers
+				// can report a failed tick instead of silent success.
+				throw error;
 			}
 
 			const current = await readLines<OutboxOp>(fs, outboxPath);
