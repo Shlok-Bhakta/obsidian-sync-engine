@@ -4,7 +4,7 @@ import {
 	TFile,
 	type TAbstractFile,
 } from 'obsidian';
-import type MyPlugin from './main';
+import type ObsidianSyncPlugin from './main';
 import { SyncEngine } from './sync/engine';
 import { HttpTransport } from './sync/httpTransport';
 import { ObsidianFs } from './sync/obsidianFs';
@@ -25,22 +25,22 @@ export type VaultSync = {
 };
 
 /** Directory the plugin's own files (main.js, data.json, ...) live in. */
-function getPluginDir(plugin: MyPlugin): string {
+function getPluginDir(plugin: ObsidianSyncPlugin): string {
 	return normalizePath(
 		plugin.manifest.dir ??
 			`${plugin.app.vault.configDir}/plugins/${plugin.manifest.id}`,
 	);
 }
 
-function getOutboxPath(plugin: MyPlugin): string {
+function getOutboxPath(plugin: ObsidianSyncPlugin): string {
 	return normalizePath(`${getPluginDir(plugin)}/outbox.jsonl`);
 }
 
-function getInboxPath(plugin: MyPlugin): string {
+function getInboxPath(plugin: ObsidianSyncPlugin): string {
 	return normalizePath(`${getPluginDir(plugin)}/inbox.jsonl`);
 }
 
-function getDataJsonPath(plugin: MyPlugin): string {
+function getDataJsonPath(plugin: ObsidianSyncPlugin): string {
 	return normalizePath(`${getPluginDir(plugin)}/data.json`);
 }
 
@@ -49,7 +49,7 @@ function getDataJsonPath(plugin: MyPlugin): string {
  * enqueued for sync themselves, or writing them (to record a sync) would
  * itself trigger another sync, forever.
  */
-function isSyncEngineOwnedPath(plugin: MyPlugin, path: string): boolean {
+function isSyncEngineOwnedPath(plugin: ObsidianSyncPlugin, path: string): boolean {
 	const normalized = normalizePath(path);
 	return (
 		normalized === getOutboxPath(plugin) ||
@@ -58,7 +58,7 @@ function isSyncEngineOwnedPath(plugin: MyPlugin, path: string): boolean {
 	);
 }
 
-function isConfigPath(plugin: MyPlugin, path: string): boolean {
+function isConfigPath(plugin: ObsidianSyncPlugin, path: string): boolean {
 	const normalizedPath = normalizePath(path);
 	const configDir = normalizePath(plugin.app.vault.configDir);
 	return (
@@ -74,7 +74,7 @@ function isConfigPath(plugin: MyPlugin, path: string): boolean {
  * POST.
  */
 function hookAdapterWrites(
-	plugin: MyPlugin,
+	plugin: ObsidianSyncPlugin,
 	enqueuePutIfLocal: (path: string) => void,
 ): void {
 	const adapter = plugin.app.vault.adapter;
@@ -107,7 +107,7 @@ function hookAdapterWrites(
  * events (note modify/create, deletes, config writes) and a periodic tick.
  * Called once from `onload`.
  */
-export function registerVaultSync(plugin: MyPlugin): VaultSync {
+export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
 	const fs = new ObsidianFs(plugin.app.vault.adapter);
 	const outboxPath = getOutboxPath(plugin);
 	const inboxPath = getInboxPath(plugin);
@@ -200,7 +200,7 @@ export function registerVaultSync(plugin: MyPlugin): VaultSync {
 
 /** Enqueues every current vault file (minus the engine's own bookkeeping files) and pushes them out. */
 export async function seedServerFromVault(
-	plugin: MyPlugin,
+	plugin: ObsidianSyncPlugin,
 	sync: VaultSync,
 ): Promise<void> {
 	const files = (await sync.fs.listAllFiles()).filter(

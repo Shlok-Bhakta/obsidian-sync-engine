@@ -1,7 +1,7 @@
 {
-	"name": "obsidian-sample-plugin",
+	"name": "obsidian-sync-engine",
 	"version": "1.0.0",
-	"description": "This is a sample plugin for Obsidian (https://obsidian.md)",
+	"description": "Self-hosted sync engine for your Obsidian vault.",
 	"main": "main.js",
 	"type": "module",
 	"scripts": {

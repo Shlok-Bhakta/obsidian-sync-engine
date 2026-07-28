@@ -9,6 +9,9 @@ on:
 jobs:
     build:
         runs-on: ubuntu-latest
+        defaults:
+            run:
+                working-directory: plugin
 
         strategy:
             matrix:
@@ -22,6 +25,7 @@ jobs:
               with:
                   node-version: ${{ matrix.node-version }}
                   cache: 'npm'
+                  cache-dependency-path: plugin/package-lock.json
             - run: npm ci
             - run: npm run build --if-present
             - run: npm run lint

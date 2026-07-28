@@ -1,8 +1,8 @@
-import { Modal, Notice, Plugin, type WorkspaceLeaf } from 'obsidian';
+import { Notice, Plugin, type WorkspaceLeaf } from 'obsidian';
 import {
 	DEFAULT_SETTINGS,
-	MyPluginSettings,
-	SampleSettingTab,
+	ObsidianSyncSettings,
+	SyncSettingTab,
 } from './settings';
 import { SyncStatusView, SYNC_STATUS_VIEW_TYPE } from './ui/syncStatusView';
 import {
@@ -10,10 +10,9 @@ import {
 	seedServerFromVault,
 	type VaultSync,
 } from './vaultSync';
-// Remember to rename these classes and interfaces!
 
-export default class MyPlugin extends Plugin {
-	settings!: MyPluginSettings;
+export default class ObsidianSyncPlugin extends Plugin {
+	settings!: ObsidianSyncSettings;
 	sync!: VaultSync;
 	private isSeeding = false;
 
@@ -45,14 +44,14 @@ export default class MyPlugin extends Plugin {
 			callback: () => void this.openSyncStatusView(),
 		});
 
-		this.addSettingTab(new SampleSettingTab(this.app, this));
+		this.addSettingTab(new SyncSettingTab(this.app, this));
 	}
 
 	async loadSettings() {
 		this.settings = Object.assign(
 			{},
 			DEFAULT_SETTINGS,
-			(await this.loadData()) as Partial<MyPluginSettings>,
+			(await this.loadData()) as Partial<ObsidianSyncSettings>,
 		);
 	}
 
@@ -92,17 +91,5 @@ export default class MyPlugin extends Plugin {
 
 	private formatError(error: unknown): string {
 		return error instanceof Error ? error.message : String(error);
-	}
-}
-
-class SampleModal extends Modal {
-	onOpen() {
-		const { contentEl } = this;
-		contentEl.setText('Woah!');
-	}
-
-	onClose() {
-		const { contentEl } = this;
-		contentEl.empty();
 	}
 }

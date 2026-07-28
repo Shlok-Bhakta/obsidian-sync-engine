@@ -1,17 +1,17 @@
 import { App, Notice, PluginSettingTab, Setting, requestUrl } from 'obsidian';
-import MyPlugin from './main';
+import ObsidianSyncPlugin from './main';
 import { deserialize, MessageType, serialize } from 'obsidian-sync-protocol';
 
-export interface MyPluginSettings {
+export interface ObsidianSyncSettings {
 	serverUrl: string;
 	clientName: string;
 	clientSecret: string;
 	revision: number;
 }
 
-export const DEFAULT_SETTINGS: MyPluginSettings = {
+export const DEFAULT_SETTINGS: ObsidianSyncSettings = {
 	serverUrl: 'https://...',
-	clientName: 'Main Computer',
+	clientName: 'Main computer',
 	clientSecret: 'Made by server',
 	revision: 0
 };
@@ -24,10 +24,10 @@ const isHttpUrl = (value: string): boolean => {
 	}
 };
 
-export class SampleSettingTab extends PluginSettingTab {
-	plugin: MyPlugin;
+export class SyncSettingTab extends PluginSettingTab {
+	plugin: ObsidianSyncPlugin;
 
-	constructor(app: App, plugin: MyPlugin) {
+	constructor(app: App, plugin: ObsidianSyncPlugin) {
 		super(app, plugin);
 		this.plugin = plugin;
 	}
@@ -37,7 +37,7 @@ export class SampleSettingTab extends PluginSettingTab {
 
 		containerEl.empty();
 		new Setting(containerEl)
-		.setName("Client Name")
+		.setName("Client name")
 		.setDesc("Name that this client is registered as")	
 		.addButton((button) =>
 			button
@@ -49,7 +49,7 @@ export class SampleSettingTab extends PluginSettingTab {
 		)
 		.addText((text) =>
 			text
-				.setPlaceholder('Main Computer')
+				.setPlaceholder('Main computer')
 				.setValue(this.plugin.settings.clientName)
 				.onChange(async (value) => {
 					this.plugin.settings.clientName = value;
@@ -68,7 +68,7 @@ export class SampleSettingTab extends PluginSettingTab {
 			.setDesc(serverUrlDesc)
 			.addText((text) =>
 				text
-					.setPlaceholder('https://...')
+					.setPlaceholder('HTTPS://...')
 					.setValue(this.plugin.settings.serverUrl)
 					.onChange(async (value) => {
 						this.plugin.settings.serverUrl = value;
@@ -90,8 +90,8 @@ export class SampleSettingTab extends PluginSettingTab {
 
 
 		new Setting(containerEl)
-		.setName("Client Secret")
-		.setDesc("DO NOT SHARE THIS WITH ANYONE!!!")			
+		.setName("Client secret")
+		.setDesc("Do not share this with anyone!!!")			
 		.addButton((button) =>
 			button
 				.setIcon('refresh-cw')
@@ -112,7 +112,7 @@ export class SampleSettingTab extends PluginSettingTab {
 		);
 
 		new Setting(containerEl)
-		.setName("Last Synced Revision")
+		.setName("Last synced revision")
 		.setDesc("Last synced revision of the client")
 		.addText((text) =>
 			text
@@ -156,7 +156,7 @@ export class SampleSettingTab extends PluginSettingTab {
 				new Notice('Error refreshing client secret: ' + message.type);
 			}
 		} catch (error) {
-			new Notice('Error refreshing client secret: ' + error);
+			new Notice('Error refreshing client secret: ' + String(error));
 		}
 	}
 
@@ -184,7 +184,7 @@ export class SampleSettingTab extends PluginSettingTab {
 				new Notice('Error refreshing client secret: ' + message.type);
 			}
 		} catch (error) {
-			new Notice('Error refreshing client secret: ' + error);
+			new Notice('Error refreshing client secret: ' + String(error));
 		}
 	}
 

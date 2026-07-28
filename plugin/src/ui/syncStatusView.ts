@@ -1,5 +1,5 @@
 import { ItemView, type WorkspaceLeaf } from 'obsidian';
-import type MyPlugin from '../main';
+import type ObsidianSyncPlugin from '../main';
 import { list as listOutbox } from '../sync/outbox';
 import type { VaultSync } from '../vaultSync';
 
@@ -11,7 +11,7 @@ const TICK_REFRESH_MS = 3000;
 export class SyncStatusView extends ItemView {
 	constructor(
 		leaf: WorkspaceLeaf,
-		private readonly plugin: MyPlugin,
+		private readonly plugin: ObsidianSyncPlugin,
 		private readonly sync: VaultSync,
 	) {
 		super(leaf);

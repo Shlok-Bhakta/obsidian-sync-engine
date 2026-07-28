@@ -1,27 +1,26 @@
 import { deserialize, Message, MessageType, PROTOCOL_VERSION, serialize } from "obsidian-sync-protocol";
-import { MyPluginSettings } from "../settings";
-import MyPlugin from "../main";
+import { ObsidianSyncSettings } from "../settings";
+import ObsidianSyncPlugin from "../main";
 import { Notice } from "obsidian";
 
 export class WebsocketsHelper {
     private ws: WebSocket | null = null;
     private socketUrl: string;
-    constructor(plugin: MyPlugin) {
+    constructor(plugin: ObsidianSyncPlugin) {
         this.socketUrl = plugin.settings.serverUrl.replace('https://', 'wss://').replace('http://', 'ws://') + '/ws?version=' + PROTOCOL_VERSION;
-        this.connect(plugin.settings.clientName, plugin.settings.clientSecret, plugin.settings);
+        void this.connect(plugin.settings.clientName, plugin.settings.clientSecret, plugin.settings);
 
         // routing
 
-        if(this.ws) this.ws.onmessage = (event) => {
-            console.log(event.data);
-            const data = deserialize(event.data.toString());
+        if(this.ws) this.ws.onmessage = (event: MessageEvent<unknown>) => {
+            const raw = typeof event.data === 'string' ? event.data : String(event.data);
+            const data = deserialize(raw);
             switch(data.type){
                 case MessageType.AUTH_INIT:
                     plugin.settings.clientSecret = data.token;
-                    plugin.saveSettings();
+                    void plugin.saveSettings();
                     break;
 				case MessageType.AUTH_SUCCESS:
-					console.log('Authenticated');
 					break;
 				case MessageType.AUTH_FAILED:
 					new Notice(data.reason);
@@ -36,7 +35,7 @@ export class WebsocketsHelper {
         };
 
         if(this.ws) this.ws.onclose = () => {
-			console.log('Disconnected from server');
+			// Disconnected from server.
 		};
 		if(this.ws) this.ws.onerror = (error) => {
 			console.error('Error: ', error);
@@ -45,11 +44,10 @@ export class WebsocketsHelper {
 
     }
 
-    public async connect(clientName: string, clientSecret: string, settings: MyPluginSettings) {
+    public async connect(clientName: string, clientSecret: string, settings: ObsidianSyncSettings) {
         this.ws = new WebSocket(this.socketUrl);
 
 		this.ws.onopen = () => {
-			console.log('Connected to server');
 			if(this.ws){
 				let message: Message = {
 					type: MessageType.AUTH_ACK,
