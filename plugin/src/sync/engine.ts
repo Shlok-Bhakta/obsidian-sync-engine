@@ -5,7 +5,9 @@ import {
 	drain as drainOutbox,
 	enqueue as enqueueOutbox,
 	list as listOutbox,
+	type OutboxOp,
 } from "./outbox";
+import { canonicalizeSyncPath } from "./paths";
 
 export type SyncTransport = {
 	upload(
@@ -14,13 +16,13 @@ export type SyncTransport = {
 	): Promise<{ revision: number }>;
 	deleteRemote(path: string): Promise<{ revision: number }>;
 	download(path: string): Promise<ArrayBuffer>;
-	fetchInbox(rev: number): Promise<InboxOp[]>; // or raw JSONL parse
+	fetchInbox(rev: number): Promise<InboxOp[]>;
 };
 
 export type VaultBlobFs = SyncFs & {
-	readBinary?(path: string): Promise<ArrayBuffer>;
-	writeBinary?(path: string, data: ArrayBuffer): Promise<void>;
-	remove?(path: string): Promise<void>;
+	readBinary(path: string): Promise<ArrayBuffer>;
+	writeBinary(path: string, data: ArrayBuffer): Promise<void>;
+	remove(path: string): Promise<void>;
 	listAllFiles?(): Promise<string[]>;
 };
 
@@ -29,106 +31,151 @@ export type SyncEngineOptions = {
 	transport: SyncTransport;
 	outboxPath: string;
 	inboxPath: string;
+	deadLetterPath?: string;
 	getRevision: () => number | Promise<number>;
 	setRevision: (rev: number) => void | Promise<void>;
-	/** Per-path quiet period before an enqueued change is written to the outbox. Default 1000ms. */
+	/**
+	 * Quiet period before a network drain/tick is scheduled after a local
+	 * change. Durability is NOT delayed — outbox writes happen immediately.
+	 */
 	debounceMs?: number;
+	/** Optional hook invoked when a permanent outbox failure is dead-lettered. */
+	onPermanentFailure?: (failure: PermanentSyncFailure) => void;
 };
+
+export type PermanentSyncFailure = {
+	op: OutboxOp;
+	error: string;
+	status?: number;
+};
+
+/** Discriminated result so callers never treat a failed tick as success. */
+export type SyncTickResult =
+	| { ok: true; pushed: number; applied: number; deadLettered: number }
+	| { ok: false; error: string; pushed: number; applied: number; deadLettered: number };
 
 const DEFAULT_DEBOUNCE_MS = 1000;
 
+export class PermanentRemoteError extends Error {
+	readonly status: number;
+	constructor(message: string, status: number) {
+		super(message);
+		this.name = "PermanentRemoteError";
+		this.status = status;
+	}
+}
+
 /**
  * Minimal two-way sync engine: local edits flow out through the outbox,
- * remote edits flow in through the inbox. No IndexedDB, no background
- * scheduling beyond what the caller drives via `tick()`.
+ * remote edits flow in through the inbox.
  *
- * The revision cursor is a single source of truth for "what have we caught
- * up to" and only ever moves in one place: `applyInbox`'s `setRevision`
- * call, driven from `applyRemoteInbox` below. Pushing a local change via
- * `upload`/`deleteRemote` does NOT move the cursor by itself — the server is
- * expected to hand that same change back to us through `fetchInbox` (a
- * "self-echo"), and it's only once *that* line is processed that the cursor
- * advances past it. `echoRevs` lets us recognize our own echoed lines so we
- * skip re-applying them to the vault while still letting them drive the
- * cursor forward.
+ * Local intent is written to the durable outbox immediately. Debouncing only
+ * coalesces when the network drain runs, not whether the edit survives a
+ * reload. The revision cursor advances only when inbox lines are applied
+ * (including self-echo of our own pushes).
  */
 export class SyncEngine {
 	private readonly fs: VaultBlobFs;
 	private readonly transport: SyncTransport;
 	private readonly outboxPath: string;
 	private readonly inboxPath: string;
+	private readonly deadLetterPath: string;
 	private readonly getRevision: () => number | Promise<number>;
 	private readonly setRevision: (rev: number) => void | Promise<void>;
-	private readonly debouncer: Debouncer<string>;
+	private readonly debouncer: Debouncer<"tick">;
+	private readonly onPermanentFailure?: (failure: PermanentSyncFailure) => void;
 
 	/**
-	 * Paths with a local change that's been enqueued (debouncing or already in
-	 * the outbox) but not yet confirmed pushed. Used to skip clobbering local
-	 * edits with an inbound inbox line for the same path. Kept accurate via
-	 * `refreshPending`, which recomputes membership from the debouncer and
-	 * outbox rather than trusting ad hoc add/delete calls.
+	 * Paths with a local change in the durable outbox (or a write in flight).
+	 * Hydrated from the outbox on start so a restart cannot pull over pending work.
 	 */
 	private readonly pendingOutboxPaths = new Set<string>();
 
-	/** Revisions returned by our own `upload`/`deleteRemote` calls, awaiting self-echo through the inbox. */
+	/** Revisions returned by our own upload/deleteRemote, awaiting self-echo. */
 	private readonly echoRevs = new Set<number>();
 
-	/** Most recently requested op per path, for paths currently debouncing (not yet written to the outbox). Read by `flush`. */
-	private readonly pendingOps = new Map<string, "put" | "delete">();
+	/** Paths with an enqueue currently writing to the outbox. */
+	private readonly enqueueInFlight = new Set<string>();
+
+	private tickInFlight: Promise<SyncTickResult> | null = null;
+	private hydrated = false;
 
 	constructor(options: SyncEngineOptions) {
 		this.fs = options.fs;
 		this.transport = options.transport;
 		this.outboxPath = options.outboxPath;
 		this.inboxPath = options.inboxPath;
+		this.deadLetterPath =
+			options.deadLetterPath ??
+			options.outboxPath.replace(/outbox\.jsonl$/, "dead-letter.jsonl");
 		this.getRevision = options.getRevision;
 		this.setRevision = options.setRevision;
 		this.debouncer = new Debouncer(options.debounceMs ?? DEFAULT_DEBOUNCE_MS);
+		this.onPermanentFailure = options.onPermanentFailure;
 	}
 
-	/** Enqueue a local write, debounced per-path. */
-	enqueuePut(path: string): void {
-		this.scheduleEnqueue(path, "put");
-	}
-
-	/** Enqueue a local delete, debounced per-path. */
-	enqueueDelete(path: string): void {
-		this.scheduleEnqueue(path, "delete");
-	}
-
-	private scheduleEnqueue(path: string, op: "put" | "delete"): void {
-		this.pendingOps.set(path, op);
-		this.debouncer.trigger(path, () => this.flushOne(path));
-		void this.refreshPending(path);
-	}
-
-	private async flushOne(path: string): Promise<void> {
-		const op = this.pendingOps.get(path);
-		if (op === undefined) {
-			return;
+	/** Load durable outbox paths into the conflict guard before the first pull. */
+	async hydrate(): Promise<void> {
+		const ops = await listOutbox(this.fs, this.outboxPath);
+		// Union with anything already marked pending (in-flight enqueue during startup).
+		for (const op of ops) {
+			this.pendingOutboxPaths.add(op.path);
 		}
-		this.pendingOps.delete(path);
-		await enqueueOutbox(this.fs, this.outboxPath, { op, path, ts: Date.now() });
-		await this.refreshPending(path);
+		this.hydrated = true;
+	}
+
+	/** Enqueue a local write — durable immediately, network work debounced. */
+	enqueuePut(path: string): void {
+		void this.enqueueDurable(path, "put");
+	}
+
+	/** Enqueue a local delete — durable immediately, network work debounced. */
+	enqueueDelete(path: string): void {
+		void this.enqueueDurable(path, "delete");
 	}
 
 	/**
-	 * Immediately writes every debounced-but-not-yet-enqueued local change to
-	 * the outbox, as if each one's quiet period had already elapsed. Used
-	 * before a manual seed + tick so bulk-enqueued puts aren't left waiting
-	 * out the debounce window.
+	 * Awaitable enqueue for callers that must know the intent landed on disk
+	 * (seed, unload flush). Still schedules a debounced network tick.
+	 */
+	async enqueueDurable(rawPath: string, op: "put" | "delete"): Promise<void> {
+		const path = canonicalizeSyncPath(rawPath);
+		this.pendingOutboxPaths.add(path);
+		this.enqueueInFlight.add(path);
+		try {
+			await enqueueOutbox(this.fs, this.outboxPath, {
+				op,
+				path,
+				ts: Date.now(),
+			});
+		} finally {
+			this.enqueueInFlight.delete(path);
+			await this.refreshPending(path);
+		}
+		this.scheduleNetworkTick();
+	}
+
+	private scheduleNetworkTick(): void {
+		this.debouncer.trigger("tick", () => {
+			void this.tick();
+		});
+	}
+
+	/**
+	 * Wait for in-flight durable enqueues and run any debounced network tick.
+	 * Used before seed/unload so nothing sits only in memory.
 	 */
 	async flush(): Promise<void> {
+		while (this.enqueueInFlight.size > 0) {
+			await new Promise<void>((resolve) => {
+				setTimeout(resolve, 0);
+			});
+		}
 		await this.debouncer.flush();
 	}
 
-	/**
-	 * Recompute whether `path` should be treated as "locally pending" — i.e.
-	 * still debouncing, or already sitting in the outbox. Call after any
-	 * change that could affect either of those (enqueue, drain).
-	 */
 	private async refreshPending(path: string): Promise<void> {
-		if (this.debouncer.isPending(path)) {
+		if (this.enqueueInFlight.has(path)) {
 			this.pendingOutboxPaths.add(path);
 			return;
 		}
@@ -144,56 +191,120 @@ export class SyncEngine {
 	async seedFromVault(
 		listFiles: () => Promise<string[]> | string[],
 	): Promise<void> {
+		await this.ensureHydrated();
 		const files = await listFiles();
 		for (const path of files) {
-			if (this.pendingOutboxPaths.has(path)) {
-				continue;
-			}
-			this.enqueuePut(path);
+			await this.enqueueDurable(path, "put");
 		}
 	}
 
-	/** One sync round: drain the outbox out, then pull and apply the inbox. */
-	async tick(): Promise<void> {
-		await this.drainOutboxOnce();
-		await this.applyRemoteInbox();
+	/**
+	 * One sync round: drain the outbox out, then pull and apply the inbox.
+	 * Concurrent callers share the same in-flight promise (single-flight).
+	 */
+	async tick(): Promise<SyncTickResult> {
+		if (this.tickInFlight) {
+			return this.tickInFlight;
+		}
+		this.tickInFlight = this.runTick().finally(() => {
+			this.tickInFlight = null;
+		});
+		return this.tickInFlight;
 	}
 
-	private async drainOutboxOnce(): Promise<void> {
+	private async ensureHydrated(): Promise<void> {
+		if (!this.hydrated) {
+			await this.hydrate();
+		}
+	}
+
+	private async runTick(): Promise<SyncTickResult> {
+		let pushed = 0;
+		let applied = 0;
+		let deadLettered = 0;
+		try {
+			await this.ensureHydrated();
+			const drainResult = await this.drainOutboxOnce();
+			pushed = drainResult.pushed;
+			deadLettered = drainResult.deadLettered;
+			applied = await this.applyRemoteInbox();
+			return { ok: true, pushed, applied, deadLettered };
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			return { ok: false, error: message, pushed, applied, deadLettered };
+		}
+	}
+
+	private async drainOutboxOnce(): Promise<{
+		pushed: number;
+		deadLettered: number;
+	}> {
 		const processedPaths = new Set<string>();
+		let pushed = 0;
+		let deadLettered = 0;
+
 		await drainOutbox(this.fs, this.outboxPath, async (op) => {
 			if (op.op === "put" && !(await this.fs.exists(op.path))) {
-				// The file was deleted locally before this put could be pushed
-				// (e.g. a delete queued right behind it). There's nothing to
-				// upload — drop the line without erroring so the delete behind
-				// it isn't blocked from draining on the same tick.
 				processedPaths.add(op.path);
 				return;
 			}
 
-			const result =
-				op.op === "put"
-					? await this.pushPut(op.path)
-					: await this.pushDelete(op.path);
-
-			// Do NOT move the revision cursor here — only applyInbox does that,
-			// once this same change comes back to us through fetchInbox.
-			this.echoRevs.add(result.revision);
-			processedPaths.add(op.path);
+			try {
+				const result =
+					op.op === "put"
+						? await this.pushPut(op.path)
+						: await this.pushDelete(op.path);
+				this.echoRevs.add(result.revision);
+				processedPaths.add(op.path);
+				pushed++;
+			} catch (error) {
+				if (this.isPermanentFailure(error)) {
+					await this.deadLetter(op, error);
+					deadLettered++;
+					processedPaths.add(op.path);
+					return;
+				}
+				throw error;
+			}
 		});
 
-		// The outbox file only reflects post-drain state once `drainOutbox`
-		// (and its internal mutex) has fully returned, so recompute pending
-		// status for touched paths now rather than inside the handler above.
 		for (const path of processedPaths) {
 			await this.refreshPending(path);
 		}
+		return { pushed, deadLettered };
+	}
+
+	private isPermanentFailure(error: unknown): boolean {
+		return error instanceof PermanentRemoteError;
+	}
+
+	private async deadLetter(op: OutboxOp, error: unknown): Promise<void> {
+		const message = error instanceof Error ? error.message : String(error);
+		const status =
+			error instanceof PermanentRemoteError ? error.status : undefined;
+		const failure: PermanentSyncFailure = { op, error: message, status };
+		const existing = (await this.fs.exists(this.deadLetterPath))
+			? await this.fs.read(this.deadLetterPath)
+			: "";
+		const note = JSON.stringify({
+			kind: "dead-letter",
+			op: op.op,
+			path: op.path,
+			originalTs: op.ts,
+			error: message,
+			status: status ?? null,
+			ts: Date.now(),
+		});
+		const base =
+			existing.length === 0 || existing.endsWith("\n")
+				? existing
+				: existing + "\n";
+		await this.fs.write(this.deadLetterPath, base + note + "\n");
+		this.onPermanentFailure?.(failure);
 	}
 
 	private async pushPut(path: string): Promise<{ revision: number }> {
-		const body = this.fs.readBinary
-			? await this.fs.readBinary(path)
-			: await this.fs.read(path);
+		const body = await this.fs.readBinary(path);
 		return this.transport.upload(path, body);
 	}
 
@@ -201,25 +312,31 @@ export class SyncEngine {
 		return this.transport.deleteRemote(path);
 	}
 
-	private async applyRemoteInbox(): Promise<void> {
+	private async applyRemoteInbox(): Promise<number> {
 		const rev = await this.getRevision();
 		const ops = await this.transport.fetchInbox(rev);
 		await appendInbox(this.fs, this.inboxPath, ops);
 
+		let applied = 0;
 		await applyInbox(this.fs, this.inboxPath, {
-			applyPut: (path) => this.applyRemotePut(path),
-			applyDelete: (path) => this.applyRemoteDelete(path),
+			applyPut: async (path) => {
+				await this.applyRemotePut(path);
+				applied++;
+			},
+			applyDelete: async (path) => {
+				await this.applyRemoteDelete(path);
+				applied++;
+			},
 			getRevision: () => this.getRevision(),
 			setRevision: (newRev) => this.setRevision(newRev),
 			shouldSkipApply: (op) => {
-				// Our own change echoed back: consume it from the set so a
-				// legitimately reused revision number later isn't misread.
 				if (this.echoRevs.delete(op.rev)) {
 					return true;
 				}
 				return this.pendingOutboxPaths.has(op.path);
 			},
 		});
+		return applied;
 	}
 
 	private async applyRemotePut(path: string): Promise<void> {
@@ -227,9 +344,8 @@ export class SyncEngine {
 		try {
 			data = await this.transport.download(path);
 		} catch (error) {
-			// Path was deleted (or never existed) by the time we went to fetch
-			// it. Treat as a successful no-op so applyInbox can advance past
-			// this put; a later delete line (if any) still applies normally.
+			// Stale put raced a later delete: treat as success so the inbox
+			// can advance; a later tombstone still applies normally.
 			if (
 				error instanceof Error &&
 				(error.name === "RemoteFileNotFoundError" ||
@@ -239,19 +355,15 @@ export class SyncEngine {
 			}
 			throw error;
 		}
-		if (this.fs.writeBinary) {
-			await this.fs.writeBinary(path, data);
-		} else {
-			await this.fs.write(path, new TextDecoder().decode(data));
-		}
+		await this.fs.writeBinary(path, data);
 	}
 
 	private async applyRemoteDelete(path: string): Promise<void> {
-		if (!this.fs.remove) {
-			throw new Error(
-				`Cannot apply remote delete for "${path}": vault fs has no remove()`,
-			);
-		}
 		await this.fs.remove(path);
+	}
+
+	/** Test/inspection helper: whether a path is treated as locally pending. */
+	isPending(path: string): boolean {
+		return this.pendingOutboxPaths.has(path);
 	}
 }

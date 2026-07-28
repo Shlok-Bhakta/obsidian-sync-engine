@@ -1,6 +1,6 @@
 import { sql } from "bun";
 import migration0001 from "./migrations/0001_init.sql" with { type: "file" };
-// import migration0002 from "./migrations/0002_blob_storage.sql" with { type: "file" };
+import migration0002 from "./migrations/0002_bytea_content.sql" with { type: "file" };
 // import migration0003 from "./migrations/0003_bootstrap_blob_staging.sql" with { type: "file" };
 // import migration0004 from "./migrations/0004_yjs_compaction_index.sql" with { type: "file" };
 // import migration0005 from "./migrations/0005_blob_upload_staging.sql" with { type: "file" };
@@ -15,10 +15,10 @@ const migrationsManifest: Migration[] = [
         name: "0001_init",
         sql: migration0001,
     },
-    // {
-    //     name: "0002_blob_storage",
-    //     sql: migration0002,
-    // },
+    {
+        name: "0002_bytea_content",
+        sql: migration0002,
+    },
     // {
     //     name: "0003_bootstrap_blob_staging",
     //     sql: migration0003,

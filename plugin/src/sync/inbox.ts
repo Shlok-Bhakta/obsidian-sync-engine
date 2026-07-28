@@ -88,16 +88,12 @@ export async function applyInbox(
 				continue;
 			}
 
-			try {
-				if (options.shouldSkipApply?.(line)) {
-					// Leave the vault alone (pending local edit, or our own echo).
-				} else if (line.op === "put") {
-					await options.applyPut(line.path);
-				} else {
-					await options.applyDelete(line.path);
-				}
-			} catch {
-				return;
+			if (options.shouldSkipApply?.(line)) {
+				// Leave the vault alone (pending local edit, or our own echo).
+			} else if (line.op === "put") {
+				await options.applyPut(line.path);
+			} else {
+				await options.applyDelete(line.path);
 			}
 
 			await options.setRevision(line.rev);

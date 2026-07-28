@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { ancestorDirs } from "./paths";
+import { ancestorDirs, canonicalizeSyncPath, InvalidSyncPathError } from "./paths";
 
 describe("ancestorDirs", () => {
 	test("a root-level file has no ancestor directories", () => {
@@ -20,5 +20,35 @@ describe("ancestorDirs", () => {
 
 	test("does not produce empty segments for a leading slash", () => {
 		expect(ancestorDirs("/a/b/c.md")).toEqual(["a", "a/b"]);
+	});
+});
+
+describe("canonicalizeSyncPath", () => {
+	test("leaves an already-normalized path unchanged", () => {
+		expect(canonicalizeSyncPath("a/b/c.md")).toBe("a/b/c.md");
+	});
+
+	test("converts backslashes to forward slashes", () => {
+		expect(canonicalizeSyncPath("a\\b\\c.md")).toBe("a/b/c.md");
+	});
+
+	test("drops duplicate separators and current-directory segments", () => {
+		expect(canonicalizeSyncPath("a//./b/c.md")).toBe("a/b/c.md");
+	});
+
+	test("rejects a parent-directory traversal segment", () => {
+		expect(() => canonicalizeSyncPath("../a.md")).toThrow(InvalidSyncPathError);
+	});
+
+	test("rejects an absolute path", () => {
+		expect(() => canonicalizeSyncPath("/etc/passwd")).toThrow(InvalidSyncPathError);
+	});
+
+	test("rejects a windows drive-letter path", () => {
+		expect(() => canonicalizeSyncPath("C:/Windows/system32")).toThrow(InvalidSyncPathError);
+	});
+
+	test("rejects an empty path", () => {
+		expect(() => canonicalizeSyncPath("")).toThrow(InvalidSyncPathError);
 	});
 });

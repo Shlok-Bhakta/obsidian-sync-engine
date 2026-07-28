@@ -35,8 +35,6 @@ export async function list(fs: SyncFs, outboxPath: string): Promise<OutboxOp[]> 
 	return readLines<OutboxOp>(fs, outboxPath);
 }
 
-export const peekAll = list;
-
 /**
  * Process outbox lines in order via `handler`. Successfully handled lines are
  * removed from the front of the outbox. Processing stops at the first
@@ -65,11 +63,7 @@ export async function drain(
 		let lines = await readLines<OutboxOp>(fs, outboxPath);
 		while (lines.length > 0) {
 			const op = lines[0]!;
-			try {
-				await handler(op);
-			} catch {
-				return;
-			}
+			await handler(op);
 
 			const current = await readLines<OutboxOp>(fs, outboxPath);
 			const head = current[0];

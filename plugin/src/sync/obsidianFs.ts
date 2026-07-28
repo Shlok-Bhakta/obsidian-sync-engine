@@ -12,10 +12,10 @@ export class ObsidianFs implements VaultBlobFs {
 	/**
 	 * Depth counter, >0 while a write/writeBinary/remove call made *through
 	 * this instance* is in flight (including nested/concurrent calls).
-	 * Callers that monkeypatch `adapter.write`/`writeBinary` to detect local
-	 * edits (see vaultSync.ts) check `isWriting` to avoid re-enqueueing a
-	 * write that originated here — e.g. the sync engine applying a remote
-	 * put/delete — which would otherwise loop it straight back out.
+	 * Callers that detect local vault edits check `isWriting` to avoid
+	 * re-enqueueing a write that originated here — e.g. the sync engine
+	 * applying a remote put/delete — which would otherwise loop it straight
+	 * back out.
 	 */
 	private writeDepth = 0;
 

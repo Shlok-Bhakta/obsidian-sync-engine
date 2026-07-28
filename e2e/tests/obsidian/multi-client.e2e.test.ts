@@ -94,7 +94,12 @@ describe("obsidian multi-client e2e", () => {
 
 	test("E2: bootstrap.zip opens as client B at tip with empty first poll", async () => {
 		const zipPath = join(RUN_ROOT, "bootstrap.zip");
-		const res = await fetch(`${stack.serverUrlLocal}/bootstrap.zip`);
+		const denied = await fetch(`${stack.serverUrlLocal}/bootstrap.zip`);
+		expect(denied.status).toBe(401);
+
+		const res = await fetch(`${stack.serverUrlLocal}/bootstrap.zip`, {
+			headers: { Authorization: `Bearer ${stack.bootstrapToken}` },
+		});
 		expect(res.ok).toBe(true);
 		await writeFile(zipPath, Buffer.from(await res.arrayBuffer()));
 
@@ -166,10 +171,16 @@ describe("obsidian multi-client e2e", () => {
 		await clientA.createNote("ToDelete", "temporary");
 		await sleep(1200);
 		await clientA.forceTick();
-		await waitForFile(clientB.vaultPath("ToDelete.md"), {
-			timeoutMs: 60_000,
-		});
-		await clientB.forceTick();
+		await clientA.forceTick();
+		await waitFor(
+			async () => {
+				await clientB.forceTick();
+				return (await Bun.file(clientB.vaultPath("ToDelete.md")).exists())
+					? true
+					: false;
+			},
+			{ timeoutMs: 60_000, intervalMs: 1000, label: "ToDelete.md on B" },
+		);
 
 		await clientA.deleteNote("ToDelete.md");
 		await sleep(1200);

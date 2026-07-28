@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { RequestUrlParam, RequestUrlResponse } from "obsidian";
-import { HttpTransport, type HttpRequestFn } from "./httpTransport";
+import { PermanentRemoteError } from "./engine";
+import { HttpTransport, RemoteFileNotFoundError, type HttpRequestFn } from "./httpTransport";
 
 const SERVER_URL = "https://sync.example.com";
 const SECRET = "obs_sync_test-secret";
@@ -138,7 +139,6 @@ describe("HttpTransport", () => {
 	});
 
 	test("download throws RemoteFileNotFoundError on 404", async () => {
-		const { RemoteFileNotFoundError } = await import("./httpTransport");
 		const { request } = recordingRequest(() =>
 			fakeResponse({ status: 404, text: "Not found" }),
 		);
@@ -152,5 +152,31 @@ describe("HttpTransport", () => {
 		}
 
 		expect(caught).toBeInstanceOf(RemoteFileNotFoundError);
+	});
+
+	test("upload and delete throw PermanentRemoteError on 400/413", async () => {
+		const { request } = recordingRequest((params) => {
+			if (params.method === "POST") {
+				return fakeResponse({ status: 413, text: "Payload too large" });
+			}
+			return fakeResponse({ status: 400, text: "Invalid path" });
+		});
+		const transport = makeTransport(request);
+
+		let uploadError: unknown;
+		try {
+			await transport.upload("a.md", "x");
+		} catch (error) {
+			uploadError = error;
+		}
+		expect(uploadError).toBeInstanceOf(PermanentRemoteError);
+
+		let deleteError: unknown;
+		try {
+			await transport.deleteRemote("a.md");
+		} catch (error) {
+			deleteError = error;
+		}
+		expect(deleteError).toBeInstanceOf(PermanentRemoteError);
 	});
 });

@@ -53,3 +53,16 @@ export const messageSchema = z.discriminatedUnion('type', [
 
 export type Message = z.infer<typeof messageSchema>;
 
+/**
+ * One line of the inbox NDJSON transport (both the wire shape returned by
+ * `GET /inbox` and what the plugin parses it back into). Additive: does not
+ * change `messageSchema`, so it does not require bumping PROTOCOL_VERSION.
+ */
+export const inboxOpSchema = z.object({
+	rev: z.number().finite().nonnegative(),
+	op: z.enum(["put", "delete"]),
+	path: z.string().min(1),
+});
+
+export type InboxOp = z.infer<typeof inboxOpSchema>;
+

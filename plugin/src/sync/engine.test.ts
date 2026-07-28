@@ -2,7 +2,12 @@ import { describe, expect, jest, test } from "bun:test";
 import type { InboxOp } from "./inbox";
 import { readInbox } from "./inbox";
 import { enqueue as enqueueOutbox, list as listOutbox } from "./outbox";
-import { SyncEngine, type SyncTransport, type VaultBlobFs } from "./engine";
+import {
+	PermanentRemoteError,
+	SyncEngine,
+	type SyncTransport,
+	type VaultBlobFs,
+} from "./engine";
 
 const OUTBOX = "outbox.jsonl";
 const INBOX = "inbox.jsonl";
@@ -43,6 +48,23 @@ class MemoryVaultFs implements VaultBlobFs {
 
 	async listAllFiles(): Promise<string[]> {
 		return [...this.files.keys()];
+	}
+}
+
+/** Vault fs whose remove always fails — exercises applyRemoteDelete failure paths. */
+class MemoryVaultFsNoRemove implements VaultBlobFs {
+	private readonly inner = new MemoryVaultFs();
+
+	read = this.inner.read.bind(this.inner);
+	write = this.inner.write.bind(this.inner);
+	exists = this.inner.exists.bind(this.inner);
+	mkdir = this.inner.mkdir.bind(this.inner);
+	readBinary = this.inner.readBinary.bind(this.inner);
+	writeBinary = this.inner.writeBinary.bind(this.inner);
+	listAllFiles = this.inner.listAllFiles.bind(this.inner);
+
+	async remove(path: string): Promise<void> {
+		throw new Error(`remove not supported for ${path}`);
 	}
 }
 
@@ -87,7 +109,14 @@ class FakeTransport implements SyncTransport {
 
 	async download(path: string): Promise<ArrayBuffer> {
 		this.calls.push("download");
-		const content = this.remoteFiles.get(path) ?? "";
+		const content = this.remoteFiles.get(path);
+		if (content === undefined) {
+			const err = new Error(
+				`Download of "${path}" failed with status 404: Not found`,
+			);
+			err.name = "RemoteFileNotFoundError";
+			throw err;
+		}
 		return new TextEncoder().encode(content).buffer;
 	}
 
@@ -225,159 +254,111 @@ describe("SyncEngine", () => {
 		expect(transport.calls).toEqual(["upload", "fetchInbox"]);
 	});
 
-	test("enqueuePut debounces rapid calls into a single outbox entry", async () => {
-		jest.useFakeTimers();
-		try {
-			const fs = new MemoryVaultFs();
-			await fs.write("a.md", "v1");
-			const transport = new FakeTransport();
-			const revision = makeRevisionStore(0);
-			const engine = new SyncEngine({
-				fs,
-				transport,
-				outboxPath: OUTBOX,
-				inboxPath: INBOX,
-				getRevision: revision.get,
-				setRevision: revision.set,
-			});
+	test("enqueuePut writes to the outbox immediately and coalesces rapid calls", async () => {
+		const fs = new MemoryVaultFs();
+		await fs.write("a.md", "v1");
+		const transport = new FakeTransport();
+		const revision = makeRevisionStore(0);
+		const engine = new SyncEngine({
+			fs,
+			transport,
+			outboxPath: OUTBOX,
+			inboxPath: INBOX,
+			getRevision: revision.get,
+			setRevision: revision.set,
+		});
 
-			engine.enqueuePut("a.md");
-			jest.advanceTimersByTime(400);
-			engine.enqueuePut("a.md");
-			jest.advanceTimersByTime(400);
-			engine.enqueuePut("a.md");
+		engine.enqueuePut("a.md");
+		engine.enqueuePut("a.md");
+		engine.enqueuePut("a.md");
+		await flushMicrotasks();
 
-			jest.advanceTimersByTime(999);
-			await flushMicrotasks();
-			expect(await listOutbox(fs, OUTBOX)).toEqual([]);
-
-			jest.advanceTimersByTime(1);
-			await flushMicrotasks();
-
-			const ops = await listOutbox(fs, OUTBOX);
-			expect(ops.length).toBe(1);
-			expect(ops[0]).toMatchObject({ op: "put", path: "a.md" });
-		} finally {
-			jest.useRealTimers();
-		}
+		const ops = await listOutbox(fs, OUTBOX);
+		expect(ops.length).toBe(1);
+		expect(ops[0]).toMatchObject({ op: "put", path: "a.md" });
 	});
 
 	test("seedFromVault enqueues a put for every file", async () => {
-		jest.useFakeTimers();
-		try {
-			const fs = new MemoryVaultFs();
-			await fs.write("a.md", "a");
-			await fs.write("b.md", "b");
-			const transport = new FakeTransport();
-			const revision = makeRevisionStore(0);
-			const engine = new SyncEngine({
-				fs,
-				transport,
-				outboxPath: OUTBOX,
-				inboxPath: INBOX,
-				getRevision: revision.get,
-				setRevision: revision.set,
-				debounceMs: 0,
-			});
+		const fs = new MemoryVaultFs();
+		await fs.write("a.md", "a");
+		await fs.write("b.md", "b");
+		const transport = new FakeTransport();
+		const revision = makeRevisionStore(0);
+		const engine = new SyncEngine({
+			fs,
+			transport,
+			outboxPath: OUTBOX,
+			inboxPath: INBOX,
+			getRevision: revision.get,
+			setRevision: revision.set,
+			debounceMs: 0,
+		});
 
-			await engine.seedFromVault(() => fs.listAllFiles());
-			jest.advanceTimersByTime(0);
-			await flushMicrotasks();
+		await engine.seedFromVault(() => fs.listAllFiles());
+		await flushMicrotasks();
 
-			const ops = await listOutbox(fs, OUTBOX);
-			expect(ops.map((op) => op.path).sort()).toEqual(["a.md", "b.md"]);
-			expect(ops.every((op) => op.op === "put")).toBe(true);
-		} finally {
-			jest.useRealTimers();
-		}
+		const ops = await listOutbox(fs, OUTBOX);
+		expect(ops.map((op) => op.path).sort()).toEqual(["a.md", "b.md"]);
+		expect(ops.every((op) => op.op === "put")).toBe(true);
 	});
 
-	test("seedFromVault skips a path already pending, so it doesn't reset that path's debounce timer", async () => {
-		jest.useFakeTimers();
-		try {
-			const fs = new MemoryVaultFs();
-			await fs.write("a.md", "a");
-			await fs.write("b.md", "b");
-			const transport = new FakeTransport();
-			const revision = makeRevisionStore(0);
-			const engine = new SyncEngine({
-				fs,
-				transport,
-				outboxPath: OUTBOX,
-				inboxPath: INBOX,
-				getRevision: revision.get,
-				setRevision: revision.set,
-				debounceMs: 1000,
-			});
+	test("seedFromVault coalesces with a path already in the outbox", async () => {
+		const fs = new MemoryVaultFs();
+		await fs.write("a.md", "a");
+		await fs.write("b.md", "b");
+		const transport = new FakeTransport();
+		const revision = makeRevisionStore(0);
+		const engine = new SyncEngine({
+			fs,
+			transport,
+			outboxPath: OUTBOX,
+			inboxPath: INBOX,
+			getRevision: revision.get,
+			setRevision: revision.set,
+			debounceMs: 0,
+		});
 
-			// a.md already has a local edit debouncing, started at t=0.
-			engine.enqueuePut("a.md");
-			await flushMicrotasks();
+		engine.enqueuePut("a.md");
+		await flushMicrotasks();
 
-			jest.advanceTimersByTime(900); // t=900, not fired yet.
+		await engine.seedFromVault(async () => ["a.md", "b.md"]);
+		await flushMicrotasks();
 
-			// If seedFromVault didn't skip already-pending paths, this would
-			// call enqueuePut("a.md") again and push its deadline out to t=1900.
-			await engine.seedFromVault(() => fs.listAllFiles());
-			await flushMicrotasks();
-
-			jest.advanceTimersByTime(100); // t=1000: a.md's original timer, if untouched, fires now.
-			await flushMicrotasks();
-
-			const ops = await listOutbox(fs, OUTBOX);
-			// a.md's original debounce fired on schedule (not reset by seeding);
-			// b.md was newly seeded and is still debouncing at t=1000.
-			expect(ops.map((op) => op.path)).toEqual(["a.md"]);
-		} finally {
-			jest.useRealTimers();
-		}
+		const ops = await listOutbox(fs, OUTBOX);
+		expect(ops.map((op) => op.path).sort()).toEqual(["a.md", "b.md"]);
+		expect(ops.filter((op) => op.path === "a.md").length).toBe(1);
 	});
 
-	test("pendingOutboxPaths stays true after draining an older put if a newer edit is still debouncing", async () => {
-		jest.useFakeTimers();
-		try {
-			const fs = new MemoryVaultFs();
-			await fs.write("a.md", "local-v2");
-			const transport = new FakeTransport();
-			const revision = makeRevisionStore(0);
-			const engine = new SyncEngine({
-				fs,
-				transport,
-				outboxPath: OUTBOX,
-				inboxPath: INBOX,
-				getRevision: revision.get,
-				setRevision: revision.set,
-				debounceMs: 1000,
-			});
+	test("pendingOutboxPaths stays true while a newer edit is still in the outbox", async () => {
+		const fs = new MemoryVaultFs();
+		await fs.write("a.md", "local-v2");
+		const transport = new FakeTransport();
+		const revision = makeRevisionStore(0);
+		const engine = new SyncEngine({
+			fs,
+			transport,
+			outboxPath: OUTBOX,
+			inboxPath: INBOX,
+			getRevision: revision.get,
+			setRevision: revision.set,
+			debounceMs: 0,
+		});
 
-			// An older put for a.md is already sitting in the outbox, as if
-			// flushed earlier.
-			await enqueueOutbox(fs, OUTBOX, { op: "put", path: "a.md", ts: 1 });
-			// A newer local edit for the same path starts debouncing — it has
-			// NOT reached the outbox yet.
-			engine.enqueuePut("a.md");
-			await flushMicrotasks();
+		await enqueueOutbox(fs, OUTBOX, { op: "put", path: "a.md", ts: 1 });
+		engine.enqueuePut("a.md");
+		await flushMicrotasks();
 
-			// A concurrent remote push for the same path lands in the shared log.
-			transport.simulateRemoteOp("put", "a.md", "remote-should-not-land");
+		transport.simulateRemoteOp("put", "a.md", "remote-should-not-land");
 
-			// Drains the older queued put (the debounced edit still hasn't fired).
-			await engine.tick();
+		await engine.hydrate();
+		expect(engine.isPending("a.md")).toBe(true);
 
-			// The debounce timer for the newer edit is still pending, so a.md
-			// must still be treated as locally-pending: both the concurrent
-			// remote write AND our own echo for this path are skipped, and the
-			// local (unsynced) content is left alone.
-			expect(await fs.read("a.md")).toBe("local-v2");
+		await engine.tick();
 
-			jest.advanceTimersByTime(1000);
-			await flushMicrotasks();
-		} finally {
-			jest.useRealTimers();
-		}
+		expect(await fs.read("a.md")).toBe("local-v2");
 	});
 
-	test("flush writes debounced puts to the outbox immediately, without waiting out the debounce window", async () => {
+	test("flush runs a debounced network tick without waiting out the debounce window", async () => {
 		jest.useFakeTimers();
 		try {
 			const fs = new MemoryVaultFs();
@@ -397,19 +378,23 @@ describe("SyncEngine", () => {
 
 			engine.enqueuePut("a.md");
 			engine.enqueuePut("b.md");
+			await flushMicrotasks();
 
-			// Nothing should be in the outbox yet — both are still debouncing.
-			expect(await listOutbox(fs, OUTBOX)).toEqual([]);
+			expect(await listOutbox(fs, OUTBOX)).toHaveLength(2);
+			expect(transport.uploads).toEqual([]);
 
 			await engine.flush();
+			await flushMicrotasks(50);
 
-			const ops = await listOutbox(fs, OUTBOX);
-			expect(ops.map((op) => op.path).sort()).toEqual(["a.md", "b.md"]);
+			expect(transport.uploads.map((u) => u.path).sort()).toEqual([
+				"a.md",
+				"b.md",
+			]);
+			expect(await listOutbox(fs, OUTBOX)).toEqual([]);
 
-			// The original timers must be defused, not just raced ahead of.
 			jest.advanceTimersByTime(5000);
 			await flushMicrotasks();
-			expect((await listOutbox(fs, OUTBOX)).length).toBe(2);
+			expect(transport.uploads.length).toBe(2);
 		} finally {
 			jest.useRealTimers();
 		}
@@ -495,16 +480,14 @@ describe("SyncEngine", () => {
 		expect(await listOutbox(fs, OUTBOX)).toEqual([]);
 	});
 
-	test("a remote delete throws when fs.remove is missing, stopping the apply and keeping the inbox line", async () => {
-		const fs = new MemoryVaultFs();
-		const vaultFs: VaultBlobFs = fs;
-		vaultFs.remove = undefined;
+	test("a remote delete returns ok:false when fs.remove is missing", async () => {
+		const fs = new MemoryVaultFsNoRemove();
 		const transport = new FakeTransport();
 		transport.simulateRemoteOp("delete", "gone.md");
 		const revision = makeRevisionStore(0);
 
 		const engine = new SyncEngine({
-			fs: vaultFs,
+			fs,
 			transport,
 			outboxPath: OUTBOX,
 			inboxPath: INBOX,
@@ -513,8 +496,9 @@ describe("SyncEngine", () => {
 			debounceMs: 0,
 		});
 
-		await engine.tick();
+		const result = await engine.tick();
 
+		expect(result.ok).toBe(false);
 		expect(revision.get()).toBe(0);
 		expect(await readInbox(fs, INBOX)).toEqual([
 			{ rev: 1, op: "delete", path: "gone.md" },
@@ -548,5 +532,143 @@ describe("SyncEngine", () => {
 		expect(revision.get()).toBe(1);
 		expect(await readInbox(fs, INBOX)).toEqual([]);
 		expect(await fs.exists("race.md")).toBe(false);
+	});
+
+	test("hydrate loads pending paths from the outbox before the first pull", async () => {
+		const fs = new MemoryVaultFs();
+		await fs.write("local.md", "mine");
+		const transport = new FakeTransport();
+		transport.simulateRemoteOp("put", "local.md", "remote-wins-if-not-pending");
+		const revision = makeRevisionStore(0);
+
+		await enqueueOutbox(fs, OUTBOX, { op: "put", path: "local.md", ts: 1 });
+
+		const engine = new SyncEngine({
+			fs,
+			transport,
+			outboxPath: OUTBOX,
+			inboxPath: INBOX,
+			getRevision: revision.get,
+			setRevision: revision.set,
+			debounceMs: 0,
+		});
+
+		await engine.hydrate();
+		expect(engine.isPending("local.md")).toBe(true);
+
+		await engine.tick();
+
+		expect(await fs.read("local.md")).toBe("mine");
+		expect(transport.uploads.some((u) => u.path === "local.md")).toBe(true);
+	});
+
+	test("tick is single-flight — concurrent callers share one run", async () => {
+		const fs = new MemoryVaultFs();
+		await fs.write("a.md", "a");
+		const transport = new FakeTransport();
+		const revision = makeRevisionStore(0);
+
+		await enqueueOutbox(fs, OUTBOX, { op: "put", path: "a.md", ts: 1 });
+
+		const engine = new SyncEngine({
+			fs,
+			transport,
+			outboxPath: OUTBOX,
+			inboxPath: INBOX,
+			getRevision: revision.get,
+			setRevision: revision.set,
+			debounceMs: 0,
+		});
+
+		let releaseUpload!: () => void;
+		const uploadGate = new Promise<void>((resolve) => {
+			releaseUpload = resolve;
+		});
+		const originalUpload = transport.upload.bind(transport);
+		transport.upload = async (path, body) => {
+			await uploadGate;
+			return originalUpload(path, body);
+		};
+
+		try {
+			const first = engine.tick();
+			const second = engine.tick();
+			await flushMicrotasks();
+			releaseUpload();
+			const [r1, r2] = await Promise.all([first, second]);
+			expect(r1).toEqual(r2);
+			expect(r1.ok).toBe(true);
+			expect(transport.uploads.length).toBe(1);
+		} finally {
+			releaseUpload();
+		}
+	});
+
+	test("dead-lettering a permanent 413 failure does not block later outbox ops", async () => {
+		const fs = new MemoryVaultFs();
+		await fs.write("big.md", "too big");
+		await fs.write("ok.md", "fine");
+		const transport = new FakeTransport();
+		const revision = makeRevisionStore(0);
+		const deadLetterPath = "dead-letter.jsonl";
+
+		await enqueueOutbox(fs, OUTBOX, { op: "put", path: "big.md", ts: 1 });
+		await enqueueOutbox(fs, OUTBOX, { op: "put", path: "ok.md", ts: 2 });
+
+		const originalUpload = transport.upload.bind(transport);
+		transport.upload = async (path, body) => {
+			if (path === "big.md") {
+				throw new PermanentRemoteError("Payload too large", 413);
+			}
+			return originalUpload(path, body);
+		};
+
+		const engine = new SyncEngine({
+			fs,
+			transport,
+			outboxPath: OUTBOX,
+			inboxPath: INBOX,
+			deadLetterPath,
+			getRevision: revision.get,
+			setRevision: revision.set,
+			debounceMs: 0,
+		});
+
+		const result = await engine.tick();
+
+		expect(result.ok).toBe(true);
+		expect(result.deadLettered).toBe(1);
+		expect(result.pushed).toBe(1);
+		expect(await listOutbox(fs, OUTBOX)).toEqual([]);
+		expect(transport.uploads.some((u) => u.path === "ok.md")).toBe(true);
+		expect(await fs.exists(deadLetterPath)).toBe(true);
+	});
+
+	test("deleteRemote for a never-uploaded path still succeeds via transport", async () => {
+		const fs = new MemoryVaultFs();
+		const transport = new FakeTransport();
+		const revision = makeRevisionStore(0);
+
+		await enqueueOutbox(fs, OUTBOX, {
+			op: "delete",
+			path: "never-uploaded.md",
+			ts: 1,
+		});
+
+		const engine = new SyncEngine({
+			fs,
+			transport,
+			outboxPath: OUTBOX,
+			inboxPath: INBOX,
+			getRevision: revision.get,
+			setRevision: revision.set,
+			debounceMs: 0,
+		});
+
+		const result = await engine.tick();
+
+		expect(result.ok).toBe(true);
+		expect(transport.deletes).toEqual(["never-uploaded.md"]);
+		expect(await listOutbox(fs, OUTBOX)).toEqual([]);
 	});
 });

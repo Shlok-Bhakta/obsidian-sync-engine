@@ -1,3 +1,9 @@
+/**
+ * Deferred: WebSocket transport will be used for the second iteration of sync
+ * (live push / lower latency). The MVP product path is HTTP polling only.
+ * Keep this module for the follow-up; do not wire it into the live server entry
+ * until that iteration.
+ */
 import { upgradeWebSocket } from 'hono/bun';
 import { Context, Hono, Next } from 'hono';
 import { auth } from '../auth/auth';
@@ -70,6 +76,7 @@ const wsUpgradeHandler = upgradeWebSocket((_c) => {
 	};
 });
 
+/** Not registered by the MVP server entrypoint. Call from a later iteration. */
 export function registerWebSocketRoutes(app: Hono) {
 	app.get('/ws', wsVersionMiddleware, wsUpgradeHandler);
 }

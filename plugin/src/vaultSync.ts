@@ -51,60 +51,30 @@ function getDataJsonPath(plugin: ObsidianSyncPlugin): string {
  */
 function isSyncEngineOwnedPath(plugin: ObsidianSyncPlugin, path: string): boolean {
 	const normalized = normalizePath(path);
-	return (
+	const pluginDir = getPluginDir(plugin);
+	if (
 		normalized === getOutboxPath(plugin) ||
 		normalized === getInboxPath(plugin) ||
 		normalized === getDataJsonPath(plugin)
-	);
-}
-
-function isConfigPath(plugin: ObsidianSyncPlugin, path: string): boolean {
-	const normalizedPath = normalizePath(path);
-	const configDir = normalizePath(plugin.app.vault.configDir);
-	return (
-		normalizedPath === configDir || normalizedPath.startsWith(`${configDir}/`)
-	);
-}
-
-/**
- * Wraps `adapter.write`/`writeBinary` so that config-directory writes (theme
- * files, other plugins' settings, etc.) flow into the sync engine the same
- * way vault note edits do. Mirrors the plugin's previous direct-upload
- * behavior, just routed through `engine.enqueuePut` instead of a bespoke
- * POST.
- */
-function hookAdapterWrites(
-	plugin: ObsidianSyncPlugin,
-	enqueuePutIfLocal: (path: string) => void,
-): void {
-	const adapter = plugin.app.vault.adapter;
-	const write = adapter.write.bind(adapter);
-	const writeBinary = adapter.writeBinary.bind(adapter);
-
-	const maybeEnqueue = (path: string) => {
-		if (isConfigPath(plugin, path)) {
-			enqueuePutIfLocal(path);
-		}
-	};
-
-	adapter.write = async (path, data, options) => {
-		await write(path, data, options);
-		maybeEnqueue(path);
-	};
-	adapter.writeBinary = async (path, data, options) => {
-		await writeBinary(path, data, options);
-		maybeEnqueue(path);
-	};
-
-	plugin.register(() => {
-		adapter.write = write;
-		adapter.writeBinary = writeBinary;
-	});
+	) {
+		return true;
+	}
+	// Queue sidecars written during recovery / dead-lettering.
+	if (
+		normalized.startsWith(`${pluginDir}/`) &&
+		(normalized.endsWith(".jsonl") ||
+			normalized.endsWith(".jsonl.corrupt") ||
+			normalized.endsWith(".jsonl.tmp") ||
+			normalized.endsWith("dead-letter.jsonl"))
+	) {
+		return true;
+	}
+	return false;
 }
 
 /**
  * Builds the SyncEngine for this plugin instance and wires it up to vault
- * events (note modify/create, deletes, config writes) and a periodic tick.
+ * events (note modify/create, delete, rename) and a periodic tick.
  * Called once from `onload`.
  */
 export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
@@ -177,21 +147,31 @@ export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
 			}
 		}),
 	);
+	plugin.registerEvent(
+		plugin.app.vault.on('rename', (file: TAbstractFile, oldPath: string) => {
+			if (file instanceof TFile) {
+				enqueueDeleteIfLocal(oldPath);
+				enqueuePutIfLocal(file.path);
+			}
+		}),
+	);
 
-	hookAdapterWrites(plugin, enqueuePutIfLocal);
+	void engine.hydrate();
+
+	plugin.register(() => {
+		void engine.flush();
+	});
 
 	plugin.registerInterval(
 		window.setInterval(() => {
-			void engine.tick().then(
-				() => {
-					status.lastTickAt = Date.now();
+			void engine.tick().then((result) => {
+				status.lastTickAt = Date.now();
+				if (result.ok) {
 					status.lastError = null;
-				},
-				(error: unknown) => {
-					status.lastError =
-						error instanceof Error ? error.message : String(error);
-				},
-			);
+				} else {
+					status.lastError = result.error;
+				}
+			});
 		}, TICK_INTERVAL_MS),
 	);
 
@@ -207,8 +187,6 @@ export async function seedServerFromVault(
 		(path) => !isSyncEngineOwnedPath(plugin, path),
 	);
 	await sync.engine.seedFromVault(() => files);
-	// Bulk-seeded puts would otherwise sit out the debounce window; flush them
-	// straight to the outbox so the immediately-following tick actually pushes them.
 	await sync.engine.flush();
 	await sync.engine.tick();
 }
