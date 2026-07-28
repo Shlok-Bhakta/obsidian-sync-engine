@@ -259,6 +259,26 @@ describe("object store", () => {
             await rm(tmp, { recursive: true, force: true });
         }
     });
+    it("bootstraps successfully when plugin data.json was never seeded", async () => {
+        const client = await createClientFixture({ client_name: "alice" });
+        const objectStore = new ObjectStore();
+        await objectStore.upload({ path: "note.md", content: "hello", id: client.id });
+
+        const tmp = await mkdtemp(join(tmpdir(), "obsidian-bootstrap-test-"));
+        const zipPath = join(tmp, "vault.zip");
+        try {
+            await objectStore.bootstrap_zip_create(zipPath);
+            const extractDir = join(tmp, "extracted");
+            await $`unzip -qq ${zipPath} -d ${extractDir}`;
+            const settings = await Bun.file(
+                join(extractDir, ".obsidian/plugins/obsidian-sync-engine/data.json"),
+            ).json() as Record<string, unknown>;
+            expect(settings.revision).toBe(1);
+            expect(typeof settings.clientSecret).toBe("string");
+        } finally {
+            await rm(tmp, { recursive: true, force: true });
+        }
+    });
     it("rejects a path traversal attempt on upload with 400", async () => {
         const client = await createClientFixture({ client_name: "alice" });
         const app = createTestApp();

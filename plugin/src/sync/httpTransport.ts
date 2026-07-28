@@ -19,6 +19,16 @@ export type HttpTransportOptions = {
 	request: HttpRequestFn;
 };
 
+/** Thrown when GET /files returns 404 (missing or soft-deleted). */
+export class RemoteFileNotFoundError extends Error {
+	readonly path: string;
+	constructor(path: string) {
+		super(`Remote file not found: ${path}`);
+		this.name = "RemoteFileNotFoundError";
+		this.path = path;
+	}
+}
+
 /** Split an NDJSON response body into parsed inbox lines. */
 function parseNdjson(body: string): InboxOp[] {
 	return body
@@ -84,6 +94,9 @@ export class HttpTransport implements SyncTransport {
 			headers: { Authorization: this.getAuthorization() },
 			throw: false,
 		});
+		if (response.status === 404) {
+			throw new RemoteFileNotFoundError(path);
+		}
 		assertOk(response, `Download of "${path}"`);
 		return response.arrayBuffer;
 	}

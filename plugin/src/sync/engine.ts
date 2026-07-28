@@ -223,7 +223,22 @@ export class SyncEngine {
 	}
 
 	private async applyRemotePut(path: string): Promise<void> {
-		const data = await this.transport.download(path);
+		let data: ArrayBuffer;
+		try {
+			data = await this.transport.download(path);
+		} catch (error) {
+			// Path was deleted (or never existed) by the time we went to fetch
+			// it. Treat as a successful no-op so applyInbox can advance past
+			// this put; a later delete line (if any) still applies normally.
+			if (
+				error instanceof Error &&
+				(error.name === "RemoteFileNotFoundError" ||
+					/\b404\b/.test(error.message))
+			) {
+				return;
+			}
+			throw error;
+		}
 		if (this.fs.writeBinary) {
 			await this.fs.writeBinary(path, data);
 		} else {

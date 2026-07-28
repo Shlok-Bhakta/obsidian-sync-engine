@@ -16,25 +16,20 @@ export type AuthResult = {
 }
 export async function auth(clientName: string, clientSecret: string): Promise<AuthResult> {
     // check if any client exists if not make one
-    const client_count = await sql`SELECT * FROM clients`.values();
-    console.log(clientSecret);
-    console.log(client_count);
-    if(client_count.count > 0){
-        console.log('client exists');
-        return { 
-            authenticated: await checkClientExists(clientName, clientSecret), 
-            token: null 
+    const clients = await sql`SELECT id FROM clients`;
+    if (clients.length > 0) {
+        return {
+            authenticated: await checkClientExists(clientName, clientSecret),
+            token: null,
         };
-    }else{
-        console.log('client does not exist');
-        const new_client_secret = await createClient(clientName);
-        console.log(new_client_secret);
-        return { authenticated: true, token: new_client_secret };
     }
+
+    const new_client_secret = await createClient(clientName);
+    return { authenticated: true, token: new_client_secret };
 }
 
 export async function checkClientExists(clientName: string, clientSecret: string) {
-    const client_info = await sql`SELECT * FROM clients WHERE client_name = ${clientName} AND client_secret = ${clientSecret}`.values();
+    const client_info = await sql`SELECT id FROM clients WHERE client_name = ${clientName} AND client_secret = ${clientSecret}`;
     return client_info.length > 0;
 }
 export async function createClient(clientName: string) {
@@ -53,12 +48,11 @@ export async function resetClientName(clientName: string, token: string): Promis
 }
 
 export async function getClientIdFromAuthorization(authorization: string): Promise<string> {
-    const client = await sql`SELECT id FROM clients WHERE client_secret = ${authorization}`.values();
-	console.log("client", client, client.length);
+    const client = await sql`SELECT id FROM clients WHERE client_secret = ${authorization}`;
 	if (client.length === 0) {
 		throw new Error("Invalid authorization");
-	}    
-	return client[0][0]; // this is dumb TODO: fix this to be typesafe or smth
+	}
+	return client[0].id as string;
 }
 
 function errorMessage(reason: string): Message {
@@ -89,6 +83,32 @@ function withMessage<T extends MessageType>(
 }
 
 export function registerAuthRoutes(app: Hono) {
+	// First-client / reconnect handshake formerly only available over the
+	// websocket. HTTP sync clients need the same entrypoint so B1 seed can
+	// obtain a real clientSecret without opening a socket.
+	app.post('/auth', withMessage(MessageType.AUTH_ACK, async (c, data) => {
+		const authResult = await auth(data.client_name, data.token);
+
+		if (!authResult.authenticated) {
+			return c.json(serialize({
+				type: MessageType.AUTH_FAILED,
+				reason: 'Invalid credentials',
+			}), 401);
+		}
+
+		if (authResult.token) {
+			return c.json(serialize({
+				type: MessageType.AUTH_INIT,
+				client_name: data.client_name,
+				token: authResult.token,
+			}), 200);
+		}
+
+		return c.json(serialize({
+			type: MessageType.AUTH_SUCCESS,
+		}), 200);
+	}));
+
 	app.post('/reset-client-secret', withMessage(MessageType.AUTH_ACK, async (c, data) => {
 		const authResult = await checkClientExists(data.client_name, data.token);
 

@@ -18,6 +18,8 @@ registerWebSocketRoutes(app);
 registerObjectStoreRoutes(app);
 
 export default {
+  port: Number(process.env.PORT ?? 3000),
+  hostname: process.env.HOST ?? "0.0.0.0",
   fetch: app.fetch,
   websocket,
   maxRequestBodySize: 1024 * 1024 * 10, // 10MB

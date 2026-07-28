@@ -27,3 +27,6 @@ db_data
 logfile
 mprocs.log
 object-data
+
+# e2e runtime artifacts
+e2e/.run/

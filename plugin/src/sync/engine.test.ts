@@ -520,4 +520,33 @@ describe("SyncEngine", () => {
 			{ rev: 1, op: "delete", path: "gone.md" },
 		]);
 	});
+
+	test("a remote put whose download 404s is skipped so apply can advance", async () => {
+		const fs = new MemoryVaultFs();
+		const transport = new FakeTransport();
+		// Simulate inbox put for a path that is already gone on the server.
+		transport.log.push({ rev: 1, op: "put", path: "race.md" });
+		transport.download = async () => {
+			const err = new Error("Download of \"race.md\" failed with status 404: Not found");
+			err.name = "RemoteFileNotFoundError";
+			throw err;
+		};
+		const revision = makeRevisionStore(0);
+
+		const engine = new SyncEngine({
+			fs,
+			transport,
+			outboxPath: OUTBOX,
+			inboxPath: INBOX,
+			getRevision: revision.get,
+			setRevision: revision.set,
+			debounceMs: 0,
+		});
+
+		await engine.tick();
+
+		expect(revision.get()).toBe(1);
+		expect(await readInbox(fs, INBOX)).toEqual([]);
+		expect(await fs.exists("race.md")).toBe(false);
+	});
 });

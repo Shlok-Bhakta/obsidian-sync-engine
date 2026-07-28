@@ -1,4 +1,5 @@
 import { Notice, Plugin, type WorkspaceLeaf } from 'obsidian';
+import { ensureAuthenticated } from './auth';
 import {
 	DEFAULT_SETTINGS,
 	ObsidianSyncSettings,
@@ -43,8 +44,21 @@ export default class ObsidianSyncPlugin extends Plugin {
 			name: 'Open sync status',
 			callback: () => void this.openSyncStatusView(),
 		});
+		this.addCommand({
+			id: 'authenticate-with-server',
+			name: 'Authenticate with server',
+			callback: () => void this.authenticate(),
+		});
 
 		this.addSettingTab(new SyncSettingTab(this.app, this));
+
+		// Best-effort: obtain / verify credentials once the plugin is up so a
+		// fresh install does not sit on the placeholder secret forever.
+		if (this.settings.serverUrl && !this.settings.serverUrl.includes('...')) {
+			void this.authenticate().catch((error) => {
+				console.warn('Initial auth failed', error);
+			});
+		}
 	}
 
 	async loadSettings() {
@@ -59,6 +73,17 @@ export default class ObsidianSyncPlugin extends Plugin {
 		await this.saveData(this.settings);
 	}
 
+	async authenticate(): Promise<void> {
+		try {
+			await ensureAuthenticated(this);
+			new Notice('Authenticated with sync server');
+		} catch (error) {
+			console.error('Authentication failed', error);
+			new Notice('Authentication failed: ' + this.formatError(error));
+			throw error;
+		}
+	}
+
 	/** Enqueues every file currently in the vault and pushes them out. Used for first-time bootstrap. */
 	async seedFromVault(): Promise<void> {
 		if (this.isSeeding) {
@@ -69,11 +94,13 @@ export default class ObsidianSyncPlugin extends Plugin {
 		this.isSeeding = true;
 		try {
 			new Notice('Seeding server from this vault…');
+			await ensureAuthenticated(this);
 			await seedServerFromVault(this, this.sync);
 			new Notice('Vault seeded');
 		} catch (error) {
 			console.error('Seeding server from vault failed', error);
 			new Notice('Seeding failed: ' + this.formatError(error));
+			throw error;
 		} finally {
 			this.isSeeding = false;
 		}

@@ -1,0 +1,2 @@
+[test]
+# No server preload — this suite manages Podman + the sync server itself.

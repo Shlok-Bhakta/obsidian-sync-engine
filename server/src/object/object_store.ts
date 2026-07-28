@@ -13,7 +13,15 @@ export class PathTraversalError extends Error {
     }
 }
 
-export const DEFAULT_OBJECT_STORE_DIR = join(import.meta.dir, "../../" + process.env.OBJECT_STORE_DIR || "object-data");
+export const DEFAULT_OBJECT_STORE_DIR = (() => {
+    const override = process.env.OBJECT_STORE_DIR;
+    if (override) {
+        return override.startsWith("/")
+            ? override
+            : join(import.meta.dir, "../../", override);
+    }
+    return join(import.meta.dir, "../../object-data");
+})();
 
 export type ObjectStoreUploadContent = {
     path: string;
@@ -126,7 +134,18 @@ export class ObjectStore {
             const pluginDir = join(vaultDir, ".obsidian/plugins/obsidian-sync-engine");
             await mkdir(pluginDir, { recursive: true });
             const dataPath = join(pluginDir, "data.json");
-            const settings = await Bun.file(dataPath).json() as Record<string, unknown>;
+            // B1 seed intentionally does not upload the plugin's data.json, so a
+            // freshly seeded object store often has no settings file yet. Default
+            // to an empty object rather than failing bootstrap.
+            let settings: Record<string, unknown> = {};
+            const dataFile = Bun.file(dataPath);
+            if (await dataFile.exists()) {
+                try {
+                    settings = await dataFile.json() as Record<string, unknown>;
+                } catch {
+                    settings = {};
+                }
+            }
             await Bun.write(dataPath, JSON.stringify({
                 ...settings,
                 clientName,

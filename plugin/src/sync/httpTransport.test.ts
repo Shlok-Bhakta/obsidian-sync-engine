@@ -136,4 +136,21 @@ describe("HttpTransport", () => {
 		expect((caught as Error).message).toContain("401");
 		expect((caught as Error).message).toContain("Unauthorized");
 	});
+
+	test("download throws RemoteFileNotFoundError on 404", async () => {
+		const { RemoteFileNotFoundError } = await import("./httpTransport");
+		const { request } = recordingRequest(() =>
+			fakeResponse({ status: 404, text: "Not found" }),
+		);
+		const transport = makeTransport(request);
+
+		let caught: unknown;
+		try {
+			await transport.download("gone.md");
+		} catch (error) {
+			caught = error;
+		}
+
+		expect(caught).toBeInstanceOf(RemoteFileNotFoundError);
+	});
 });
