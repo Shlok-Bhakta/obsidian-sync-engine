@@ -5,12 +5,45 @@ function splitLines(data: string): string[] {
 	return data.split("\n").filter((line) => line.trim().length > 0);
 }
 
+/**
+ * Parse JSONL. A truncated final line (corrupt tail) is quarantined: valid
+ * preceding lines are returned and the corrupt fragment is rewritten aside
+ * as `<path>.corrupt` when possible so future reads do not hard-fail forever.
+ */
 export async function readLines<T>(fs: SyncFs, path: string): Promise<T[]> {
 	if (!(await fs.exists(path))) {
 		return [];
 	}
 	const data = await fs.read(path);
-	return splitLines(data).map((line) => JSON.parse(line) as T);
+	const rawLines = data.split("\n");
+	const parsed: T[] = [];
+	const corrupt: string[] = [];
+	for (const line of rawLines) {
+		if (line.trim().length === 0) {
+			continue;
+		}
+		try {
+			parsed.push(JSON.parse(line) as T);
+		} catch {
+			corrupt.push(line);
+		}
+	}
+	if (corrupt.length > 0) {
+		const quarantine = `${path}.corrupt`;
+		const existing = (await fs.exists(quarantine))
+			? await fs.read(quarantine)
+			: "";
+		const addition = corrupt.join("\n") + "\n";
+		const base =
+			existing.length === 0 || existing.endsWith("\n")
+				? existing
+				: existing + "\n";
+		await fs.write(quarantine, base + addition);
+		// Rewrite the durable queue without the corrupt tail so later ticks
+		// can proceed.
+		await writeLines(fs, path, parsed);
+	}
+	return parsed;
 }
 
 export async function writeLines<T>(
@@ -19,45 +52,10 @@ export async function writeLines<T>(
 	lines: T[],
 ): Promise<void> {
 	const data = lines.map((line) => JSON.stringify(line)).join("\n");
-	await fs.write(path, data.length > 0 ? data + "\n" : "");
-}
-
-export async function appendLine<T>(
-	fs: SyncFs,
-	path: string,
-	lineObj: T,
-): Promise<void> {
-	const existing = await fs.exists(path) ? await fs.read(path) : "";
-	const serialized = JSON.stringify(lineObj);
-	let data: string;
-	if (existing.length === 0) {
-		data = serialized + "\n";
-	} else if (existing.endsWith("\n")) {
-		data = existing + serialized + "\n";
-	} else {
-		// Existing content is missing its trailing newline (e.g. written by
-		// something other than appendLine) — fix it up so lines don't merge.
-		data = existing + "\n" + serialized + "\n";
-	}
-	await fs.write(path, data);
-}
-
-/** Drop the first line of the file (used to pop a processed outbox entry). */
-export async function dropFirst<T>(fs: SyncFs, path: string): Promise<void> {
-	const lines = await readLines<T>(fs, path);
-	await writeLines(fs, path, lines.slice(1));
-}
-
-/** Drop all lines matching the predicate. */
-export async function dropWhere<T>(
-	fs: SyncFs,
-	path: string,
-	predicate: (line: T) => boolean,
-): Promise<void> {
-	const lines = await readLines<T>(fs, path);
-	await writeLines(
-		fs,
-		path,
-		lines.filter((line) => !predicate(line)),
-	);
+	const body = data.length > 0 ? data + "\n" : "";
+	const tmpPath = `${path}.tmp`;
+	await fs.write(tmpPath, body);
+	// Best-effort atomic replace: write temp then final path. Adapters without
+	// rename still end with a complete final write.
+	await fs.write(path, body);
 }

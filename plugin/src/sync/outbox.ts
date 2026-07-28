@@ -35,8 +35,6 @@ export async function list(fs: SyncFs, outboxPath: string): Promise<OutboxOp[]> 
 	return readLines<OutboxOp>(fs, outboxPath);
 }
 
-export const peekAll = list;
-
 /**
  * Process outbox lines in order via `handler`. Successfully handled lines are
  * removed from the front of the outbox. Processing stops at the first
