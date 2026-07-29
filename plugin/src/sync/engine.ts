@@ -188,9 +188,17 @@ export class SyncEngine {
 	 * Used before seed/unload so nothing sits only in memory.
 	 */
 	async flush(): Promise<void> {
-		await Promise.all([...this.enqueueInFlight]);
+		await Promise.allSettled([...this.enqueueInFlight]);
 		await this.debouncer.flush();
 		if (this.tickInFlight) await this.tickInFlight;
+		if (this.failedEnqueues.size > 0) {
+			await this.tick();
+		}
+		if (this.failedEnqueues.size > 0) {
+			throw new Error(
+				`${this.failedEnqueues.size} local operation(s) could not be persisted`,
+			);
+		}
 	}
 
 	private async refreshPending(path: string): Promise<void> {

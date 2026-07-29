@@ -187,7 +187,11 @@ export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
 	void engine.hydrate();
 
 	plugin.register(() => {
-		void engine.flush();
+		void engine.flush().catch((error) => {
+			status.lastError =
+				error instanceof Error ? error.message : String(error);
+			console.error("Could not flush sync state during unload", error);
+		});
 	});
 
 	plugin.registerInterval(

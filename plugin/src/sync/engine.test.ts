@@ -728,8 +728,7 @@ describe("SyncEngine", () => {
 		engine.enqueuePut("a.md");
 		await flushMicrotasks();
 		expect(failures).toEqual(["disk temporarily unavailable"]);
-		const result = await engine.tick();
-		expect(result.ok).toBe(true);
+		await engine.flush();
 		expect(transport.uploads.map(({ path }) => path)).toEqual(["a.md"]);
 		expect(await listOutbox(fs, OUTBOX)).toEqual([]);
 	});
