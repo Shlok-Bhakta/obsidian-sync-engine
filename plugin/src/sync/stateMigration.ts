@@ -71,6 +71,10 @@ async function mergeJournal(
 			await adapter.write(quarantineTarget, quarantineBody);
 		}
 		if (await adapter.exists(source)) await adapter.remove(source);
+		const sourceQuarantine = `${source}.corrupt`;
+		if (await adapter.exists(sourceQuarantine)) {
+			await adapter.remove(sourceQuarantine);
+		}
 		if (await adapter.exists(tmp)) await adapter.remove(tmp);
 		if (await adapter.exists(backup)) await adapter.remove(backup);
 		await adapter.remove(marker);
@@ -88,18 +92,32 @@ async function mergeJournal(
 			await adapter.rename(backup, target);
 		}
 	}
-	if (!(await adapter.exists(source))) return;
+	const sourceQuarantine = `${source}.corrupt`;
+	const hasSource = await adapter.exists(source);
+	const hasSourceQuarantine = await adapter.exists(sourceQuarantine);
+	if (!hasSource && !hasSourceQuarantine) return;
 	if (!(await adapter.exists(target))) {
-		await adapter.rename(source, target);
-		return;
+		if (
+			hasSource &&
+			!hasSourceQuarantine &&
+			!(await adapter.exists(quarantineTarget))
+		) {
+			await adapter.rename(source, target);
+			return;
+		}
+		// Quarantine bytes require the marker protocol even when there is no
+		// destination journal, so create an empty merge target.
+		await adapter.write(target, "");
 	}
 	if (await adapter.exists(tmp)) await adapter.remove(tmp);
 	if (await adapter.exists(backup)) await adapter.remove(backup);
 	// Parse without mutating either journal. The exact desired journal and
 	// quarantine bytes are persisted together in the marker before install.
-	const olderParsed = parseJournal(await adapter.read(source), source);
+	const olderParsed = parseJournal(
+		hasSource ? await adapter.read(source) : "",
+		source,
+	);
 	const newerParsed = parseJournal(await adapter.read(target), target);
-	const sourceQuarantine = `${source}.corrupt`;
 	const existingQuarantine = (await adapter.exists(quarantineTarget))
 		? await adapter.read(quarantineTarget)
 		: "";
@@ -124,7 +142,10 @@ async function mergeJournal(
 	if (quarantineBody.length > 0) {
 		await adapter.write(quarantineTarget, quarantineBody);
 	}
-	await adapter.remove(source);
+	if (await adapter.exists(source)) await adapter.remove(source);
+	if (await adapter.exists(sourceQuarantine)) {
+		await adapter.remove(sourceQuarantine);
+	}
 	await adapter.remove(backup);
 	await adapter.remove(marker);
 }

@@ -2,7 +2,12 @@ import type { SyncFs } from "./fs";
 import { readLines, writeLines } from "./jsonl";
 import { mutexFor } from "./mutex";
 
-export type OutboxOp = { op: "put" | "delete"; path: string; ts: number };
+export type OutboxOp = {
+	op: "put" | "delete";
+	path: string;
+	ts: number;
+	baseRevision?: number;
+};
 
 function sameOp(a: OutboxOp, b: OutboxOp): boolean {
 	return a.op === b.op && a.path === b.path && a.ts === b.ts;

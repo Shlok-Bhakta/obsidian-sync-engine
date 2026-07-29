@@ -44,18 +44,23 @@ export async function auth(
 	}) as Promise<AuthResult>;
 }
 
-export async function checkClientExists(clientName: string, clientSecret: string) {
-    const client_info = await sql`SELECT id FROM clients WHERE client_name = ${clientName} AND client_secret = ${clientSecret}`;
-    return client_info.length > 0;
-}
 export async function createClient(clientName: string) {
     const client = await sql`INSERT INTO clients (client_name) VALUES (${clientName}) RETURNING client_secret`;
     return client[0].client_secret;
 }
 
-export async function resetClientSecret(clientName: string): Promise<string> {
-    const client = await sql`UPDATE clients SET client_secret = concat('obs_sync_', encode(gen_random_bytes(32), 'base64')) WHERE client_name = ${clientName} RETURNING client_secret`;
-    return client[0].client_secret;
+export async function resetClientSecret(
+	clientName: string,
+	currentSecret: string,
+): Promise<string | null> {
+	const [client] = await sql<{ client_secret: string }[]>`
+		UPDATE clients
+		SET client_secret = concat('obs_sync_', encode(gen_random_bytes(32), 'base64')),
+			updated_at = NOW()
+		WHERE client_name = ${clientName} AND client_secret = ${currentSecret}
+		RETURNING client_secret
+	`;
+	return client?.client_secret ?? null;
 }
 
 export async function resetClientName(clientName: string, token: string): Promise<string> {
@@ -135,13 +140,13 @@ export function registerAuthRoutes(app: Hono) {
 	}));
 
 	app.post('/reset-client-secret', withMessage(MessageType.AUTH_ACK, async (c, data) => {
-		const authResult = await checkClientExists(data.client_name, data.token);
-
-		if (!authResult) {
+		const newClientSecret = await resetClientSecret(
+			data.client_name,
+			data.token,
+		);
+		if (!newClientSecret) {
 			return c.json(errorMessage('Invalid token'), 401);
 		}
-
-		const newClientSecret = await resetClientSecret(data.client_name);
 
 		return c.json({
 			type: MessageType.AUTH_INIT,

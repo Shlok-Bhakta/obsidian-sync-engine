@@ -61,17 +61,21 @@ describe("HttpTransport", () => {
 		expect(result).toEqual({ revision: 3 });
 	});
 
-	test("deleteRemote DELETEs /files with an encoded path query param", async () => {
+	test("deleteRemote sends the encoded path and causal base revision", async () => {
 		const { request, calls } = recordingRequest(() =>
 			fakeResponse({ json: { path: "a.md", revision: 4 } }),
 		);
 		const transport = makeTransport(request);
 
-		const result = await transport.deleteRemote("notes/a b.md");
+		const result = await transport.deleteRemote("notes/a b.md", 3);
 
 		expect(calls[0]).toMatchObject({
 			url: `${SERVER_URL}/files?path=${encodeURIComponent("notes/a b.md")}`,
 			method: "DELETE",
+		});
+		expect(calls[0]?.headers).toMatchObject({
+			Authorization: SECRET,
+			"X-Obsidian-Base-Revision": "3",
 		});
 		expect(result).toEqual({ revision: 4 });
 	});

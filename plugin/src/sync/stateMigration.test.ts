@@ -150,6 +150,7 @@ describe("migrateServerState", () => {
 		fs.dirs.add("state/legacy");
 		fs.dirs.add("state/encoded");
 		fs.files.set("state/legacy/outbox.jsonl", '{"id":"old"}\n');
+		fs.files.set("state/legacy/outbox.jsonl.corrupt", "broken\n");
 		fs.files.set(
 			"state/encoded/outbox.jsonl",
 			'{"id":"old"}\n{"id":"new"}\n',
@@ -173,6 +174,9 @@ describe("migrateServerState", () => {
 		).toBe("broken\nbroken\n");
 		expect(
 			await fs.exists("state/encoded/outbox.jsonl.migration.json"),
+		).toBe(false);
+		expect(
+			await fs.exists("state/legacy/outbox.jsonl.corrupt"),
 		).toBe(false);
 	});
 
@@ -231,5 +235,34 @@ describe("migrateServerState", () => {
 		expect(fs.files.get("state/encoded/outbox.jsonl")).toBe(
 			'{"id":"same"}\n{"id":"same"}\n{"id":"new"}\n',
 		);
+	});
+
+	test("preserves quarantine when the destination journal is absent", async () => {
+		const fs = new MemoryAdapter();
+		fs.dirs.add("state/legacy");
+		fs.dirs.add("state/encoded");
+		fs.files.set("state/legacy/outbox.jsonl", '{"id":"old"}\n');
+		fs.files.set("state/legacy/outbox.jsonl.corrupt", "broken\n");
+
+		await migrateServerState(fs, "state", "legacy", "encoded");
+
+		expect(fs.files.get("state/encoded/outbox.jsonl")).toBe('{"id":"old"}\n');
+		expect(
+			fs.files.get("state/encoded/outbox.jsonl.legacy.corrupt"),
+		).toBe("broken\n");
+	});
+
+	test("preserves an orphan quarantine without a source journal", async () => {
+		const fs = new MemoryAdapter();
+		fs.dirs.add("state/legacy");
+		fs.dirs.add("state/encoded");
+		fs.files.set("state/legacy/outbox.jsonl.corrupt", "orphan\n");
+
+		await migrateServerState(fs, "state", "legacy", "encoded");
+
+		expect(fs.files.get("state/encoded/outbox.jsonl")).toBe("");
+		expect(
+			fs.files.get("state/encoded/outbox.jsonl.legacy.corrupt"),
+		).toBe("orphan\n");
 	});
 });

@@ -14,7 +14,7 @@ export type SyncTransport = {
 		path: string,
 		body: ArrayBuffer | string,
 	): Promise<{ revision: number }>;
-	deleteRemote(path: string): Promise<{ revision: number }>;
+	deleteRemote(path: string, baseRevision?: number): Promise<{ revision: number }>;
 	download(path: string): Promise<ArrayBuffer>;
 	fetchInbox(rev: number): Promise<InboxOp[]>;
 };
@@ -149,13 +149,15 @@ export class SyncEngine {
 			throw new Error("Sync is suspended until Obsidian reloads");
 		}
 		const path = canonicalizeSyncPath(rawPath);
+		const baseRevision = op === "delete" ? await this.getRevision() : undefined;
 		this.pendingOutboxPaths.add(path);
 		this.enqueueCounts.set(path, (this.enqueueCounts.get(path) ?? 0) + 1);
 		const intent: OutboxOp = {
-				op,
-				path,
-				ts: Date.now(),
-			};
+			op,
+			path,
+			ts: Date.now(),
+			baseRevision,
+		};
 		const persistence = enqueueOutbox(this.fs, this.outboxPath, intent).finally(async () => {
 				const remaining = (this.enqueueCounts.get(path) ?? 1) - 1;
 				if (remaining > 0) this.enqueueCounts.set(path, remaining);
@@ -338,7 +340,7 @@ export class SyncEngine {
 				if (op.op === "put") {
 					await this.pushPut(op.path);
 				} else {
-					await this.pushDelete(op.path);
+					await this.pushDelete(op.path, op.baseRevision);
 				}
 				processedPaths.add(op.path);
 				pushed++;
@@ -395,9 +397,12 @@ export class SyncEngine {
 		return this.transport.upload(path, body);
 	}
 
-	private async pushDelete(path: string): Promise<{ revision: number }> {
+	private async pushDelete(
+		path: string,
+		baseRevision?: number,
+	): Promise<{ revision: number }> {
 		this.assertActive();
-		return this.transport.deleteRemote(path);
+		return this.transport.deleteRemote(path, baseRevision);
 	}
 
 	private async applyRemoteInbox(): Promise<number> {

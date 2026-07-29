@@ -150,26 +150,46 @@ export class ObjectStore {
     }
 
     /** Soft-deletes a file. Idempotent: unknown paths get a tombstone revision. */
-    async delete(path: string, authorId: string): Promise<{ revision: number }> {
+    async delete(
+        path: string,
+        authorId: string,
+        baseRevision?: number,
+    ): Promise<{ revision: number }> {
         const canonicalPath = canonicalizePath(path);
 
         const [row] = (await sql.begin(async (tx) => {
             await tx`SELECT pg_advisory_xact_lock(hashtext(${REVISION_LOCK_KEY}))`;
-			const descendants = await tx<{ file_path: string }[]>`
-				SELECT file_path FROM files
-				WHERE file_is_deleted = FALSE
-				  AND position(${canonicalPath + "/"} in file_path) = 1
-				ORDER BY file_path
-			`;
-			for (const descendant of descendants) {
-				await tx`
-					UPDATE files
-					SET author_id = ${authorId}, file_is_deleted = TRUE,
-						content = NULL, updated_at = NOW(),
-						last_updated_revision = NEXTVAL('global_revision')
-					WHERE file_path = ${descendant.file_path}
-				`;
-			}
+            if (baseRevision !== undefined) {
+                const [newer] = await tx<{ last_updated_revision: string }[]>`
+                    SELECT last_updated_revision FROM files
+                    WHERE file_is_deleted = FALSE
+                      AND (
+                        file_path = ${canonicalPath}
+                        OR position(${canonicalPath + "/"} in file_path) = 1
+                      )
+                      AND last_updated_revision > ${baseRevision}
+                    ORDER BY last_updated_revision DESC
+                    LIMIT 1
+                `;
+                if (newer) {
+                    return [{ last_updated_revision: Number(newer.last_updated_revision) }];
+                }
+            }
+            const descendants = await tx<{ file_path: string }[]>`
+                SELECT file_path FROM files
+                WHERE file_is_deleted = FALSE
+                  AND position(${canonicalPath + "/"} in file_path) = 1
+                ORDER BY file_path
+            `;
+            for (const descendant of descendants) {
+                await tx`
+                    UPDATE files
+                    SET author_id = ${authorId}, file_is_deleted = TRUE,
+                        content = NULL, updated_at = NOW(),
+                        last_updated_revision = NEXTVAL('global_revision')
+                    WHERE file_path = ${descendant.file_path}
+                `;
+            }
             return tx<FileContentRow[]>`
                 INSERT INTO files (file_path, author_id, file_is_deleted, content)
                 VALUES (${canonicalPath}, ${authorId}, TRUE, NULL)
@@ -503,7 +523,24 @@ export function registerObjectStoreRoutes(app: Hono, store = objectStore) {
             }
             try {
                 const clientId = authorized;
-                const result = await store.delete(path, clientId);
+                const rawBaseRevision = c.req.header("X-Obsidian-Base-Revision");
+                const parsedBaseRevision =
+                    rawBaseRevision === undefined
+                        ? { success: true as const, data: undefined }
+                        : rawBaseRevision.trim() === ""
+                            ? { success: false as const }
+                            : revisionSchema.safeParse(Number(rawBaseRevision));
+                if (!parsedBaseRevision.success) {
+                    return c.json(
+                        { error: "base revision must be a safe nonnegative integer" },
+                        400,
+                    );
+                }
+                const result = await store.delete(
+                    path,
+                    clientId,
+                    parsedBaseRevision.data,
+                );
                 return c.json({ path, revision: result.revision }, 200);
             } catch (error) {
                 if (error instanceof InvalidPathError) {

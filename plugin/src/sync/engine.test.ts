@@ -97,6 +97,7 @@ class FakeTransport implements SyncTransport {
 	readonly log: InboxOp[] = [];
 	readonly uploads: { path: string; body: ArrayBuffer | string }[] = [];
 	readonly deletes: string[] = [];
+	readonly deleteBaseRevisions: (number | undefined)[] = [];
 	readonly fetchInboxCalls: number[] = [];
 	readonly calls: string[] = [];
 
@@ -115,10 +116,14 @@ class FakeTransport implements SyncTransport {
 		return { revision: this.revision };
 	}
 
-	async deleteRemote(path: string): Promise<{ revision: number }> {
+	async deleteRemote(
+		path: string,
+		baseRevision?: number,
+	): Promise<{ revision: number }> {
 		this.calls.push("delete");
 		this.revision++;
 		this.deletes.push(path);
+		this.deleteBaseRevisions.push(baseRevision);
 		this.remoteFiles.delete(path);
 		this.log.push({ rev: this.revision, op: "delete", path });
 		return { revision: this.revision };
@@ -927,5 +932,25 @@ describe("SyncEngine", () => {
 		expect(result.ok).toBe(true);
 		expect(transport.deletes).toEqual(["never-uploaded.md"]);
 		expect(await listOutbox(fs, OUTBOX)).toEqual([]);
+	});
+
+	test("a newly enqueued delete carries the client's observed revision", async () => {
+		const fs = new MemoryVaultFs();
+		const transport = new FakeTransport();
+		const revision = makeRevisionStore(7);
+		const engine = new SyncEngine({
+			fs,
+			transport,
+			outboxPath: OUTBOX,
+			inboxPath: INBOX,
+			getRevision: revision.get,
+			setRevision: revision.set,
+			debounceMs: 60_000,
+		});
+
+		await engine.enqueueDurable("deleted.md", "delete");
+		await engine.flush();
+
+		expect(transport.deleteBaseRevisions).toEqual([7]);
 	});
 });

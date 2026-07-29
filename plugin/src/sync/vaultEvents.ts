@@ -4,13 +4,8 @@ type FileSnapshot = {
 
 /** True when a delete notification describes an older file than the live one. */
 export function isStaleFileDeletion(
-	deleted: FileSnapshot,
+	_deleted: FileSnapshot,
 	current: FileSnapshot | null,
 ): boolean {
-	return (
-		current !== null &&
-		(current.stat.ctime !== deleted.stat.ctime ||
-			current.stat.mtime !== deleted.stat.mtime ||
-			current.stat.size !== deleted.stat.size)
-	);
+	return current !== null;
 }

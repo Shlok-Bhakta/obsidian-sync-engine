@@ -716,4 +716,62 @@ describe("object store", () => {
 		const rows = await store.inbox(0);
 		expect(rows.find(({ path }) => path === "a")?.isDeleted).toBe(true);
 	});
+
+	it("ignores a delete older than a live file revision", async () => {
+		const client = await createClientFixture({ client_name: "alice" });
+		const store = new ObjectStore();
+		const first = await store.upload({
+			path: "note.md",
+			content: "old",
+			id: client.id,
+		});
+		const latest = await store.upload({
+			path: "note.md",
+			content: "new",
+			id: client.id,
+		});
+
+		const result = await store.delete("note.md", client.id, first.revision);
+
+		expect(result.revision).toBe(latest.revision);
+		expect(decode(await store.download("note.md"))).toBe("new");
+		expect((await store.inbox(first.revision)).at(-1)?.isDeleted).toBe(false);
+	});
+
+	it("ignores a subtree delete when any live descendant is newer", async () => {
+		const client = await createClientFixture({ client_name: "alice" });
+		const store = new ObjectStore();
+		const first = await store.upload({
+			path: "shape/old.md",
+			content: "old",
+			id: client.id,
+		});
+		const child = await store.upload({
+			path: "shape/child.md",
+			content: "new",
+			id: client.id,
+		});
+
+		const result = await store.delete("shape", client.id, first.revision);
+
+		expect(result.revision).toBe(child.revision);
+		expect(decode(await store.download("shape/old.md"))).toBe("old");
+		expect(decode(await store.download("shape/child.md"))).toBe("new");
+	});
+
+	it("rejects malformed causal delete revisions", async () => {
+		const client = await createClientFixture({ client_name: "alice" });
+		const app = createTestApp();
+
+		for (const baseRevision of ["", "-1", "1.5", "NaN", "Infinity"]) {
+			const response = await app.request("/files?path=note.md", {
+				method: "DELETE",
+				headers: {
+					Authorization: client.client_secret,
+					"X-Obsidian-Base-Revision": baseRevision,
+				},
+			});
+			expect(response.status).toBe(400);
+		}
+	});
 });

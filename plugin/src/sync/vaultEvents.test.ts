@@ -14,7 +14,7 @@ describe("isStaleFileDeletion", () => {
 		expect(isStaleFileDeletion(file(1, 2, 3), null)).toBe(false);
 	});
 
-	test("keeps the event while the same file snapshot is still cached", () => {
-		expect(isStaleFileDeletion(file(1, 2, 3), file(1, 2, 3))).toBe(false);
+	test("rejects deletion whenever a file is currently live at that path", () => {
+		expect(isStaleFileDeletion(file(1, 2, 3), file(1, 2, 3))).toBe(true);
 	});
 });

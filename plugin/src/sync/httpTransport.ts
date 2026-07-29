@@ -87,11 +87,22 @@ export class HttpTransport implements SyncTransport {
 		return revisionResponseSchema.parse(response.json);
 	}
 
-	async deleteRemote(path: string): Promise<{ revision: number }> {
+	async deleteRemote(
+		path: string,
+		baseRevision?: number,
+	): Promise<{ revision: number }> {
+		const headers: Record<string, string> = {
+			Authorization: this.getAuthorization(),
+		};
+		if (baseRevision !== undefined) {
+			headers["X-Obsidian-Base-Revision"] = String(
+				revisionSchema.parse(baseRevision),
+			);
+		}
 		const response = await this.request({
 			url: `${this.getServerUrl()}/files?path=${encodeURIComponent(path)}`,
 			method: "DELETE",
-			headers: { Authorization: this.getAuthorization() },
+			headers,
 			throw: false,
 		});
 		assertOk(response, `Delete of "${path}"`);
