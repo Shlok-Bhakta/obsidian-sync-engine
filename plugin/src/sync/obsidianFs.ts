@@ -8,7 +8,7 @@ import {
 import type { VaultBlobFs } from "./engine";
 import {
 	InboundEventSuppressor,
-	type InboundOperation,
+	type InboundEvent,
 } from "./inboundEventSuppressor";
 import { ancestorDirs } from "./paths";
 
@@ -30,17 +30,17 @@ export class ObsidianFs implements VaultBlobFs {
 		private readonly vault?: Vault,
 	) {}
 
-	consumeInboundEvent(path: string, operation: InboundOperation): boolean {
+	consumeInboundEvent(path: string, event: InboundEvent): boolean {
 		const normalized = normalizePath(path);
-		return this.inboundEvents.consume(normalized, operation);
+		return this.inboundEvents.consume(normalized, event);
 	}
 
-	private expectInboundEvent(path: string, operation: InboundOperation): void {
-		this.inboundEvents.expect(path, operation);
+	private expectInboundEvent(path: string, ...events: InboundEvent[]): void {
+		this.inboundEvents.expect(path, ...events);
 	}
 
-	private cancelInboundEvent(path: string, operation: InboundOperation): void {
-		this.inboundEvents.cancel(path, operation);
+	private cancelInboundEvent(path: string): void {
+		this.inboundEvents.cancel(path);
 	}
 
 	async read(path: string): Promise<string> {
@@ -93,10 +93,10 @@ export class ObsidianFs implements VaultBlobFs {
 			await this.adapter.writeBinary(normalized, data);
 			return;
 		}
-		this.expectInboundEvent(normalized, "put");
 		try {
 			const existing = this.vault.getAbstractFileByPath(normalized);
 			if (existing instanceof TFile) {
+				this.expectInboundEvent(normalized, "modify");
 				await this.vault.modifyBinary(existing, data);
 				return;
 			}
@@ -104,13 +104,15 @@ export class ObsidianFs implements VaultBlobFs {
 				if (existing.children.length > 0) {
 					throw new Error(`Cannot replace non-empty folder "${normalized}"`);
 				}
+				this.expectInboundEvent(normalized, "rename-delete", "delete");
 				// eslint-disable-next-line obsidianmd/prefer-file-manager-trash-file
 				await this.vault.delete(existing, true);
 			}
 			await this.ensureVaultParentDir(normalized);
+			this.expectInboundEvent(normalized, "create");
 			await this.vault.createBinary(normalized, data);
 		} catch (error) {
-			this.cancelInboundEvent(normalized, "put");
+			this.cancelInboundEvent(normalized);
 			throw error;
 		}
 	}
@@ -120,13 +122,13 @@ export class ObsidianFs implements VaultBlobFs {
 		if (this.vault) {
 			const existing = this.vault.getAbstractFileByPath(normalized);
 			if (!existing) return;
-			this.expectInboundEvent(normalized, "delete");
+			this.expectInboundEvent(normalized, "rename-delete", "delete");
 			try {
 				// A remote tombstone must not create a new synced file in `.trash`.
 				// eslint-disable-next-line obsidianmd/prefer-file-manager-trash-file
 				await this.vault.delete(existing, true);
 			} catch (error) {
-				this.cancelInboundEvent(normalized, "delete");
+				this.cancelInboundEvent(normalized);
 				throw error;
 			}
 			return;
@@ -176,12 +178,12 @@ export class ObsidianFs implements VaultBlobFs {
 		for (const dir of ancestorDirs(normalizedPath)) {
 			const existing = this.vault.getAbstractFileByPath(dir);
 			if (existing instanceof TFile) {
-				this.expectInboundEvent(dir, "delete");
+				this.expectInboundEvent(dir, "rename-delete", "delete");
 				try {
 					// eslint-disable-next-line obsidianmd/prefer-file-manager-trash-file
 					await this.vault.delete(existing, true);
 				} catch (error) {
-					this.cancelInboundEvent(dir, "delete");
+					this.cancelInboundEvent(dir);
 					throw error;
 				}
 			}

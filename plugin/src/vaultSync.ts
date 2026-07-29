@@ -131,19 +131,22 @@ export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
 	// re-enqueue itself as an outbound one.
 	const isLocallyOriginated = (
 		path: string,
-		operation: "put" | "delete",
+		event: "create" | "modify" | "delete" | "rename-delete",
 	) =>
 		!plugin.isSyncSuspended() &&
-		!fs.consumeInboundEvent(path, operation) &&
+		!fs.consumeInboundEvent(path, event) &&
 		!isSyncEngineOwnedPath(plugin, path);
 
-	const enqueuePutIfLocal = (path: string) => {
-		if (isLocallyOriginated(path, "put")) {
+	const enqueuePutIfLocal = (path: string, event: "create" | "modify") => {
+		if (isLocallyOriginated(path, event)) {
 			engine.enqueuePut(path);
 		}
 	};
-	const enqueueDeleteIfLocal = (path: string) => {
-		if (isLocallyOriginated(path, "delete")) {
+	const enqueueDeleteIfLocal = (
+		path: string,
+		event: "delete" | "rename-delete",
+	) => {
+		if (isLocallyOriginated(path, event)) {
 			engine.enqueueDelete(path);
 		}
 	};
@@ -155,14 +158,14 @@ export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
 	plugin.registerEvent(
 		plugin.app.vault.on('modify', (file: TAbstractFile) => {
 			if (file instanceof TFile) {
-				enqueuePutIfLocal(file.path);
+				enqueuePutIfLocal(file.path, "modify");
 			}
 		}),
 	);
 	plugin.registerEvent(
 		plugin.app.vault.on('create', (file: TAbstractFile) => {
 			if (file instanceof TFile) {
-				enqueuePutIfLocal(file.path);
+				enqueuePutIfLocal(file.path, "create");
 			}
 		}),
 	);
@@ -171,15 +174,15 @@ export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
 			// Folders have no content to sync — only their (already-deleted)
 			// child files matter, and those get their own 'delete' events.
 			if (file instanceof TFile) {
-				enqueueDeleteIfLocal(file.path);
+				enqueueDeleteIfLocal(file.path, "delete");
 			}
 		}),
 	);
 	plugin.registerEvent(
 		plugin.app.vault.on('rename', (file: TAbstractFile, oldPath: string) => {
 			if (file instanceof TFile) {
-				enqueueDeleteIfLocal(oldPath);
-				enqueuePutIfLocal(file.path);
+				enqueueDeleteIfLocal(oldPath, "rename-delete");
+				enqueuePutIfLocal(file.path, "create");
 			}
 		}),
 	);

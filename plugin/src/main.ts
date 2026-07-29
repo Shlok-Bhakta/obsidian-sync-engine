@@ -6,6 +6,7 @@ import {
 	SyncSettingTab,
 	normalizeServerUrl,
 	serverIdentityFor,
+	transitionServerSettings,
 } from './settings';
 import { SyncStatusView, SYNC_STATUS_VIEW_TYPE } from './ui/syncStatusView';
 import {
@@ -13,6 +14,7 @@ import {
 	seedServerFromVault,
 	type VaultSync,
 } from './vaultSync';
+import { migrateServerState } from "./sync/stateMigration";
 
 export default class ObsidianSyncPlugin extends Plugin {
 	settings!: ObsidianSyncSettings;
@@ -69,9 +71,23 @@ export default class ObsidianSyncPlugin extends Plugin {
 			loaded,
 		);
 		this.settings.serverUrl = normalizeServerUrl(this.settings.serverUrl);
+		const nextIdentity = serverIdentityFor(this.settings.serverUrl);
+		const previousIdentity = loaded.serverIdentity;
+		if (previousIdentity && previousIdentity !== nextIdentity) {
+			const pluginDir =
+				this.manifest.dir ??
+				`${this.app.vault.configDir}/plugins/${this.manifest.id}`;
+			await migrateServerState(
+				this.app.vault.adapter,
+				`${pluginDir}/state`,
+				previousIdentity,
+				nextIdentity,
+			);
+		}
 		// Recompute to migrate the legacy 32-bit identity and ensure the queue
 		// namespace is derived from the exact normalized server URL.
-		this.settings.serverIdentity = serverIdentityFor(this.settings.serverUrl);
+		this.settings.serverIdentity = nextIdentity;
+		if (previousIdentity !== nextIdentity) await this.saveSettings();
 	}
 
 	async saveSettings() {
@@ -79,16 +95,16 @@ export default class ObsidianSyncPlugin extends Plugin {
 	}
 
 	async changeServerUrl(value: string): Promise<void> {
-		const serverUrl = normalizeServerUrl(value);
-		const identity = serverIdentityFor(serverUrl);
-		if (serverUrl !== this.settings.serverUrl) {
+		if (
+			transitionServerSettings(
+				this.settings,
+				value,
+				DEFAULT_SETTINGS.clientSecret,
+			)
+		) {
 			this.reloadRequired = true;
-			this.settings.revision = 0;
-			this.settings.clientSecret = DEFAULT_SETTINGS.clientSecret;
-			this.settings.serverIdentity = identity;
 			new Notice("Server changed. Reload Obsidian before pairing; sync state is isolated per server.");
 		}
-		this.settings.serverUrl = serverUrl;
 		await this.saveSettings();
 	}
 

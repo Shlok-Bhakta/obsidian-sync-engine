@@ -4,7 +4,11 @@ import { ensureAuthenticated } from './auth';
 import { deserialize, MessageType, serialize } from 'obsidian-sync-protocol';
 import { serverIdentityFor } from "./sync/serverIdentity";
 
-export { normalizeServerUrl, serverIdentityFor } from "./sync/serverIdentity";
+export {
+	normalizeServerUrl,
+	serverIdentityFor,
+	transitionServerSettings,
+} from "./sync/serverIdentity";
 
 export interface ObsidianSyncSettings {
 	serverUrl: string;

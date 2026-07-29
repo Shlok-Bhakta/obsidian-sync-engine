@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { normalizeServerUrl, serverIdentityFor } from "./serverIdentity";
+import {
+	normalizeServerUrl,
+	serverIdentityFor,
+	transitionServerSettings,
+} from "./serverIdentity";
 
 describe("server identity", () => {
 	test("normalizes whitespace and trailing slashes", () => {
@@ -19,5 +23,25 @@ describe("server identity", () => {
 		const identity = serverIdentityFor(url);
 		expect(identity).not.toContain("/");
 		expect(decodeURIComponent(identity)).toBe(url);
+	});
+
+	test("switching servers clears credentials, setup token, and revision", () => {
+		const settings = {
+			serverUrl: "https://old.example",
+			serverIdentity: serverIdentityFor("https://old.example"),
+			clientSecret: "old-client-secret",
+			setupToken: "old-admin-token",
+			revision: 42,
+		};
+		expect(
+			transitionServerSettings(settings, "https://new.example/", "unpaired"),
+		).toBe(true);
+		expect(settings).toEqual({
+			serverUrl: "https://new.example",
+			serverIdentity: serverIdentityFor("https://new.example"),
+			clientSecret: "unpaired",
+			setupToken: "",
+			revision: 0,
+		});
 	});
 });

@@ -1,22 +1,25 @@
-export type InboundOperation = "put" | "delete";
+export type InboundEvent =
+	| "create"
+	| "modify"
+	| "delete"
+	| "rename-delete";
 
 /** Tracks only the exact Vault event expected from an inbound mutation. */
 export class InboundEventSuppressor {
-	private readonly expected = new Map<string, InboundOperation>();
+	private readonly expected = new Map<string, Set<InboundEvent>>();
 
-	expect(path: string, operation: InboundOperation): void {
-		this.expected.set(path, operation);
+	expect(path: string, ...events: InboundEvent[]): void {
+		this.expected.set(path, new Set(events));
 	}
 
-	consume(path: string, operation: InboundOperation): boolean {
-		if (this.expected.get(path) !== operation) return false;
-		this.expected.delete(path);
+	consume(path: string, event: InboundEvent): boolean {
+		const events = this.expected.get(path);
+		if (!events?.delete(event)) return false;
+		if (events.size === 0) this.expected.delete(path);
 		return true;
 	}
 
-	cancel(path: string, operation: InboundOperation): void {
-		if (this.expected.get(path) === operation) {
-			this.expected.delete(path);
-		}
+	cancel(path: string): void {
+		this.expected.delete(path);
 	}
 }
