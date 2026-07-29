@@ -2,7 +2,7 @@ name: Tests
 
 on:
   push:
-    branches: ['**']
+    branches: [diy-object-store]
   pull_request:
     branches: ['**']
 
@@ -54,6 +54,8 @@ jobs:
     env:
       DATABASE_URL: postgres://postgres:postgres@localhost:5434/test_db
       OBJECT_STORE_DIR: /tmp/ci-object-store
+      PUBLIC_SERVER_URL: http://localhost:3000
+      BOOTSTRAP_TOKEN: ci-test-setup-token
     steps:
       - uses: actions/checkout@v6
       - uses: oven-sh/setup-bun@v2

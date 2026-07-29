@@ -41,6 +41,17 @@ jobs:
               run: |
                   [ -f styles.css ] && echo "exists=true" >> "$GITHUB_OUTPUT" || echo "exists=false" >> "$GITHUB_OUTPUT"
 
+            - name: Validate release tag and required artifacts
+              run: |
+                  tag="${GITHUB_REF#refs/tags/}"
+                  version="$(node -p "require('./manifest.json').version")"
+                  test "$tag" = "$version" || {
+                    echo "Tag $tag must match manifest version $version" >&2
+                    exit 1
+                  }
+                  test -s main.js
+                  test -s manifest.json
+
             - name: Attest build provenance
               uses: actions/attest@v4
               with:
