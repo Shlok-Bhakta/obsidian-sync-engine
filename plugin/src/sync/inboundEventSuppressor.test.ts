@@ -18,11 +18,12 @@ describe("InboundEventSuppressor", () => {
 		expect(suppressor.consume("a.md", "create")).toBe(false);
 	});
 
-	test("tracks both delete event shapes emitted by a Vault removal", () => {
+	test("unused alternative events are cleared when a mutation settles", () => {
 		const suppressor = new InboundEventSuppressor();
 		suppressor.expect("a.md", "rename-delete", "delete");
 		expect(suppressor.consume("a.md", "rename-delete")).toBe(true);
-		expect(suppressor.consume("a.md", "delete")).toBe(true);
+		suppressor.cancel("a.md");
+		expect(suppressor.consume("a.md", "delete")).toBe(false);
 		expect(suppressor.consume("a.md", "delete")).toBe(false);
 	});
 });

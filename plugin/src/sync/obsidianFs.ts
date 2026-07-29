@@ -98,6 +98,7 @@ export class ObsidianFs implements VaultBlobFs {
 			if (existing instanceof TFile) {
 				this.expectInboundEvent(normalized, "modify");
 				await this.vault.modifyBinary(existing, data);
+				this.cancelInboundEvent(normalized);
 				return;
 			}
 			if (existing instanceof TFolder) {
@@ -111,6 +112,7 @@ export class ObsidianFs implements VaultBlobFs {
 			await this.ensureVaultParentDir(normalized);
 			this.expectInboundEvent(normalized, "create");
 			await this.vault.createBinary(normalized, data);
+			this.cancelInboundEvent(normalized);
 		} catch (error) {
 			this.cancelInboundEvent(normalized);
 			throw error;
@@ -127,6 +129,7 @@ export class ObsidianFs implements VaultBlobFs {
 				// A remote tombstone must not create a new synced file in `.trash`.
 				// eslint-disable-next-line obsidianmd/prefer-file-manager-trash-file
 				await this.vault.delete(existing, true);
+				this.cancelInboundEvent(normalized);
 			} catch (error) {
 				this.cancelInboundEvent(normalized);
 				throw error;
@@ -182,6 +185,7 @@ export class ObsidianFs implements VaultBlobFs {
 				try {
 					// eslint-disable-next-line obsidianmd/prefer-file-manager-trash-file
 					await this.vault.delete(existing, true);
+					this.cancelInboundEvent(dir);
 				} catch (error) {
 					this.cancelInboundEvent(dir);
 					throw error;

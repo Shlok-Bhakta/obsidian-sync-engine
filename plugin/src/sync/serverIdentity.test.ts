@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import {
 	normalizeServerUrl,
+	legacyServerIdentityFor,
+	resetServerCredentials,
 	serverIdentityFor,
 	transitionServerSettings,
 } from "./serverIdentity";
@@ -15,6 +17,9 @@ describe("server identity", () => {
 	test("does not collide for URLs that shared the legacy 32-bit hash", () => {
 		const first = "https://m0g00hi01d.example";
 		const second = "https://ae7qetyymf.example";
+		expect(legacyServerIdentityFor(first)).toBe(
+			legacyServerIdentityFor(second),
+		);
 		expect(serverIdentityFor(first)).not.toBe(serverIdentityFor(second));
 	});
 
@@ -43,5 +48,24 @@ describe("server identity", () => {
 			setupToken: "",
 			revision: 0,
 		});
+	});
+
+	test("an externally mismatched identity resets credentials without changing URL", () => {
+		const settings = {
+			serverUrl: "https://new.example",
+			serverIdentity: "identity-from-another-server",
+			clientSecret: "old-client-secret",
+			setupToken: "old-admin-token",
+			revision: 42,
+		};
+		resetServerCredentials(
+			settings,
+			serverIdentityFor(settings.serverUrl),
+			"unpaired",
+		);
+		expect(settings.clientSecret).toBe("unpaired");
+		expect(settings.setupToken).toBe("");
+		expect(settings.revision).toBe(0);
+		expect(settings.serverUrl).toBe("https://new.example");
 	});
 });

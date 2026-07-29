@@ -5,6 +5,8 @@ import {
 	ObsidianSyncSettings,
 	SyncSettingTab,
 	normalizeServerUrl,
+	legacyServerIdentityFor,
+	resetServerCredentials,
 	serverIdentityFor,
 	transitionServerSettings,
 } from './settings';
@@ -73,7 +75,9 @@ export default class ObsidianSyncPlugin extends Plugin {
 		this.settings.serverUrl = normalizeServerUrl(this.settings.serverUrl);
 		const nextIdentity = serverIdentityFor(this.settings.serverUrl);
 		const previousIdentity = loaded.serverIdentity;
-		if (previousIdentity && previousIdentity !== nextIdentity) {
+		const isLegacyIdentity =
+			previousIdentity === legacyServerIdentityFor(this.settings.serverUrl);
+		if (previousIdentity && previousIdentity !== nextIdentity && isLegacyIdentity) {
 			const pluginDir =
 				this.manifest.dir ??
 				`${this.app.vault.configDir}/plugins/${this.manifest.id}`;
@@ -82,6 +86,15 @@ export default class ObsidianSyncPlugin extends Plugin {
 				`${pluginDir}/state`,
 				previousIdentity,
 				nextIdentity,
+			);
+		} else if (
+			previousIdentity &&
+			previousIdentity !== nextIdentity
+		) {
+			resetServerCredentials(
+				this.settings,
+				nextIdentity,
+				DEFAULT_SETTINGS.clientSecret,
 			);
 		}
 		// Recompute to migrate the legacy 32-bit identity and ensure the queue

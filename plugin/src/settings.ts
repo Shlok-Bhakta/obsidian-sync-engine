@@ -6,6 +6,8 @@ import { serverIdentityFor } from "./sync/serverIdentity";
 
 export {
 	normalizeServerUrl,
+	legacyServerIdentityFor,
+	resetServerCredentials,
 	serverIdentityFor,
 	transitionServerSettings,
 } from "./sync/serverIdentity";

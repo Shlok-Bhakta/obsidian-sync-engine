@@ -16,6 +16,9 @@ class MemoryAdapter {
 	async write(path: string, value: string): Promise<void> {
 		this.files.set(path, value);
 	}
+	async append(path: string, value: string): Promise<void> {
+		this.files.set(path, (this.files.get(path) ?? "") + value);
+	}
 	async rename(from: string, to: string): Promise<void> {
 		if (this.files.has(from)) {
 			this.files.set(to, this.files.get(from) ?? "");
@@ -65,10 +68,10 @@ describe("migrateServerState", () => {
 		const fs = new MemoryAdapter();
 		fs.dirs.add("state/legacy");
 		fs.dirs.add("state/encoded");
-		fs.files.set("state/legacy/outbox.jsonl", "old-outbox\n");
-		fs.files.set("state/encoded/outbox.jsonl", "new-outbox\n");
-		fs.files.set("state/legacy/inbox.jsonl", "old-inbox\n");
-		fs.files.set("state/encoded/inbox.jsonl", "new-inbox\n");
+		fs.files.set("state/legacy/outbox.jsonl", '{"id":"old-outbox"}\n');
+		fs.files.set("state/encoded/outbox.jsonl", '{"id":"new-outbox"}\n');
+		fs.files.set("state/legacy/inbox.jsonl", '{"id":"old-inbox"}\n');
+		fs.files.set("state/encoded/inbox.jsonl", '{"id":"new-inbox"}\n');
 		await migrateServerState(
 			fs,
 			"state",
@@ -76,11 +79,45 @@ describe("migrateServerState", () => {
 			"encoded",
 		);
 		expect(fs.files.get("state/encoded/outbox.jsonl")).toBe(
-			"old-outbox\nnew-outbox\n",
+			'{"id":"old-outbox"}\n{"id":"new-outbox"}\n',
 		);
 		expect(fs.files.get("state/encoded/inbox.jsonl")).toBe(
-			"old-inbox\nnew-inbox\n",
+			'{"id":"old-inbox"}\n{"id":"new-inbox"}\n',
 		);
 		expect(await fs.exists("state/legacy")).toBe(false);
+	});
+
+	test("quarantines a truncated source tail and keeps the destination valid", async () => {
+		const fs = new MemoryAdapter();
+		fs.dirs.add("state/legacy");
+		fs.dirs.add("state/encoded");
+		fs.files.set(
+			"state/legacy/outbox.jsonl",
+			'{"id":"valid"}\n{"id":"truncated"',
+		);
+		fs.files.set("state/encoded/outbox.jsonl", '{"id":"new"}\n');
+		await migrateServerState(fs, "state", "legacy", "encoded");
+		expect(fs.files.get("state/encoded/outbox.jsonl")).toBe(
+			'{"id":"valid"}\n{"id":"new"}\n',
+		);
+		expect(
+			fs.files.get("state/encoded/outbox.jsonl.legacy.corrupt"),
+		).toContain('{"id":"truncated"');
+	});
+
+	test("a restart after target replacement does not duplicate source entries", async () => {
+		const fs = new MemoryAdapter();
+		fs.dirs.add("state/legacy");
+		fs.dirs.add("state/encoded");
+		fs.files.set("state/legacy/outbox.jsonl", '{"id":"old"}\n');
+		// Represents a crash after target installation but before source removal.
+		fs.files.set(
+			"state/encoded/outbox.jsonl",
+			'{"id":"old"}\n{"id":"new"}\n',
+		);
+		await migrateServerState(fs, "state", "legacy", "encoded");
+		expect(fs.files.get("state/encoded/outbox.jsonl")).toBe(
+			'{"id":"old"}\n{"id":"new"}\n',
+		);
 	});
 });
