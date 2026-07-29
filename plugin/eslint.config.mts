@@ -7,7 +7,9 @@ export default tseslint.config(
 	globalIgnores([
 		'node_modules',
 		'dist',
+		'obsidian-sync-engine',
 		'esbuild.config.mjs',
+		'package-plugin.mjs',
 		'version-bump.mjs',
 		'versions.json',
 		'main.js',

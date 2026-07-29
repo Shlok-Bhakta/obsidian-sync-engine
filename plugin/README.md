@@ -12,12 +12,15 @@ npm run lint
 bun test src/sync
 ```
 
+The production build also creates an install-ready `obsidian-sync-engine/`
+folder containing `main.js`, `manifest.json`, and `styles.css`.
+
 ## Install into a vault
 
-Copy `main.js`, `manifest.json`, and `styles.css` (if any) to:
+Copy the generated `obsidian-sync-engine/` folder to:
 
 ```text
-<Vault>/.obsidian/plugins/obsidian-sync-engine/
+<Vault>/.obsidian/plugins/
 ```
 
 Reload Obsidian and enable the plugin.
