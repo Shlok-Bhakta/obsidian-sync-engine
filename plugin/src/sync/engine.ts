@@ -41,6 +41,8 @@ export type SyncEngineOptions = {
 	debounceMs?: number;
 	/** Optional hook invoked when a permanent outbox failure is dead-lettered. */
 	onPermanentFailure?: (failure: PermanentSyncFailure) => void;
+	/** Stops all persistence/network work while runtime configuration is stale. */
+	isSuspended?: () => boolean;
 };
 
 export type PermanentSyncFailure = {
@@ -84,6 +86,7 @@ export class SyncEngine {
 	private readonly setRevision: (rev: number) => void | Promise<void>;
 	private readonly debouncer: Debouncer<"tick">;
 	private readonly onPermanentFailure?: (failure: PermanentSyncFailure) => void;
+	private readonly isSuspended: () => boolean;
 
 	/**
 	 * Paths with a local change in the durable outbox (or a write in flight).
@@ -113,6 +116,7 @@ export class SyncEngine {
 		this.setRevision = options.setRevision;
 		this.debouncer = new Debouncer(options.debounceMs ?? DEFAULT_DEBOUNCE_MS);
 		this.onPermanentFailure = options.onPermanentFailure;
+		this.isSuspended = options.isSuspended ?? (() => false);
 	}
 
 	/** Load durable outbox paths into the conflict guard before the first pull. */
@@ -140,6 +144,9 @@ export class SyncEngine {
 	 * (seed, unload flush). Still schedules a debounced network tick.
 	 */
 	async enqueueDurable(rawPath: string, op: "put" | "delete"): Promise<void> {
+		if (this.isSuspended()) {
+			throw new Error("Sync is suspended until Obsidian reloads");
+		}
 		const path = canonicalizeSyncPath(rawPath);
 		this.pendingOutboxPaths.add(path);
 		this.enqueueCounts.set(path, (this.enqueueCounts.get(path) ?? 0) + 1);
@@ -232,6 +239,15 @@ export class SyncEngine {
 		let applied = 0;
 		let deadLettered = 0;
 		try {
+			if (this.isSuspended()) {
+				return {
+					ok: false,
+					error: "Sync is suspended until Obsidian reloads",
+					pushed,
+					applied,
+					deadLettered,
+				};
+			}
 			await this.ensureHydrated();
 			while (true) {
 				const drainResult = await this.drainOutboxOnce();

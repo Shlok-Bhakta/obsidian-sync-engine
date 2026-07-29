@@ -119,6 +119,7 @@ export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
 		onPermanentFailure: ({ op, error }) => {
 			status.lastError = `${op.path}: ${error}`;
 		},
+		isSuspended: () => plugin.isSyncSuspended(),
 	});
 
 	// Suppressed whenever the write/delete originated from *this* fs instance
@@ -129,6 +130,7 @@ export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
 		path: string,
 		operation: "put" | "delete",
 	) =>
+		!plugin.isSyncSuspended() &&
 		!fs.consumeInboundEvent(path, operation) &&
 		!isSyncEngineOwnedPath(plugin, path);
 

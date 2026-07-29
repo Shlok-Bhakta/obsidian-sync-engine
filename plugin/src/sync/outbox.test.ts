@@ -85,7 +85,7 @@ describe("outbox", () => {
 		]);
 	});
 
-	test("enqueue during a slow drain waits for the mutex and no ops are lost", async () => {
+	test("enqueue during a slow drain persists immediately and no ops are lost", async () => {
 		const fs = new MemorySyncFs();
 		await enqueue(fs, OUTBOX, { op: "put", path: "a.md", ts: 1 });
 
@@ -133,6 +133,30 @@ describe("outbox", () => {
 		// is still present — no op was lost or clobbered by the interleaving.
 		expect(await list(fs, OUTBOX)).toEqual([
 			{ op: "put", path: "b.md", ts: 2 },
+		]);
+	});
+
+	test("a newer same-path put survives acknowledgment of an in-flight put", async () => {
+		const fs = new MemorySyncFs();
+		await enqueue(fs, OUTBOX, { op: "put", path: "a.md", ts: 1 });
+		let release = () => {};
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let started = () => {};
+		const startedPromise = new Promise<void>((resolve) => {
+			started = resolve;
+		});
+		const draining = drain(fs, OUTBOX, async () => {
+			started();
+			await gate;
+		});
+		await startedPromise;
+		await enqueue(fs, OUTBOX, { op: "put", path: "a.md", ts: 2 });
+		release();
+		await draining;
+		expect(await list(fs, OUTBOX)).toEqual([
+			{ op: "put", path: "a.md", ts: 2 },
 		]);
 	});
 });

@@ -643,11 +643,33 @@ describe("SyncEngine", () => {
 
 		expect(result.ok).toBe(false);
 		expect(result.deadLettered).toBe(1);
-		expect(result.deadLettered).toBe(1);
 		expect(result.pushed).toBe(1);
 		expect(await listOutbox(fs, OUTBOX)).toEqual([]);
 		expect(transport.uploads.some((u) => u.path === "ok.md")).toBe(true);
 		expect(await fs.exists(deadLetterPath)).toBe(true);
+	});
+
+	test("suspension blocks both network ticks and new durable intent", async () => {
+		const fs = new MemoryVaultFs();
+		await fs.write("a.md", "local");
+		const transport = new FakeTransport();
+		const revision = makeRevisionStore(0);
+		const engine = new SyncEngine({
+			fs,
+			transport,
+			outboxPath: OUTBOX,
+			inboxPath: INBOX,
+			getRevision: revision.get,
+			setRevision: revision.set,
+			isSuspended: () => true,
+		});
+		expect(engine.enqueueDurable("a.md", "put")).rejects.toThrow(
+			"suspended",
+		);
+		const result = await engine.tick();
+		expect(result.ok).toBe(false);
+		expect(transport.calls).toEqual([]);
+		expect(await listOutbox(fs, OUTBOX)).toEqual([]);
 	});
 
 	test("deleteRemote for a never-uploaded path still succeeds via transport", async () => {

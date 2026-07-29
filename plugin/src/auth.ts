@@ -8,6 +8,9 @@ import type ObsidianSyncPlugin from './main';
  * On an existing server, verifies the current secret.
  */
 export async function ensureAuthenticated(plugin: ObsidianSyncPlugin): Promise<void> {
+	if (plugin.isSyncSuspended()) {
+		throw new Error("Reload Obsidian before pairing with the new server");
+	}
 	const response = await requestUrl({
 		url: `${plugin.settings.serverUrl}/auth`,
 		method: 'POST',

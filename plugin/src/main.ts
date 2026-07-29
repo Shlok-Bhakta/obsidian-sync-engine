@@ -18,6 +18,7 @@ export default class ObsidianSyncPlugin extends Plugin {
 	settings!: ObsidianSyncSettings;
 	sync!: VaultSync;
 	private isSeeding = false;
+	private reloadRequired = false;
 
 	async onload() {
 		await this.loadSettings();
@@ -81,6 +82,7 @@ export default class ObsidianSyncPlugin extends Plugin {
 		const serverUrl = normalizeServerUrl(value);
 		const identity = serverIdentityFor(serverUrl);
 		if (identity !== this.settings.serverIdentity) {
+			this.reloadRequired = true;
 			this.settings.revision = 0;
 			this.settings.clientSecret = DEFAULT_SETTINGS.clientSecret;
 			this.settings.serverIdentity = identity;
@@ -90,7 +92,14 @@ export default class ObsidianSyncPlugin extends Plugin {
 		await this.saveSettings();
 	}
 
+	isSyncSuspended(): boolean {
+		return this.reloadRequired;
+	}
+
 	async authenticate(): Promise<void> {
+		if (this.reloadRequired) {
+			throw new Error("Reload Obsidian before pairing with the new server");
+		}
 		try {
 			await ensureAuthenticated(this);
 			new Notice('Authenticated with sync server');

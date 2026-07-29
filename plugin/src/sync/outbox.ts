@@ -66,29 +66,15 @@ export async function drain(
 	handler: (op: OutboxOp) => Promise<void>,
 ): Promise<void> {
 	const snapshot = await mutexFor(outboxPath).run(() =>
-		readLines<OutboxOp>(fs, outboxPath).then(coalesce),
+		readLines<OutboxOp>(fs, outboxPath),
 	);
 	for (const op of snapshot) {
 		await handler(op);
 		await mutexFor(outboxPath).run(async () => {
 			const current = await readLines<OutboxOp>(fs, outboxPath);
-			const index =
-				op.op === "put"
-					? current.findLastIndex(
-							(candidate) =>
-								candidate.op === "put" && candidate.path === op.path,
-						)
-					: current.findIndex((candidate) => sameOp(candidate, op));
+			const index = current.findIndex((candidate) => sameOp(candidate, op));
 			if (index >= 0) {
-				if (op.op === "put") {
-					for (let cursor = index; cursor >= 0; cursor--) {
-						const candidate = current[cursor]!;
-						if (candidate.op !== "put" || candidate.path !== op.path) break;
-						current.splice(cursor, 1);
-					}
-				} else {
-					current.splice(index, 1);
-				}
+				current.splice(index, 1);
 				await writeLines(fs, outboxPath, current);
 			}
 		});
