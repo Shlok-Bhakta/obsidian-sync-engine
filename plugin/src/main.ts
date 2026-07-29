@@ -66,7 +66,8 @@ export default class ObsidianSyncPlugin extends Plugin {
 	}
 
 	async loadSettings() {
-		const loaded = (await this.loadData()) as Partial<ObsidianSyncSettings>;
+		const loaded =
+			((await this.loadData()) ?? {}) as Partial<ObsidianSyncSettings>;
 		this.settings = Object.assign(
 			{},
 			DEFAULT_SETTINGS,
