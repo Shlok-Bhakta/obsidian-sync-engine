@@ -269,6 +269,27 @@ describe("migrateServerState", () => {
 		expect(await fs.exists("state/encoded/outbox.jsonl.tmp")).toBe(false);
 	});
 
+	test("recovers a quarantine sidecar from its ordinary write backup", async () => {
+		const fs = new MemoryAdapter();
+		fs.dirs.add("state/legacy");
+		fs.dirs.add("state/encoded");
+		fs.files.set("state/legacy/outbox.jsonl", '{"id":"old"}\n');
+		fs.files.set("state/legacy/outbox.jsonl.corrupt.bak", "recover-me\n");
+		fs.files.set(
+			"state/legacy/outbox.jsonl.corrupt.tmp",
+			"uncommitted\n",
+		);
+
+		await migrateServerState(fs, "state", "legacy", "encoded");
+
+		expect(
+			fs.files.get("state/encoded/outbox.jsonl.legacy.corrupt"),
+		).toBe("recover-me\n");
+		expect(
+			await fs.exists("state/legacy/outbox.jsonl.corrupt.tmp"),
+		).toBe(false);
+	});
+
 	test("recovers a destination backup before considering source-only fast path", async () => {
 		const fs = new MemoryAdapter();
 		fs.dirs.add("state/legacy");

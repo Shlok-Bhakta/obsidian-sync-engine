@@ -88,8 +88,10 @@ async function mergeJournal(
 	source: string,
 	target: string,
 ): Promise<void> {
+	const sourceQuarantine = `${source}.corrupt`;
 	await recoverJournalWrite(adapter, source);
 	await recoverJournalWrite(adapter, target);
+	await recoverJournalWrite(adapter, sourceQuarantine);
 
 	const tmp = `${target}.migration.tmp`;
 	const backup = `${target}.migration.bak`;
@@ -129,7 +131,6 @@ async function mergeJournal(
 				await adapter.write(quarantineTarget, quarantineBody);
 			}
 			if (await adapter.exists(source)) await adapter.remove(source);
-			const sourceQuarantine = `${source}.corrupt`;
 			if (await adapter.exists(sourceQuarantine)) {
 				await adapter.remove(sourceQuarantine);
 			}
@@ -156,7 +157,6 @@ async function mergeJournal(
 			await adapter.rename(backup, target);
 		}
 	}
-	const sourceQuarantine = `${source}.corrupt`;
 	const hasSource = await adapter.exists(source);
 	const hasSourceQuarantine = await adapter.exists(sourceQuarantine);
 	if (!hasSource && !hasSourceQuarantine) return;
