@@ -738,7 +738,7 @@ describe("object store", () => {
 		expect((await store.inbox(first.revision)).at(-1)?.isDeleted).toBe(false);
 	});
 
-	it("ignores a subtree delete when any live descendant is newer", async () => {
+	it("deletes observed subtree members while preserving newer descendants", async () => {
 		const client = await createClientFixture({ client_name: "alice" });
 		const store = new ObjectStore();
 		const first = await store.upload({
@@ -754,9 +754,17 @@ describe("object store", () => {
 
 		const result = await store.delete("shape", client.id, first.revision);
 
-		expect(result.revision).toBe(child.revision);
-		expect(decode(await store.download("shape/old.md"))).toBe("old");
+		expect(result.revision).toBeGreaterThan(child.revision);
+		expect(await store.download("shape/old.md")).toBeNull();
 		expect(decode(await store.download("shape/child.md"))).toBe("new");
+		const changes = await store.inbox(first.revision);
+		expect(
+			changes.map(({ path, isDeleted }) => ({ path, isDeleted })),
+		).toEqual([
+			{ path: "shape/child.md", isDeleted: false },
+			{ path: "shape/old.md", isDeleted: true },
+		]);
+		expect(changes.some(({ path }) => path === "shape")).toBe(false);
 	});
 
 	it("rejects malformed causal delete revisions", async () => {

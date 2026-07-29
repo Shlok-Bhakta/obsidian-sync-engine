@@ -159,36 +159,54 @@ export class ObjectStore {
 
         const [row] = (await sql.begin(async (tx) => {
             await tx`SELECT pg_advisory_xact_lock(hashtext(${REVISION_LOCK_KEY}))`;
-            if (baseRevision !== undefined) {
-                const [newer] = await tx<{ last_updated_revision: string }[]>`
-                    SELECT last_updated_revision FROM files
-                    WHERE file_is_deleted = FALSE
-                      AND (
-                        file_path = ${canonicalPath}
-                        OR position(${canonicalPath + "/"} in file_path) = 1
-                      )
-                      AND last_updated_revision > ${baseRevision}
-                    ORDER BY last_updated_revision DESC
-                    LIMIT 1
-                `;
-                if (newer) {
-                    return [{ last_updated_revision: Number(newer.last_updated_revision) }];
-                }
-            }
-            const descendants = await tx<{ file_path: string }[]>`
-                SELECT file_path FROM files
+            const active = await tx<{
+                file_path: string;
+                last_updated_revision: string;
+            }[]>`
+                SELECT file_path, last_updated_revision FROM files
                 WHERE file_is_deleted = FALSE
-                  AND position(${canonicalPath + "/"} in file_path) = 1
+                  AND (
+                    file_path = ${canonicalPath}
+                    OR position(${canonicalPath + "/"} in file_path) = 1
+                  )
                 ORDER BY file_path
             `;
-            for (const descendant of descendants) {
-                await tx`
+            const newer = active.filter(
+                ({ last_updated_revision }) =>
+                    baseRevision !== undefined &&
+                    Number(last_updated_revision) > baseRevision,
+            );
+            let lastDeletedRevision: number | null = null;
+            for (const candidate of active) {
+                if (
+                    candidate.file_path === canonicalPath ||
+                    (baseRevision !== undefined &&
+                        Number(candidate.last_updated_revision) > baseRevision)
+                ) {
+                    continue;
+                }
+                const [deleted] = await tx<{ last_updated_revision: string }[]>`
                     UPDATE files
                     SET author_id = ${authorId}, file_is_deleted = TRUE,
                         content = NULL, updated_at = NOW(),
                         last_updated_revision = NEXTVAL('global_revision')
-                    WHERE file_path = ${descendant.file_path}
+                    WHERE file_path = ${candidate.file_path}
+                    RETURNING last_updated_revision
                 `;
+                lastDeletedRevision = Number(deleted.last_updated_revision);
+            }
+            if (newer.length > 0) {
+                // A parent tombstone would recursively erase the newer members
+                // on clients. Emit only tombstones for members visible at the
+                // deleting client's base revision.
+                const acknowledgedRevision =
+                    lastDeletedRevision ??
+                    Math.max(
+                        ...newer.map(({ last_updated_revision }) =>
+                            Number(last_updated_revision)
+                        ),
+                    );
+                return [{ last_updated_revision: acknowledgedRevision }];
             }
             return tx<FileContentRow[]>`
                 INSERT INTO files (file_path, author_id, file_is_deleted, content)

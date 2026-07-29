@@ -49,6 +49,18 @@ class MemoryAdapter {
 	}
 }
 
+class InterruptedMarkerAdapter extends MemoryAdapter {
+	private interruptMarkerPublish = true;
+
+	override async rename(from: string, to: string): Promise<void> {
+		if (this.interruptMarkerPublish && to.endsWith(".migration.json")) {
+			this.interruptMarkerPublish = false;
+			throw new Error("simulated interruption during marker publication");
+		}
+		await super.rename(from, to);
+	}
+}
+
 describe("migrateServerState", () => {
 	test("renames an untouched legacy state directory", async () => {
 		const fs = new MemoryAdapter();
@@ -178,6 +190,56 @@ describe("migrateServerState", () => {
 		expect(
 			await fs.exists("state/legacy/outbox.jsonl.corrupt"),
 		).toBe(false);
+	});
+
+	test("restarts safely after marker publication is interrupted", async () => {
+		const fs = new InterruptedMarkerAdapter();
+		fs.dirs.add("state/legacy");
+		fs.dirs.add("state/encoded");
+		fs.files.set("state/legacy/outbox.jsonl", '{"id":"old"}\n');
+		fs.files.set("state/encoded/outbox.jsonl", '{"id":"new"}\n');
+
+		let interruption: unknown;
+		try {
+			await migrateServerState(fs, "state", "legacy", "encoded");
+		} catch (error) {
+			interruption = error;
+		}
+		expect(interruption).toBeInstanceOf(Error);
+		expect((interruption as Error).message).toContain("simulated interruption");
+		expect(fs.files.get("state/legacy/outbox.jsonl")).toBe('{"id":"old"}\n');
+		expect(fs.files.get("state/encoded/outbox.jsonl")).toBe('{"id":"new"}\n');
+
+		await migrateServerState(fs, "state", "legacy", "encoded");
+
+		expect(fs.files.get("state/encoded/outbox.jsonl")).toBe(
+			'{"id":"old"}\n{"id":"new"}\n',
+		);
+		expect(
+			await fs.exists("state/encoded/outbox.jsonl.migration.json.tmp"),
+		).toBe(false);
+	});
+
+	test("restores the backup before rebuilding from an invalid legacy marker", async () => {
+		const fs = new MemoryAdapter();
+		fs.dirs.add("state/legacy");
+		fs.dirs.add("state/encoded");
+		fs.files.set("state/legacy/outbox.jsonl", '{"id":"old"}\n');
+		fs.files.set(
+			"state/encoded/outbox.jsonl",
+			'{"id":"old"}\n{"id":"new"}\n',
+		);
+		fs.files.set(
+			"state/encoded/outbox.jsonl.migration.bak",
+			'{"id":"new"}\n',
+		);
+		fs.files.set("state/encoded/outbox.jsonl.migration.json", '{"body":');
+
+		await migrateServerState(fs, "state", "legacy", "encoded");
+
+		expect(fs.files.get("state/encoded/outbox.jsonl")).toBe(
+			'{"id":"old"}\n{"id":"new"}\n',
+		);
 	});
 
 	test("recovers a destination backup before considering source-only fast path", async () => {

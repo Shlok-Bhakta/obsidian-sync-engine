@@ -39,6 +39,30 @@ function joinJournalFragments(...fragments: string[]): string {
 		.join("");
 }
 
+type MigrationMarker = { body: string; quarantineBody: string };
+
+function parseMigrationMarker(raw: string): MigrationMarker | null {
+	try {
+		const value = JSON.parse(raw) as {
+			body?: unknown;
+			quarantineBody?: unknown;
+		};
+		if (
+			typeof value.body !== "string" ||
+			(value.quarantineBody !== undefined &&
+				typeof value.quarantineBody !== "string")
+		) {
+			return null;
+		}
+		return {
+			body: value.body,
+			quarantineBody: value.quarantineBody ?? "",
+		};
+	} catch {
+		return null;
+	}
+}
+
 async function mergeJournal(
 	adapter: StateAdapter,
 	source: string,
@@ -47,38 +71,55 @@ async function mergeJournal(
 	const tmp = `${target}.migration.tmp`;
 	const backup = `${target}.migration.bak`;
 	const marker = `${target}.migration.json`;
+	const markerTmp = `${marker}.tmp`;
 	const quarantineTarget = `${target}.legacy.corrupt`;
 
 	// An explicit marker distinguishes a previously installed merge from a
 	// coincidental source/target prefix. It contains the prepared body so any
 	// crash point can resume without guessing from journal contents.
 	if (await adapter.exists(marker)) {
-		const { body, quarantineBody = "" } = JSON.parse(
-			await adapter.read(marker),
-		) as { body: string; quarantineBody?: string };
-		if (
-			!(await adapter.exists(target)) ||
-			(await adapter.read(target)) !== body
-		) {
-			await adapter.write(tmp, body);
-			if (await adapter.exists(target)) {
-				if (await adapter.exists(backup)) await adapter.remove(backup);
-				await adapter.rename(target, backup);
+		const prepared = parseMigrationMarker(await adapter.read(marker));
+		if (!prepared) {
+			// Direct marker writes from older builds could be torn. Since the
+			// marker was published before replacement, restore the committed
+			// backup (when replacement had started) and rebuild from source.
+			if (await adapter.exists(backup)) {
+				if (await adapter.exists(target)) await adapter.remove(target);
+				await adapter.rename(backup, target);
 			}
-			await adapter.rename(tmp, target);
+			if (await adapter.exists(tmp)) await adapter.remove(tmp);
+			await adapter.remove(marker);
+		} else {
+			const { body, quarantineBody } = prepared;
+			if (
+				!(await adapter.exists(target)) ||
+				(await adapter.read(target)) !== body
+			) {
+				await adapter.write(tmp, body);
+				if (await adapter.exists(target)) {
+					if (await adapter.exists(backup)) await adapter.remove(backup);
+					await adapter.rename(target, backup);
+				}
+				await adapter.rename(tmp, target);
+			}
+			if (quarantineBody.length > 0) {
+				await adapter.write(quarantineTarget, quarantineBody);
+			}
+			if (await adapter.exists(source)) await adapter.remove(source);
+			const sourceQuarantine = `${source}.corrupt`;
+			if (await adapter.exists(sourceQuarantine)) {
+				await adapter.remove(sourceQuarantine);
+			}
+			if (await adapter.exists(tmp)) await adapter.remove(tmp);
+			if (await adapter.exists(backup)) await adapter.remove(backup);
+			if (await adapter.exists(markerTmp)) await adapter.remove(markerTmp);
+			await adapter.remove(marker);
+			return;
 		}
-		if (quarantineBody.length > 0) {
-			await adapter.write(quarantineTarget, quarantineBody);
-		}
-		if (await adapter.exists(source)) await adapter.remove(source);
-		const sourceQuarantine = `${source}.corrupt`;
-		if (await adapter.exists(sourceQuarantine)) {
-			await adapter.remove(sourceQuarantine);
-		}
-		if (await adapter.exists(tmp)) await adapter.remove(tmp);
-		if (await adapter.exists(backup)) await adapter.remove(backup);
-		await adapter.remove(marker);
-		return;
+	}
+	if (await adapter.exists(markerTmp)) {
+		// An interrupted atomic publication cannot own any installed target.
+		await adapter.remove(markerTmp);
 	}
 
 	// Recover artifacts produced by versions that predate explicit markers.
@@ -135,7 +176,8 @@ async function mergeJournal(
 	const lines = [...olderLines, ...newerLines];
 	const body = lines.length > 0 ? `${lines.join("\n")}\n` : "";
 	await adapter.write(tmp, body);
-	await adapter.write(marker, JSON.stringify({ body, quarantineBody }));
+	await adapter.write(markerTmp, JSON.stringify({ body, quarantineBody }));
+	await adapter.rename(markerTmp, marker);
 	await adapter.rename(target, backup);
 	// If any step fails, marker/source/artifacts remain for startup recovery.
 	await adapter.rename(tmp, target);

@@ -321,4 +321,56 @@ describe("obsidian multi-client e2e", () => {
 			{ timeoutMs: 60_000, label: "file becomes directory on B" },
 		);
 	}, 180_000);
+
+	test("E10: a causal subtree delete preserves only concurrent members", async () => {
+		const auth = (await clientA.readSettings()).clientSecret;
+		const upload = async (path: string, body: string): Promise<number> => {
+			const response = await fetch(`${stack.serverUrlLocal}/files`, {
+				method: "POST",
+				headers: {
+					Authorization: auth,
+					"X-Obsidian-Path": encodeURIComponent(path),
+				},
+				body,
+			});
+			expect(response.status).toBe(200);
+			const result = (await response.json()) as { revision: number };
+			return result.revision;
+		};
+
+		const baseRevision = await upload("causal/old.md", "observed");
+		await upload("causal/new.md", "concurrent");
+		const deleted = await fetch(
+			`${stack.serverUrlLocal}/files?path=${encodeURIComponent("causal")}`,
+			{
+				method: "DELETE",
+				headers: {
+					Authorization: auth,
+					"X-Obsidian-Base-Revision": String(baseRevision),
+				},
+			},
+		);
+		expect(deleted.status).toBe(200);
+
+		for (const client of [clientA, clientB]) {
+			await waitFor(
+				async () => {
+					await client.forceTick();
+					const oldExists = await Bun.file(
+						client.vaultPath("causal/old.md"),
+					).exists();
+					const newer = Bun.file(client.vaultPath("causal/new.md"));
+					return (
+						!oldExists &&
+						(await newer.exists()) &&
+						(await newer.text()) === "concurrent"
+					);
+				},
+				{
+					timeoutMs: 60_000,
+					label: `causal subtree delete converges on ${client.name}`,
+				},
+			);
+		}
+	}, 120_000);
 });
