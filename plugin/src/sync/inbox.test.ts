@@ -134,6 +134,27 @@ describe("inbox", () => {
 		expect(await readInbox(fs, INBOX)).toEqual([]);
 	});
 
+	test("applyInbox defers a pending local path without advancing or dropping it", async () => {
+		const fs = new MemorySyncFs();
+		await writeInbox(fs, INBOX, [{ rev: 2, op: "put", path: "a.md" }]);
+		let revision = 1;
+		await applyInbox(fs, INBOX, {
+			applyPut: async () => {
+				throw new Error("must not apply");
+			},
+			applyDelete: async () => {},
+			getRevision: () => revision,
+			setRevision: (next) => {
+				revision = next;
+			},
+			shouldDeferApply: () => true,
+		});
+		expect(revision).toBe(1);
+		expect(await readInbox(fs, INBOX)).toEqual([
+			{ rev: 2, op: "put", path: "a.md" },
+		]);
+	});
+
 	test("applyInbox skips by rev via shouldSkipApply (self-echo) but still advances revision, drops the line, and consumes it", async () => {
 		const fs = new MemorySyncFs();
 		await writeInbox(fs, INBOX, [

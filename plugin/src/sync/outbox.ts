@@ -8,6 +8,19 @@ function sameOp(a: OutboxOp, b: OutboxOp): boolean {
 	return a.op === b.op && a.path === b.path && a.ts === b.ts;
 }
 
+function coalesce(ops: OutboxOp[]): OutboxOp[] {
+	const result: OutboxOp[] = [];
+	for (const op of ops) {
+		const last = result[result.length - 1];
+		if (last?.op === "put" && op.op === "put" && last.path === op.path) {
+			result[result.length - 1] = op;
+		} else {
+			result.push(op);
+		}
+	}
+	return result;
+}
+
 /**
  * Enqueue an op, coalescing consecutive "put" ops for the same path.
  *
@@ -20,19 +33,12 @@ export async function enqueue(
 	op: OutboxOp,
 ): Promise<void> {
 	return mutexFor(outboxPath).run(async () => {
-		const lines = await readLines<OutboxOp>(fs, outboxPath);
-		const last = lines[lines.length - 1];
-		if (last && last.op === "put" && op.op === "put" && last.path === op.path) {
-			lines[lines.length - 1] = op;
-		} else {
-			lines.push(op);
-		}
-		await writeLines(fs, outboxPath, lines);
+		await fs.append(outboxPath, JSON.stringify(op) + "\n");
 	});
 }
 
 export async function list(fs: SyncFs, outboxPath: string): Promise<OutboxOp[]> {
-	return readLines<OutboxOp>(fs, outboxPath);
+	return coalesce(await readLines<OutboxOp>(fs, outboxPath));
 }
 
 /**
@@ -59,16 +65,32 @@ export async function drain(
 	outboxPath: string,
 	handler: (op: OutboxOp) => Promise<void>,
 ): Promise<void> {
-	return mutexFor(outboxPath).run(async () => {
-		let lines = await readLines<OutboxOp>(fs, outboxPath);
-		while (lines.length > 0) {
-			const op = lines[0]!;
-			await handler(op);
-
+	const snapshot = await mutexFor(outboxPath).run(() =>
+		readLines<OutboxOp>(fs, outboxPath).then(coalesce),
+	);
+	for (const op of snapshot) {
+		await handler(op);
+		await mutexFor(outboxPath).run(async () => {
 			const current = await readLines<OutboxOp>(fs, outboxPath);
-			const head = current[0];
-			lines = head && sameOp(head, op) ? current.slice(1) : current;
-			await writeLines(fs, outboxPath, lines);
-		}
-	});
+			const index =
+				op.op === "put"
+					? current.findLastIndex(
+							(candidate) =>
+								candidate.op === "put" && candidate.path === op.path,
+						)
+					: current.findIndex((candidate) => sameOp(candidate, op));
+			if (index >= 0) {
+				if (op.op === "put") {
+					for (let cursor = index; cursor >= 0; cursor--) {
+						const candidate = current[cursor]!;
+						if (candidate.op !== "put" || candidate.path !== op.path) break;
+						current.splice(cursor, 1);
+					}
+				} else {
+					current.splice(index, 1);
+				}
+				await writeLines(fs, outboxPath, current);
+			}
+		});
+	}
 }

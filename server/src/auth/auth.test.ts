@@ -16,7 +16,10 @@ describe("HTTP /auth", () => {
 
 		const res = await app.request("/auth", {
 			method: "POST",
-			headers: { "Content-Type": "application/json" },
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: `Bearer ${process.env.BOOTSTRAP_TOKEN}`,
+			},
 			body: serialize({
 				type: MessageType.AUTH_ACK,
 				client_name: "first-client",
@@ -38,7 +41,10 @@ describe("HTTP /auth", () => {
 
 		const first = await app.request("/auth", {
 			method: "POST",
-			headers: { "Content-Type": "application/json" },
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: `Bearer ${process.env.BOOTSTRAP_TOKEN}`,
+			},
 			body: serialize({
 				type: MessageType.AUTH_ACK,
 				client_name: "only-client",
@@ -62,5 +68,25 @@ describe("HTTP /auth", () => {
 		});
 		expect(second.status).toBe(200);
 		expect((await readMessage(second)).type).toBe(MessageType.AUTH_SUCCESS);
+	});
+
+	it("allows exactly one concurrent first-client enrollment", async () => {
+		const app = new Hono();
+		registerAuthRoutes(app);
+		const request = (clientName: string) =>
+			app.request("/auth", {
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					Authorization: `Bearer ${process.env.BOOTSTRAP_TOKEN}`,
+				},
+				body: serialize({
+					type: MessageType.AUTH_ACK,
+					client_name: clientName,
+					token: "unissued",
+				}),
+			});
+		const responses = await Promise.all([request("first-a"), request("first-b")]);
+		expect(responses.map(({ status }) => status).sort()).toEqual([200, 401]);
 	});
 });

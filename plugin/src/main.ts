@@ -4,6 +4,8 @@ import {
 	DEFAULT_SETTINGS,
 	ObsidianSyncSettings,
 	SyncSettingTab,
+	normalizeServerUrl,
+	serverIdentityFor,
 } from './settings';
 import { SyncStatusView, SYNC_STATUS_VIEW_TYPE } from './ui/syncStatusView';
 import {
@@ -59,15 +61,33 @@ export default class ObsidianSyncPlugin extends Plugin {
 	}
 
 	async loadSettings() {
+		const loaded = (await this.loadData()) as Partial<ObsidianSyncSettings>;
 		this.settings = Object.assign(
 			{},
 			DEFAULT_SETTINGS,
-			(await this.loadData()) as Partial<ObsidianSyncSettings>,
+			loaded,
 		);
+		this.settings.serverUrl = normalizeServerUrl(this.settings.serverUrl);
+		if (!loaded.serverIdentity) {
+			this.settings.serverIdentity = serverIdentityFor(this.settings.serverUrl);
+		}
 	}
 
 	async saveSettings() {
 		await this.saveData(this.settings);
+	}
+
+	async changeServerUrl(value: string): Promise<void> {
+		const serverUrl = normalizeServerUrl(value);
+		const identity = serverIdentityFor(serverUrl);
+		if (identity !== this.settings.serverIdentity) {
+			this.settings.revision = 0;
+			this.settings.clientSecret = DEFAULT_SETTINGS.clientSecret;
+			this.settings.serverIdentity = identity;
+			new Notice("Server changed. Reload Obsidian before pairing; sync state is isolated per server.");
+		}
+		this.settings.serverUrl = serverUrl;
+		await this.saveSettings();
 	}
 
 	async authenticate(): Promise<void> {
@@ -92,7 +112,10 @@ export default class ObsidianSyncPlugin extends Plugin {
 		try {
 			new Notice('Seeding server from this vault…');
 			await ensureAuthenticated(this);
-			await seedServerFromVault(this, this.sync);
+			const result = await seedServerFromVault(this, this.sync);
+			if (!result.ok) {
+				throw new Error(result.error);
+			}
 			new Notice('Vault seeded');
 		} catch (error) {
 			console.error('Seeding server from vault failed', error);

@@ -28,12 +28,12 @@ describe("canonicalizeSyncPath", () => {
 		expect(canonicalizeSyncPath("a/b/c.md")).toBe("a/b/c.md");
 	});
 
-	test("converts backslashes to forward slashes", () => {
-		expect(canonicalizeSyncPath("a\\b\\c.md")).toBe("a/b/c.md");
+	test("rejects backslashes rather than guessing path intent", () => {
+		expect(() => canonicalizeSyncPath("a\\b\\c.md")).toThrow(InvalidSyncPathError);
 	});
 
-	test("drops duplicate separators and current-directory segments", () => {
-		expect(canonicalizeSyncPath("a//./b/c.md")).toBe("a/b/c.md");
+	test("rejects noncanonical separators and current-directory segments", () => {
+		expect(() => canonicalizeSyncPath("a//./b/c.md")).toThrow(InvalidSyncPathError);
 	});
 
 	test("rejects a parent-directory traversal segment", () => {
@@ -50,5 +50,12 @@ describe("canonicalizeSyncPath", () => {
 
 	test("rejects an empty path", () => {
 		expect(() => canonicalizeSyncPath("")).toThrow(InvalidSyncPathError);
+	});
+
+	test("rejects Obsidian configuration paths", () => {
+		const configPath = [".", "obsidian/workspace.json"].join("");
+		expect(() => canonicalizeSyncPath(configPath)).toThrow(
+			InvalidSyncPathError,
+		);
 	});
 });

@@ -1,5 +1,9 @@
 import type { RequestUrlParam, RequestUrlResponse } from "obsidian";
-import { inboxOpSchema } from "obsidian-sync-protocol";
+import {
+	inboxOpSchema,
+	revisionResponseSchema,
+	revisionSchema,
+} from "obsidian-sync-protocol";
 import { PermanentRemoteError, type SyncTransport } from "./engine";
 import type { InboxOp } from "./inbox";
 
@@ -80,7 +84,7 @@ export class HttpTransport implements SyncTransport {
 			throw: false,
 		});
 		assertOk(response, `Upload of "${path}"`);
-		return { revision: Number((response.json as { revision: unknown }).revision) };
+		return revisionResponseSchema.parse(response.json);
 	}
 
 	async deleteRemote(path: string): Promise<{ revision: number }> {
@@ -91,7 +95,7 @@ export class HttpTransport implements SyncTransport {
 			throw: false,
 		});
 		assertOk(response, `Delete of "${path}"`);
-		return { revision: Number((response.json as { revision: unknown }).revision) };
+		return revisionResponseSchema.parse(response.json);
 	}
 
 	async download(path: string): Promise<ArrayBuffer> {
@@ -109,8 +113,9 @@ export class HttpTransport implements SyncTransport {
 	}
 
 	async fetchInbox(rev: number): Promise<InboxOp[]> {
+		const cursor = revisionSchema.parse(rev);
 		const response = await this.request({
-			url: `${this.getServerUrl()}/inbox?rev=${rev}`,
+			url: `${this.getServerUrl()}/inbox?rev=${cursor}`,
 			method: "GET",
 			headers: { Authorization: this.getAuthorization() },
 			throw: false,

@@ -49,6 +49,8 @@ export type ApplyInboxOptions = {
 	 * paths with a pending local edit and for self-echoed revisions.
 	 */
 	shouldSkipApply?: (op: InboxOp) => boolean;
+	/** Leave this line and all later lines durable for a later tick. */
+	shouldDeferApply?: (op: InboxOp) => boolean;
 };
 
 /**
@@ -86,6 +88,10 @@ export async function applyInbox(
 				lines = lines.slice(1);
 				await writeInbox(fs, inboxPath, lines);
 				continue;
+			}
+
+			if (options.shouldDeferApply?.(line)) {
+				return;
 			}
 
 			if (options.shouldSkipApply?.(line)) {

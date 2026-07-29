@@ -28,6 +28,10 @@ class MemoryVaultFs implements VaultBlobFs {
 		this.files.set(path, data);
 	}
 
+	async append(path: string, data: string): Promise<void> {
+		this.files.set(path, (this.files.get(path) ?? "") + data);
+	}
+
 	async exists(path: string): Promise<boolean> {
 		return this.files.has(path);
 	}
@@ -57,6 +61,7 @@ class MemoryVaultFsNoRemove implements VaultBlobFs {
 
 	read = this.inner.read.bind(this.inner);
 	write = this.inner.write.bind(this.inner);
+	append = this.inner.append.bind(this.inner);
 	exists = this.inner.exists.bind(this.inner);
 	mkdir = this.inner.mkdir.bind(this.inner);
 	readBinary = this.inner.readBinary.bind(this.inner);
@@ -636,7 +641,8 @@ describe("SyncEngine", () => {
 
 		const result = await engine.tick();
 
-		expect(result.ok).toBe(true);
+		expect(result.ok).toBe(false);
+		expect(result.deadLettered).toBe(1);
 		expect(result.deadLettered).toBe(1);
 		expect(result.pushed).toBe(1);
 		expect(await listOutbox(fs, OUTBOX)).toEqual([]);

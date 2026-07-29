@@ -18,21 +18,10 @@ export class InvalidSyncPathError extends Error {
  * vault paths should never need to escape a directory.
  */
 export function canonicalizeSyncPath(path: string): string {
-	if (typeof path !== "string" || path.length === 0 || path.includes("\0")) {
+	if (!isCanonicalSyncPath(path)) {
 		throw new InvalidSyncPathError(path);
 	}
-	const segments = path
-		.replace(/\\/g, "/")
-		.split("/")
-		.filter((segment) => segment.length > 0 && segment !== ".");
-
-	if (segments.length === 0 || segments.includes("..")) {
-		throw new InvalidSyncPathError(path);
-	}
-	if (/^[a-zA-Z]:$/.test(segments[0]!) || path.startsWith("/")) {
-		throw new InvalidSyncPathError(path);
-	}
-	return segments.join("/");
+	return path;
 }
 
 /**
@@ -54,3 +43,4 @@ export function ancestorDirs(path: string): string[] {
 	}
 	return dirs;
 }
+import { isCanonicalSyncPath } from "obsidian-sync-protocol";

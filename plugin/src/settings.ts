@@ -8,13 +8,31 @@ export interface ObsidianSyncSettings {
 	clientName: string;
 	clientSecret: string;
 	revision: number;
+	setupToken: string;
+	serverIdentity: string;
+}
+
+export function normalizeServerUrl(value: string): string {
+	return value.trim().replace(/\/+$/, "");
+}
+
+export function serverIdentityFor(value: string): string {
+	const normalized = normalizeServerUrl(value);
+	let hash = 0x811c9dc5;
+	for (let index = 0; index < normalized.length; index++) {
+		hash ^= normalized.charCodeAt(index);
+		hash = Math.imul(hash, 0x01000193);
+	}
+	return (hash >>> 0).toString(16).padStart(8, "0");
 }
 
 export const DEFAULT_SETTINGS: ObsidianSyncSettings = {
 	serverUrl: 'https://...',
 	clientName: 'Main computer',
 	clientSecret: 'Made by server',
-	revision: 0
+	revision: 0,
+	setupToken: "",
+	serverIdentity: serverIdentityFor("https://..."),
 };
 
 const isHttpUrl = (value: string): boolean => {
@@ -72,9 +90,8 @@ export class SyncSettingTab extends PluginSettingTab {
 					.setPlaceholder('HTTPS://...')
 					.setValue(this.plugin.settings.serverUrl)
 					.onChange(async (value) => {
-						this.plugin.settings.serverUrl = value;
+						await this.plugin.changeServerUrl(value);
 						updateServerUrlWarning(value);
-						await this.plugin.saveSettings();
 					}),
 			);
 
@@ -88,6 +105,19 @@ export class SyncSettingTab extends PluginSettingTab {
 		};
 
 		updateServerUrlWarning(this.plugin.settings.serverUrl);
+
+		new Setting(containerEl)
+		.setName("Setup token")
+		.setDesc("Required only to enroll the first client. It must match the server setup token.")
+		.addText((text) =>
+			text
+				.setPlaceholder("Server setup token")
+				.setValue(this.plugin.settings.setupToken)
+				.onChange(async (value) => {
+					this.plugin.settings.setupToken = value;
+					await this.plugin.saveSettings();
+				}),
+		);
 
 		new Setting(containerEl)
 		.setName("Pair with server")

@@ -5,7 +5,7 @@ import {
 	type TAbstractFile,
 } from 'obsidian';
 import type ObsidianSyncPlugin from './main';
-import { SyncEngine } from './sync/engine';
+import { SyncEngine, type SyncTickResult } from './sync/engine';
 import { HttpTransport } from './sync/httpTransport';
 import { ObsidianFs } from './sync/obsidianFs';
 
@@ -21,6 +21,7 @@ export type VaultSync = {
 	engine: SyncEngine;
 	fs: ObsidianFs;
 	outboxPath: string;
+	deadLetterPath: string;
 	status: SyncStatus;
 };
 
@@ -33,11 +34,17 @@ function getPluginDir(plugin: ObsidianSyncPlugin): string {
 }
 
 function getOutboxPath(plugin: ObsidianSyncPlugin): string {
-	return normalizePath(`${getPluginDir(plugin)}/outbox.jsonl`);
+	return normalizePath(`${getPluginDir(plugin)}/state/${plugin.settings.serverIdentity}/outbox.jsonl`);
 }
 
 function getInboxPath(plugin: ObsidianSyncPlugin): string {
-	return normalizePath(`${getPluginDir(plugin)}/inbox.jsonl`);
+	return normalizePath(`${getPluginDir(plugin)}/state/${plugin.settings.serverIdentity}/inbox.jsonl`);
+}
+
+function getDeadLetterPath(plugin: ObsidianSyncPlugin): string {
+	return normalizePath(
+		`${getPluginDir(plugin)}/state/${plugin.settings.serverIdentity}/dead-letter.jsonl`,
+	);
 }
 
 function getDataJsonPath(plugin: ObsidianSyncPlugin): string {
@@ -52,6 +59,10 @@ function getDataJsonPath(plugin: ObsidianSyncPlugin): string {
 function isSyncEngineOwnedPath(plugin: ObsidianSyncPlugin, path: string): boolean {
 	const normalized = normalizePath(path);
 	const pluginDir = getPluginDir(plugin);
+	const configDir = normalizePath(plugin.app.vault.configDir);
+	if (normalized === configDir || normalized.startsWith(`${configDir}/`)) {
+		return true;
+	}
 	if (
 		normalized === getOutboxPath(plugin) ||
 		normalized === getInboxPath(plugin) ||
@@ -78,9 +89,13 @@ function isSyncEngineOwnedPath(plugin: ObsidianSyncPlugin, path: string): boolea
  * Called once from `onload`.
  */
 export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
-	const fs = new ObsidianFs(plugin.app.vault.adapter);
+	const fs = new ObsidianFs(
+		plugin.app.vault.adapter,
+		plugin.app.vault,
+	);
 	const outboxPath = getOutboxPath(plugin);
 	const inboxPath = getInboxPath(plugin);
+	const deadLetterPath = getDeadLetterPath(plugin);
 	const status: SyncStatus = { lastTickAt: null, lastError: null };
 
 	const transport = new HttpTransport({
@@ -94,28 +109,36 @@ export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
 		transport,
 		outboxPath,
 		inboxPath,
+		deadLetterPath,
 		getRevision: () => plugin.settings.revision,
 		setRevision: (revision) => {
 			plugin.settings.revision = revision;
 			return plugin.saveSettings();
 		},
 		debounceMs: DEBOUNCE_MS,
+		onPermanentFailure: ({ op, error }) => {
+			status.lastError = `${op.path}: ${error}`;
+		},
 	});
 
 	// Suppressed whenever the write/delete originated from *this* fs instance
 	// (e.g. the engine applying a remote put/delete) rather than from the
 	// user editing the vault, so applying an inbound change can never
 	// re-enqueue itself as an outbound one.
-	const isLocallyOriginated = (path: string) =>
-		!fs.isWriting && !isSyncEngineOwnedPath(plugin, path);
+	const isLocallyOriginated = (
+		path: string,
+		operation: "put" | "delete",
+	) =>
+		!fs.consumeInboundEvent(path, operation) &&
+		!isSyncEngineOwnedPath(plugin, path);
 
 	const enqueuePutIfLocal = (path: string) => {
-		if (isLocallyOriginated(path)) {
+		if (isLocallyOriginated(path, "put")) {
 			engine.enqueuePut(path);
 		}
 	};
 	const enqueueDeleteIfLocal = (path: string) => {
-		if (isLocallyOriginated(path)) {
+		if (isLocallyOriginated(path, "delete")) {
 			engine.enqueueDelete(path);
 		}
 	};
@@ -164,10 +187,12 @@ export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
 
 	plugin.registerInterval(
 		window.setInterval(() => {
-			void engine.tick().then((result) => {
+			void engine.tick().then(async (result) => {
 				status.lastTickAt = Date.now();
 				if (result.ok) {
-					status.lastError = null;
+					status.lastError = (await fs.exists(deadLetterPath))
+						? "Some files require attention; see the dead-letter journal"
+						: null;
 				} else {
 					status.lastError = result.error;
 				}
@@ -175,18 +200,18 @@ export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
 		}, TICK_INTERVAL_MS),
 	);
 
-	return { engine, fs, outboxPath, status };
+	return { engine, fs, outboxPath, deadLetterPath, status };
 }
 
 /** Enqueues every current vault file (minus the engine's own bookkeeping files) and pushes them out. */
 export async function seedServerFromVault(
 	plugin: ObsidianSyncPlugin,
 	sync: VaultSync,
-): Promise<void> {
+): Promise<SyncTickResult> {
 	const files = (await sync.fs.listAllFiles()).filter(
 		(path) => !isSyncEngineOwnedPath(plugin, path),
 	);
 	await sync.engine.seedFromVault(() => files);
 	await sync.engine.flush();
-	await sync.engine.tick();
+	return sync.engine.tick();
 }

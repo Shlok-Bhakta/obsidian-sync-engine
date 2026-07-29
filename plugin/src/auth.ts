@@ -12,6 +12,9 @@ export async function ensureAuthenticated(plugin: ObsidianSyncPlugin): Promise<v
 		url: `${plugin.settings.serverUrl}/auth`,
 		method: 'POST',
 		contentType: 'application/json',
+		headers: plugin.settings.setupToken
+			? { Authorization: `Bearer ${plugin.settings.setupToken}` }
+			: undefined,
 		body: serialize({
 			type: MessageType.AUTH_ACK,
 			client_name: plugin.settings.clientName,
@@ -33,6 +36,7 @@ export async function ensureAuthenticated(plugin: ObsidianSyncPlugin): Promise<v
 	if (message.type === MessageType.AUTH_INIT) {
 		plugin.settings.clientSecret = message.token;
 		plugin.settings.clientName = message.client_name;
+		plugin.settings.setupToken = '';
 		await plugin.saveSettings();
 		return;
 	}

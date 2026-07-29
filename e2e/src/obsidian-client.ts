@@ -257,12 +257,14 @@ export class ObsidianClient {
 		clientName: string;
 		clientSecret?: string;
 		revision?: number;
+		setupToken?: string;
 	}): Promise<void> {
 		const next = {
 			serverUrl: settings.serverUrl,
 			clientName: settings.clientName,
 			clientSecret: settings.clientSecret ?? "Made by server",
 			revision: settings.revision ?? 0,
+			setupToken: settings.setupToken ?? "",
 		};
 		const payload = JSON.stringify(next, null, 2);
 		const containerDataPath =

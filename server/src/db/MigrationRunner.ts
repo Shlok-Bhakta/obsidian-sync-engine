@@ -35,14 +35,31 @@ const migrationsManifest: Migration[] = [
 
 
 export async function bootstrapDB() {
-    // if this boi runs then the db is ok to run;
     await canConnect();
-    // check and create our migrations table
-    await setupDB();
-    // check to see if there are any migrations to run
-    await applyMigrations();
-
-
+    await sql.begin(async (tx) => {
+        await tx`SELECT pg_advisory_xact_lock(hashtext('obsidian-sync-migrations'))`;
+        await tx`
+            CREATE TABLE IF NOT EXISTS migrations (
+                id SERIAL PRIMARY KEY,
+                name VARCHAR(255) NOT NULL UNIQUE,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+        `;
+        const applied = await tx<MigrationRow[]>`SELECT name FROM migrations`;
+        const appliedNames = new Set(applied.map(({ name }) => name));
+        for (const migration of migrationsManifest) {
+            if (appliedNames.has(migration.name)) {
+                continue;
+            }
+            await tx.unsafe(await Bun.file(migration.sql).text());
+            await tx`
+                INSERT INTO migrations (name, created_at)
+                VALUES (${migration.name}, NOW())
+                ON CONFLICT (name) DO NOTHING
+            `;
+            console.log(`Applied migration ${migration.name}`);
+        }
+    });
 }
 
 async function canConnect() {
@@ -55,41 +72,4 @@ async function canConnect() {
 
 }
 
-async function setupDB() {
-    const migrationsTableName = "migrations";
-    // check to see if migrations table exists
-    let exists = false;
-    try {
-    await sql.unsafe(`SELECT * FROM ${migrationsTableName};`).values();
-    exists = true;
-    } catch (e) {
-        exists = false;
-    }
-    if (exists) {
-        return;
-    }else{
-        await sql.unsafe(`CREATE TABLE ${migrationsTableName} (
-            id SERIAL PRIMARY KEY, 
-            name VARCHAR(255) NOT NULL,
-            created_at TIMESTAMP NOT NULL);`
-        );
-    } 
-}
-
 type MigrationRow = { name: string };
-async function applyMigrations() {
-
-    // get all migrations that have already been run
-    let migrations = await sql<MigrationRow[]>`SELECT name FROM migrations;`;
-    let migrationsNames: string[] = migrations.map(m => m.name);
-
-    for (const migration of migrationsManifest) {
-        // first check to see if the migration has already been applied
-        if (migrations.find(m => m.name === migration.name)) {
-            continue;
-        }
-        await sql.unsafe(await Bun.file(migration.sql).text());
-        console.log(`Applied migration ${migration.name}`);
-        await sql`INSERT INTO migrations (name, created_at) VALUES (${migration.name}, NOW());`;
-    }
-}

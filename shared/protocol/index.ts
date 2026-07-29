@@ -53,16 +53,49 @@ export const messageSchema = z.discriminatedUnion('type', [
 
 export type Message = z.infer<typeof messageSchema>;
 
+const WINDOWS_DRIVE_RE = /^[a-zA-Z]:/;
+
+/** Product-wide path policy: sync user vault content, never Obsidian config. */
+export function isCanonicalSyncPath(path: string): boolean {
+  if (
+    typeof path !== "string" ||
+    path.length === 0 ||
+    path.includes("\0") ||
+    path.includes("\\") ||
+    path.startsWith("/") ||
+    path.endsWith("/") ||
+    WINDOWS_DRIVE_RE.test(path)
+  ) {
+    return false;
+  }
+  const segments = path.split("/");
+  return (
+    segments.every(
+      (segment) =>
+        segment.length > 0 && segment !== "." && segment !== "..",
+    ) && segments[0] !== ".obsidian"
+  );
+}
+
+export const syncPathSchema = z
+  .string()
+  .refine(isCanonicalSyncPath, "Path must be canonical user-vault content");
+
+export const revisionSchema = z.number().int().safe().nonnegative();
+
+export const revisionResponseSchema = z.object({
+  revision: revisionSchema,
+});
+
 /**
  * One line of the inbox NDJSON transport (both the wire shape returned by
  * `GET /inbox` and what the plugin parses it back into). Additive: does not
  * change `messageSchema`, so it does not require bumping PROTOCOL_VERSION.
  */
 export const inboxOpSchema = z.object({
-	rev: z.number().finite().nonnegative(),
+	rev: revisionSchema,
 	op: z.enum(["put", "delete"]),
-	path: z.string().min(1),
+	path: syncPathSchema,
 });
 
 export type InboxOp = z.infer<typeof inboxOpSchema>;
-

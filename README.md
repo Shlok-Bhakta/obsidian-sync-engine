@@ -1,8 +1,6 @@
 # Obsidian Sync Engine
 
-Self-hosted sync for Obsidian vaults. MVP transport is **HTTP polling**. WebSocket
-code is retained under `*/websockets/` for a later live-push iteration and is
-not registered on the server entrypoint yet.
+Self-hosted sync for Obsidian vaults. The MVP transport is **HTTP polling**.
 
 ## What syncs
 
@@ -52,6 +50,7 @@ cd shared/protocol && npm ci
 cd ../../server && bun install
 export DATABASE_URL=postgres://postgres:postgres@localhost:5433/dev_db
 export BOOTSTRAP_TOKEN='generate-a-long-random-secret'
+export PUBLIC_SERVER_URL='https://sync.example.com'
 bun run dev
 ```
 

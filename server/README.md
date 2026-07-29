@@ -12,6 +12,7 @@ cd shared/protocol && npm ci
 cd ../../server && bun install
 export DATABASE_URL=postgres://postgres:postgres@localhost:5433/dev_db
 export BOOTSTRAP_TOKEN='long-random-secret'
+export PUBLIC_SERVER_URL='https://sync.example.com'
 bun run dev
 ```
 
@@ -21,6 +22,7 @@ bun run dev
 | --- | --- |
 | `DATABASE_URL` | Postgres connection string |
 | `BOOTSTRAP_TOKEN` | Required for `GET /bootstrap.zip` |
+| `PUBLIC_SERVER_URL` | Public base URL stamped into bootstrap vault settings |
 | `OBJECT_STORE_DIR` | Legacy on-disk store used only to backfill NULL BYTEA rows on upgrade |
 | `PORT` / `HOST` | Listen address (default `3000` / `0.0.0.0`) |
 

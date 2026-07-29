@@ -1,8 +1,8 @@
 export interface SyncFs {
 	read(path: string): Promise<string>;
 	write(path: string, data: string): Promise<void>;
+	append(path: string, data: string): Promise<void>;
 	exists(path: string): Promise<boolean>;
-	mkdir?(path: string): Promise<void>;
 }
 
 export class MemorySyncFs implements SyncFs {
@@ -20,11 +20,12 @@ export class MemorySyncFs implements SyncFs {
 		this.files.set(path, data);
 	}
 
+	async append(path: string, data: string): Promise<void> {
+		this.files.set(path, (this.files.get(path) ?? "") + data);
+	}
+
 	async exists(path: string): Promise<boolean> {
 		return this.files.has(path);
 	}
 
-	async mkdir(_path: string): Promise<void> {
-		// no-op: MemorySyncFs is flat, directories are implicit
-	}
 }

@@ -95,7 +95,8 @@ export class SyncEngine {
 	private readonly echoRevs = new Set<number>();
 
 	/** Paths with an enqueue currently writing to the outbox. */
-	private readonly enqueueInFlight = new Set<string>();
+	private readonly enqueueInFlight = new Set<Promise<void>>();
+	private readonly enqueueCounts = new Map<string, number>();
 
 	private tickInFlight: Promise<SyncTickResult> | null = null;
 	private hydrated = false;
@@ -141,24 +142,25 @@ export class SyncEngine {
 	async enqueueDurable(rawPath: string, op: "put" | "delete"): Promise<void> {
 		const path = canonicalizeSyncPath(rawPath);
 		this.pendingOutboxPaths.add(path);
-		this.enqueueInFlight.add(path);
-		try {
-			await enqueueOutbox(this.fs, this.outboxPath, {
+		this.enqueueCounts.set(path, (this.enqueueCounts.get(path) ?? 0) + 1);
+		const persistence = enqueueOutbox(this.fs, this.outboxPath, {
 				op,
 				path,
 				ts: Date.now(),
+			}).finally(async () => {
+				const remaining = (this.enqueueCounts.get(path) ?? 1) - 1;
+				if (remaining > 0) this.enqueueCounts.set(path, remaining);
+				else this.enqueueCounts.delete(path);
+				this.enqueueInFlight.delete(persistence);
+				await this.refreshPending(path);
 			});
-		} finally {
-			this.enqueueInFlight.delete(path);
-			await this.refreshPending(path);
-		}
+		this.enqueueInFlight.add(persistence);
+		await persistence;
 		this.scheduleNetworkTick();
 	}
 
 	private scheduleNetworkTick(): void {
-		this.debouncer.trigger("tick", () => {
-			void this.tick();
-		});
+		this.debouncer.trigger("tick", () => this.tick().then(() => undefined));
 	}
 
 	/**
@@ -166,16 +168,13 @@ export class SyncEngine {
 	 * Used before seed/unload so nothing sits only in memory.
 	 */
 	async flush(): Promise<void> {
-		while (this.enqueueInFlight.size > 0) {
-			await new Promise<void>((resolve) => {
-				setTimeout(resolve, 0);
-			});
-		}
+		await Promise.all([...this.enqueueInFlight]);
 		await this.debouncer.flush();
+		if (this.tickInFlight) await this.tickInFlight;
 	}
 
 	private async refreshPending(path: string): Promise<void> {
-		if (this.enqueueInFlight.has(path)) {
+		if ((this.enqueueCounts.get(path) ?? 0) > 0) {
 			this.pendingOutboxPaths.add(path);
 			return;
 		}
@@ -184,6 +183,16 @@ export class SyncEngine {
 			this.pendingOutboxPaths.add(path);
 		} else {
 			this.pendingOutboxPaths.delete(path);
+		}
+	}
+
+	private async rebuildPendingPaths(): Promise<void> {
+		this.pendingOutboxPaths.clear();
+		for (const op of await listOutbox(this.fs, this.outboxPath)) {
+			this.pendingOutboxPaths.add(op.path);
+		}
+		for (const path of this.enqueueCounts.keys()) {
+			this.pendingOutboxPaths.add(path);
 		}
 	}
 
@@ -224,10 +233,26 @@ export class SyncEngine {
 		let deadLettered = 0;
 		try {
 			await this.ensureHydrated();
-			const drainResult = await this.drainOutboxOnce();
-			pushed = drainResult.pushed;
-			deadLettered = drainResult.deadLettered;
+			while (true) {
+				const drainResult = await this.drainOutboxOnce();
+				pushed += drainResult.pushed;
+				deadLettered += drainResult.deadLettered;
+				await Promise.all([...this.enqueueInFlight]);
+				if ((await listOutbox(this.fs, this.outboxPath)).length === 0) {
+					break;
+				}
+			}
+			await this.rebuildPendingPaths();
 			applied = await this.applyRemoteInbox();
+			if (deadLettered > 0) {
+				return {
+					ok: false,
+					error: `${deadLettered} operation(s) require attention`,
+					pushed,
+					applied,
+					deadLettered,
+				};
+			}
 			return { ok: true, pushed, applied, deadLettered };
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
@@ -239,6 +264,7 @@ export class SyncEngine {
 		pushed: number;
 		deadLettered: number;
 	}> {
+		await Promise.all([...this.enqueueInFlight]);
 		const processedPaths = new Set<string>();
 		let pushed = 0;
 		let deadLettered = 0;
@@ -333,8 +359,9 @@ export class SyncEngine {
 				if (this.echoRevs.delete(op.rev)) {
 					return true;
 				}
-				return this.pendingOutboxPaths.has(op.path);
+				return false;
 			},
+			shouldDeferApply: (op) => this.pendingOutboxPaths.has(op.path),
 		});
 		return applied;
 	}

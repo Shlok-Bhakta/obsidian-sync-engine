@@ -91,6 +91,7 @@ async function spawnServer(opts: {
 			PORT: String(opts.serverPort),
 			HOST: "0.0.0.0",
 			BOOTSTRAP_TOKEN: opts.bootstrapToken,
+			PUBLIC_SERVER_URL: `http://${hostGateway()}:${opts.serverPort}`,
 		},
 		stdout: "pipe",
 		stderr: "pipe",

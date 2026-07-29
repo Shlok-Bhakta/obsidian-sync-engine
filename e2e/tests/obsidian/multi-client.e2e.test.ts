@@ -48,6 +48,7 @@ describe("obsidian multi-client e2e", () => {
 		await clientA.configurePlugin({
 			serverUrl: stack.serverUrl,
 			clientName: "e2e-client-a",
+			setupToken: stack.bootstrapToken,
 		});
 	}, 300_000);
 
@@ -207,6 +208,14 @@ describe("obsidian multi-client e2e", () => {
 		const after = await Bun.file(clientA.vaultPath("Welcome.md")).text();
 		expect(after).toContain("<!-- e5 -->");
 		expect(after.split("<!-- e5 -->").length - 1).toBe(1);
+		await waitFor(
+			async () => {
+				await clientB.forceTick();
+				const remote = await Bun.file(clientB.vaultPath("Welcome.md")).text();
+				return remote.includes("<!-- e5 -->");
+			},
+			{ timeoutMs: 60_000, label: "self-echo edit converged to B" },
+		);
 	}, 90_000);
 
 	test("E6: offline edits drain after reconnect", async () => {

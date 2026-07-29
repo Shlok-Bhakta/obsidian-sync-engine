@@ -15,7 +15,7 @@ export class InvalidPathError extends Error {
 	}
 }
 
-const WINDOWS_DRIVE_RE = /^[a-zA-Z]:/;
+import { isCanonicalSyncPath } from "obsidian-sync-protocol";
 
 /**
  * Validates and returns `path` unchanged if it is an already-normalized,
@@ -26,6 +26,17 @@ const WINDOWS_DRIVE_RE = /^[a-zA-Z]:/;
  * non-normalized duplicate separators (e.g. `a//b`).
  */
 export function canonicalizePath(path: string): string {
+	if (!isCanonicalSyncPath(path)) {
+		throw new InvalidPathError(
+			String(path ?? ""),
+			"path must be canonical user-vault content (excluding .obsidian)",
+		);
+	}
+	/*
+	 * Keep the detailed checks below for useful server diagnostics. The shared
+	 * predicate above is the authoritative product boundary used by clients,
+	 * wire schemas, and the server.
+	 */
 	if (typeof path !== "string" || path.length === 0) {
 		throw new InvalidPathError(String(path ?? ""), "path must not be empty");
 	}
@@ -35,7 +46,7 @@ export function canonicalizePath(path: string): string {
 	if (path.includes("\\")) {
 		throw new InvalidPathError(path, "path must not contain a backslash");
 	}
-	if (path.startsWith("/") || WINDOWS_DRIVE_RE.test(path)) {
+	if (path.startsWith("/") || /^[a-zA-Z]:/.test(path)) {
 		throw new InvalidPathError(path, "path must be vault-relative, not absolute");
 	}
 	if (path.endsWith("/")) {
@@ -50,6 +61,9 @@ export function canonicalizePath(path: string): string {
 		if (segment === "." || segment === "..") {
 			throw new InvalidPathError(path, `path must not contain a "${segment}" segment`);
 		}
+	}
+	if (segments[0] === ".obsidian") {
+		throw new InvalidPathError(path, "Obsidian configuration is private");
 	}
 
 	return path;

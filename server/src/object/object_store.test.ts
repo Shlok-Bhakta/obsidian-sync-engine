@@ -245,9 +245,8 @@ describe("object store", () => {
         const client = await createClientFixture({ client_name: "alice" });
         const objectStore = new ObjectStore();
         const pluginDataPath = ".obsidian/plugins/obsidian-sync-engine/data.json";
-        await objectStore.upload({ path: pluginDataPath, content: "{}", id: client.id });
         await objectStore.upload({ path: "note.md", content: "hello", id: client.id });
-        expect(await objectStore.getTipRevision()).toBe(2);
+        expect(await objectStore.getTipRevision()).toBe(1);
 
         const tmp = await mkdtemp(join(tmpdir(), "obsidian-bootstrap-test-"));
         const zipPath = join(tmp, "vault.zip");
@@ -256,7 +255,8 @@ describe("object store", () => {
             const extractDir = join(tmp, "extracted");
             await $`unzip -qq ${zipPath} -d ${extractDir}`;
             const settings = await Bun.file(join(extractDir, pluginDataPath)).json() as Record<string, unknown>;
-            expect(settings.revision).toBe(2);
+            expect(settings.revision).toBe(1);
+            expect(settings.serverUrl).toBe("http://localhost:3000");
             expect(settings.lastPulledRev).toBeUndefined();
             expect(typeof settings.clientName).toBe("string");
             expect(typeof settings.clientSecret).toBe("string");
@@ -435,8 +435,6 @@ describe("object store", () => {
     it("excludes soft-deleted files from the bootstrap zip", async () => {
         const client = await createClientFixture({ client_name: "alice" });
         const objectStore = new ObjectStore();
-        const pluginDataPath = ".obsidian/plugins/obsidian-sync-engine/data.json";
-        await objectStore.upload({ path: pluginDataPath, content: "{}", id: client.id });
         await objectStore.upload({ path: "keep.md", content: "keep me", id: client.id });
         await objectStore.upload({ path: "gone.md", content: "delete me", id: client.id });
         await objectStore.delete("gone.md", client.id);
@@ -632,7 +630,6 @@ describe("object store", () => {
         const client = await createClientFixture({ client_name: "alice" });
         const objectStore = new ObjectStore();
         const pluginDataPath = ".obsidian/plugins/obsidian-sync-engine/data.json";
-        await objectStore.upload({ path: pluginDataPath, content: "{}", id: client.id });
         await objectStore.upload({ path: "keep.md", content: "keep me", id: client.id });
         await objectStore.upload({ path: "gone.md", content: "delete me", id: client.id });
         const { revision: deleteRevision } = await objectStore.delete("gone.md", client.id);
@@ -653,4 +650,40 @@ describe("object store", () => {
             await rm(tmp, { recursive: true, force: true });
         }
     });
+
+	it("rejects Obsidian configuration uploads at the server boundary", async () => {
+		const client = await createClientFixture({ client_name: "alice" });
+		const app = createTestApp();
+		const response = await app.request("/files", {
+			method: "POST",
+			headers: {
+				Authorization: client.client_secret,
+				"X-Obsidian-Path": ".obsidian/workspace.json",
+			},
+			body: "private",
+		});
+		expect(response.status).toBe(400);
+	});
+
+	it("rejects invalid inbox cursors", async () => {
+		const client = await createClientFixture({ client_name: "alice" });
+		const app = createTestApp();
+		for (const rev of ["", "-1", "1.5", "NaN", "Infinity"]) {
+			const response = await app.request(`/inbox?rev=${encodeURIComponent(rev)}`, {
+				headers: { Authorization: client.client_secret },
+			});
+			expect(response.status).toBe(400);
+		}
+	});
+
+	it("resolves file/directory prefix conflicts with the newest upload", async () => {
+		const client = await createClientFixture({ client_name: "alice" });
+		const store = new ObjectStore();
+		await store.upload({ path: "a", content: "file", id: client.id });
+		await store.upload({ path: "a/b.md", content: "nested", id: client.id });
+		expect(await store.download("a")).toBeNull();
+		expect(decode(await store.download("a/b.md"))).toBe("nested");
+		const rows = await store.inbox(0);
+		expect(rows.find(({ path }) => path === "a")?.isDeleted).toBe(true);
+	});
 });

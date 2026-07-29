@@ -179,4 +179,16 @@ describe("HttpTransport", () => {
 		}
 		expect(deleteError).toBeInstanceOf(PermanentRemoteError);
 	});
+
+	test("malformed successful revisions never acknowledge durable work", async () => {
+		const malformed = [undefined, "4", Number.NaN, -1, 1.5];
+		for (const revision of malformed) {
+			const { request } = recordingRequest(() =>
+				fakeResponse({ json: { revision } }),
+			);
+			const transport = makeTransport(request);
+			expect(transport.upload("a.md", "x")).rejects.toThrow();
+			expect(transport.deleteRemote("a.md")).rejects.toThrow();
+		}
+	});
 });

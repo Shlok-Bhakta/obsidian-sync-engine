@@ -1,9 +1,12 @@
 import { Context, Hono } from "hono";
-import { dirname, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
-import { $, sql } from "bun";
+import { mkdtemp, rm } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { sql } from "bun";
+import { zipSync } from "fflate";
 import { createClient, getClientIdFromAuthorization } from "../auth/auth";
+import { revisionSchema } from "obsidian-sync-protocol";
 import { assertBootstrapAuthorized } from "../auth/bootstrapToken";
 import { canonicalizePath, InvalidPathError } from "./paths";
 
@@ -80,6 +83,22 @@ export class ObjectStore {
 
         const [row] = (await sql.begin(async (tx) => {
             await tx`SELECT pg_advisory_xact_lock(hashtext(${REVISION_LOCK_KEY}))`;
+			const conflicts = await tx<{ file_path: string }[]>`
+				SELECT file_path FROM files
+				WHERE file_is_deleted = FALSE
+				  AND (
+					position(file_path || '/' in ${path}) = 1
+					OR position(${path + "/"} in file_path) = 1
+				  )
+			`;
+			for (const conflict of conflicts) {
+				await tx`
+					UPDATE files
+					SET file_is_deleted = TRUE, content = NULL, author_id = ${content.id},
+						updated_at = NOW(), last_updated_revision = NEXTVAL('global_revision')
+					WHERE file_path = ${conflict.file_path}
+				`;
+			}
             return tx<FileContentRow[]>`
                 INSERT INTO files (file_path, author_id, content, file_is_deleted)
                 VALUES (${path}, ${content.id}, ${buffer}, FALSE)
@@ -185,12 +204,24 @@ export class ObjectStore {
         return filled;
     }
 
-    async bootstrap_zip_create(path: string): Promise<void> {
-        const tmp = await mkdtemp(join(tmpdir(), "obsidian-bootstrap-copy-"));
-        const vaultDir = join(tmp, "vault");
-        try {
-            await mkdir(vaultDir, { recursive: true });
+	async assertContentComplete(): Promise<void> {
+		const [{ count }] = await sql<{ count: string }[]>`
+			SELECT COUNT(*)::text AS count FROM files
+			WHERE file_is_deleted = FALSE AND content IS NULL
+		`;
+		if (Number(count) > 0) {
+			throw new Error(
+				`Object store is not ready: ${count} active file(s) have no content`,
+			);
+		}
+	}
 
+    async bootstrap_zip_create(path: string): Promise<void> {
+		await this.assertContentComplete();
+		const publicServerUrl = getPublicServerUrl();
+		const entries: Record<string, Uint8Array> = {};
+		let clientSecret: string | null = null;
+        try {
             // Snapshot the tip BEFORE reading file rows: if we read it after, a file
             // landing between the read and the tip snapshot could be reflected in the
             // tip without its bytes making it into the zip, so the client would never
@@ -206,46 +237,28 @@ export class ObjectStore {
                 WHERE file_is_deleted = FALSE AND content IS NOT NULL
             `;
             for (const file of files) {
-                const dest = join(vaultDir, file.file_path);
-                await mkdir(dirname(dest), { recursive: true });
-                await Bun.write(dest, file.content as Buffer);
+				const canonicalPath = canonicalizePath(file.file_path);
+				entries[canonicalPath] = new Uint8Array(file.content as Buffer);
             }
 
-            const name_choices = [
-                "acrobat", "banana", "camera", "diamond", "elephant",
-                "forest", "galaxy", "horizon", "indigo", "jungle",
-                "koala", "lantern", "mystery", "network", "ocean",
-                "pyramid", "quantum", "shadow", "tornado", "volcano",
-            ];
-            const pick = () => name_choices[Math.floor(Math.random() * name_choices.length)];
-            const clientName = `${pick()}-${pick()}`;
-            const clientSecret = await createClient(clientName);
-
-            const pluginDir = join(vaultDir, ".obsidian/plugins/obsidian-sync-engine");
-            await mkdir(pluginDir, { recursive: true });
-            const dataPath = join(pluginDir, "data.json");
-            // B1 seed intentionally does not upload the plugin's data.json, so a
-            // freshly seeded object store often has no settings file yet. Default
-            // to an empty object rather than failing bootstrap.
-            let settings: Record<string, unknown> = {};
-            const dataFile = Bun.file(dataPath);
-            if (await dataFile.exists()) {
-                try {
-                    settings = await dataFile.json() as Record<string, unknown>;
-                } catch {
-                    settings = {};
-                }
-            }
-            await Bun.write(dataPath, JSON.stringify({
-                ...settings,
+			const clientName = `bootstrap-${randomUUID()}`;
+            clientSecret = await createClient(clientName);
+			const dataPath = ".obsidian/plugins/obsidian-sync-engine/data.json";
+			entries[dataPath] = new TextEncoder().encode(JSON.stringify({
                 clientName,
                 clientSecret,
                 revision,
+				serverUrl: publicServerUrl,
             }, null, 2));
 
-            await $`zip -qr ${path} .`.cwd(vaultDir);
-        } finally {
-            await rm(tmp, { recursive: true, force: true });
+			await Bun.write(path, zipSync(entries, { level: 6 }));
+        } catch (error) {
+			if (clientSecret) {
+				await sql`DELETE FROM clients WHERE client_secret = ${clientSecret}`.catch(
+					() => undefined,
+				);
+			}
+			throw error;
         }
     }
 
@@ -280,23 +293,57 @@ function resolvePathFromRequest(c: Context): string | undefined {
     if (headerPath === undefined) {
         return undefined;
     }
-    return decodeURIComponent(headerPath);
+	try {
+		return decodeURIComponent(headerPath);
+	} catch (error) {
+		if (error instanceof URIError) {
+			throw new InvalidPathError(headerPath, "malformed percent encoding");
+		}
+		throw error;
+	}
+}
+
+function getPublicServerUrl(): string {
+	const raw = process.env.PUBLIC_SERVER_URL?.trim();
+	if (!raw) {
+		throw new Error("PUBLIC_SERVER_URL is required to create a bootstrap archive");
+	}
+	const url = new URL(raw);
+	if (!["http:", "https:"].includes(url.protocol)) {
+		throw new Error("PUBLIC_SERVER_URL must use http or https");
+	}
+	return url.toString().replace(/\/$/, "");
+}
+
+async function requireClient(c: Context): Promise<string | Response> {
+	const authorization = c.req.header("Authorization");
+	if (!authorization) {
+		return c.json({ error: "Unauthorized" }, 401);
+	}
+	try {
+		return await getClientIdFromAuthorization(authorization);
+	} catch {
+		return c.json({ error: "Unauthorized" }, 401);
+	}
 }
 
 export function registerObjectStoreRoutes(app: Hono, store = objectStore) {
     // Chain so Hono accumulates route types (needed by testClient inference).
     return app
         .post('/files', async (c) => {
-            const path = resolvePathFromRequest(c);
-            const authorization = c.req.header("Authorization");
-            if (!authorization) {
-                return c.json({ error: "Authorization is required" }, 400);
-            }
+			let path: string | undefined;
+			try {
+				path = resolvePathFromRequest(c);
+			} catch (error) {
+				if (error instanceof InvalidPathError) return c.json({ error: "Invalid path" }, 400);
+				throw error;
+			}
             if (!path) {
                 return c.json({ error: "Request body is required" }, 400);
             }
-
-            const clientId = await getClientIdFromAuthorization(authorization);
+			const authorized = await requireClient(c);
+			if (authorized instanceof Response) return authorized;
+            const clientId = authorized;
             try {
                 const result = await store.upload({
                     path: path,
@@ -342,13 +389,17 @@ export function registerObjectStoreRoutes(app: Hono, store = objectStore) {
             }
         })
         .get('/inbox', async (c) => {
-            const authorization = c.req.header("Authorization");
-            if (!authorization) {
-                return c.json({ error: "Authorization is required" }, 400);
-            }
-            await getClientIdFromAuthorization(authorization);
-
-            const rev = Number(c.req.query("rev"));
+			const authorized = await requireClient(c);
+			if (authorized instanceof Response) return authorized;
+			const rawRev = c.req.query("rev");
+			const parsedRev =
+				rawRev === undefined || rawRev.trim() === ""
+					? { success: false as const }
+					: revisionSchema.safeParse(Number(rawRev));
+			if (!parsedRev.success) {
+				return c.json({ error: "rev must be a safe nonnegative integer" }, 400);
+			}
+            const rev = parsedRev.data;
             const inbox = await store.inbox(rev);
             const lines = inbox.map((item) => JSON.stringify({
                 rev: item.lastUpdatedRevision,
@@ -362,18 +413,17 @@ export function registerObjectStoreRoutes(app: Hono, store = objectStore) {
             });
         })
         .get('/files', async (c) => {
-            const authorization = c.req.header("Authorization");
-            if (!authorization) {
-                return c.json({ error: "Authorization is required" }, 400);
-            }
-            const path = resolvePathFromRequest(c);
+			const authorized = await requireClient(c);
+			if (authorized instanceof Response) return authorized;
+			let path: string | undefined;
+			try {
+				path = resolvePathFromRequest(c);
+			} catch (error) {
+				if (error instanceof InvalidPathError) return c.json({ error: "Invalid path" }, 400);
+				throw error;
+			}
             if (!path) {
                 return c.json({ error: "path is required" }, 400);
-            }
-            try {
-                await getClientIdFromAuthorization(authorization);
-            } catch {
-                return c.json({ error: "Unauthorized" }, 401);
             }
 
             try {
@@ -389,20 +439,24 @@ export function registerObjectStoreRoutes(app: Hono, store = objectStore) {
                 if (error instanceof InvalidPathError) {
                     return c.json({ error: "Invalid path" }, 400);
                 }
-                return c.json({ error: "Not found" }, 404);
+                throw error;
             }
         })
         .delete('/files', async (c) => {
-            const authorization = c.req.header("Authorization");
-            if (!authorization) {
-                return c.json({ error: "Authorization is required" }, 400);
-            }
-            const path = resolvePathFromRequest(c);
+			const authorized = await requireClient(c);
+			if (authorized instanceof Response) return authorized;
+			let path: string | undefined;
+			try {
+				path = resolvePathFromRequest(c);
+			} catch (error) {
+				if (error instanceof InvalidPathError) return c.json({ error: "Invalid path" }, 400);
+				throw error;
+			}
             if (!path) {
                 return c.json({ error: "path is required" }, 400);
             }
             try {
-                const clientId = await getClientIdFromAuthorization(authorization);
+                const clientId = authorized;
                 const result = await store.delete(path, clientId);
                 return c.json({ path, revision: result.revision }, 200);
             } catch (error) {

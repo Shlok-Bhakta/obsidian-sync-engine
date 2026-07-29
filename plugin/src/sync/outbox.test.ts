@@ -117,12 +117,11 @@ describe("outbox", () => {
 			enqueueResolved = true;
 		});
 
-		// Flush pending microtasks; enqueue must still be blocked on the mutex
-		// that drain is holding for its whole run (including the handler).
+		// Enqueue durability must not wait for a slow network handler.
 		for (let i = 0; i < 5; i++) {
 			await Promise.resolve();
 		}
-		expect(enqueueResolved).toBe(false);
+		expect(enqueueResolved).toBe(true);
 
 		releaseHandler();
 		await drainPromise;
