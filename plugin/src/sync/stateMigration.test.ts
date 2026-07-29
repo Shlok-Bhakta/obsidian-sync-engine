@@ -140,4 +140,24 @@ describe("migrateServerState", () => {
 			fs.files.get("state/encoded/outbox.jsonl.legacy.corrupt"),
 		).toBe('{"id":"truncated"\n');
 	});
+
+	test("recovers a destination backup before considering source-only fast path", async () => {
+		const fs = new MemoryAdapter();
+		fs.dirs.add("state/legacy");
+		fs.dirs.add("state/encoded");
+		fs.files.set("state/legacy/outbox.jsonl", '{"id":"old"}\n');
+		fs.files.set(
+			"state/encoded/outbox.jsonl.migration.bak",
+			'{"id":"new"}\n',
+		);
+
+		await migrateServerState(fs, "state", "legacy", "encoded");
+
+		expect(fs.files.get("state/encoded/outbox.jsonl")).toBe(
+			'{"id":"old"}\n{"id":"new"}\n',
+		);
+		expect(
+			await fs.exists("state/encoded/outbox.jsonl.migration.bak"),
+		).toBe(false);
+	});
 });

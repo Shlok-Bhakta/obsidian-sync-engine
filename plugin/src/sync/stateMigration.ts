@@ -13,19 +13,23 @@ async function mergeJournal(
 	source: string,
 	target: string,
 ): Promise<void> {
+	const tmp = `${target}.migration.tmp`;
+	const backup = `${target}.migration.bak`;
+	if (!(await adapter.exists(target))) {
+		if (await adapter.exists(tmp)) {
+			await adapter.rename(tmp, target);
+			if (await adapter.exists(backup)) await adapter.remove(backup);
+		} else if (await adapter.exists(backup)) {
+			await adapter.rename(backup, target);
+		}
+	}
 	if (!(await adapter.exists(source))) return;
 	if (!(await adapter.exists(target))) {
 		await adapter.rename(source, target);
 		return;
 	}
-
-	const tmp = `${target}.migration.tmp`;
-	const backup = `${target}.migration.bak`;
 	if (await adapter.exists(tmp)) await adapter.remove(tmp);
-	if (await adapter.exists(backup)) {
-		if (!(await adapter.exists(target))) await adapter.rename(backup, target);
-		else await adapter.remove(backup);
-	}
+	if (await adapter.exists(backup)) await adapter.remove(backup);
 	// Parsing first preserves jsonl's recoverable-tail quarantine behavior.
 	// Exact serialized-entry deduplication makes a restart after target
 	// replacement idempotent even if the source has not yet been removed.

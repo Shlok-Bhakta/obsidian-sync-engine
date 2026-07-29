@@ -429,6 +429,7 @@ export class SyncEngine {
 		try {
 			data = await this.transport.download(path);
 		} catch (error) {
+			this.assertActive();
 			// Stale put raced a later delete: treat as success so the inbox
 			// can advance; a later tombstone still applies normally.
 			if (
@@ -440,6 +441,7 @@ export class SyncEngine {
 			}
 			throw error;
 		}
+		this.assertActive();
 		await this.fs.writeBinary(path, data);
 	}
 

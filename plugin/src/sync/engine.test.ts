@@ -743,6 +743,49 @@ describe("SyncEngine", () => {
 		expect(revision.get()).toBe(0);
 	});
 
+	test("a server switch during download cannot mutate the vault", async () => {
+		const fs = new MemoryVaultFs();
+		const transport = new FakeTransport();
+		transport.simulateRemoteOp("put", "remote.md", "old-server-content");
+		let suspended = false;
+		let releaseDownload!: () => void;
+		let signalDownloadStarted!: () => void;
+		const downloadStarted = new Promise<void>((resolve) => {
+			signalDownloadStarted = resolve;
+		});
+		const download = transport.download.bind(transport);
+		transport.download = async (path) => {
+			signalDownloadStarted();
+			await new Promise<void>((resolve) => {
+				releaseDownload = resolve;
+			});
+			return download(path);
+		};
+		const revision = makeRevisionStore(0);
+		const engine = new SyncEngine({
+			fs,
+			transport,
+			outboxPath: OUTBOX,
+			inboxPath: INBOX,
+			getRevision: revision.get,
+			setRevision: revision.set,
+			isSuspended: () => suspended,
+		});
+
+		const tick = engine.tick();
+		await downloadStarted;
+		suspended = true;
+		releaseDownload();
+		const result = await tick;
+
+		expect(result.ok).toBe(false);
+		expect(await fs.exists("remote.md")).toBe(false);
+		expect(revision.get()).toBe(0);
+		expect(await readInbox(fs, INBOX)).toEqual([
+			{ rev: 1, op: "put", path: "remote.md" },
+		]);
+	});
+
 	test("a failed outbox append is reported and retried on the next tick", async () => {
 		const fs = new FlakyAppendVaultFs();
 		await fs.write("a.md", "local");
