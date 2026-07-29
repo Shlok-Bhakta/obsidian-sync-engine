@@ -41,6 +41,7 @@ export type SyncEngineOptions = {
 	debounceMs?: number;
 	/** Optional hook invoked when a permanent outbox failure is dead-lettered. */
 	onPermanentFailure?: (failure: PermanentSyncFailure) => void;
+	onEnqueueFailure?: (error: Error, op: OutboxOp) => void;
 	/** Stops all persistence/network work while runtime configuration is stale. */
 	isSuspended?: () => boolean;
 };
@@ -86,6 +87,7 @@ export class SyncEngine {
 	private readonly setRevision: (rev: number) => void | Promise<void>;
 	private readonly debouncer: Debouncer<"tick">;
 	private readonly onPermanentFailure?: (failure: PermanentSyncFailure) => void;
+	private readonly onEnqueueFailure?: (error: Error, op: OutboxOp) => void;
 	private readonly isSuspended: () => boolean;
 
 	/**
@@ -97,6 +99,7 @@ export class SyncEngine {
 	/** Paths with an enqueue currently writing to the outbox. */
 	private readonly enqueueInFlight = new Set<Promise<void>>();
 	private readonly enqueueCounts = new Map<string, number>();
+	private readonly failedEnqueues = new Map<string, OutboxOp>();
 
 	private tickInFlight: Promise<SyncTickResult> | null = null;
 	private hydrated = false;
@@ -113,6 +116,7 @@ export class SyncEngine {
 		this.setRevision = options.setRevision;
 		this.debouncer = new Debouncer(options.debounceMs ?? DEFAULT_DEBOUNCE_MS);
 		this.onPermanentFailure = options.onPermanentFailure;
+		this.onEnqueueFailure = options.onEnqueueFailure;
 		this.isSuspended = options.isSuspended ?? (() => false);
 	}
 
@@ -128,12 +132,12 @@ export class SyncEngine {
 
 	/** Enqueue a local write — durable immediately, network work debounced. */
 	enqueuePut(path: string): void {
-		void this.enqueueDurable(path, "put");
+		void this.enqueueDurable(path, "put").catch(() => undefined);
 	}
 
 	/** Enqueue a local delete — durable immediately, network work debounced. */
 	enqueueDelete(path: string): void {
-		void this.enqueueDurable(path, "delete");
+		void this.enqueueDurable(path, "delete").catch(() => undefined);
 	}
 
 	/**
@@ -147,11 +151,12 @@ export class SyncEngine {
 		const path = canonicalizeSyncPath(rawPath);
 		this.pendingOutboxPaths.add(path);
 		this.enqueueCounts.set(path, (this.enqueueCounts.get(path) ?? 0) + 1);
-		const persistence = enqueueOutbox(this.fs, this.outboxPath, {
+		const intent: OutboxOp = {
 				op,
 				path,
 				ts: Date.now(),
-			}).finally(async () => {
+			};
+		const persistence = enqueueOutbox(this.fs, this.outboxPath, intent).finally(async () => {
 				const remaining = (this.enqueueCounts.get(path) ?? 1) - 1;
 				if (remaining > 0) this.enqueueCounts.set(path, remaining);
 				else this.enqueueCounts.delete(path);
@@ -159,7 +164,18 @@ export class SyncEngine {
 				await this.refreshPending(path);
 			});
 		this.enqueueInFlight.add(persistence);
-		await persistence;
+		try {
+			await persistence;
+			this.failedEnqueues.delete(path);
+		} catch (error) {
+			const enqueueError =
+				error instanceof Error ? error : new Error(String(error));
+			this.failedEnqueues.set(path, intent);
+			this.pendingOutboxPaths.add(path);
+			this.onEnqueueFailure?.(enqueueError, intent);
+			this.scheduleNetworkTick();
+			throw enqueueError;
+		}
 		this.scheduleNetworkTick();
 	}
 
@@ -197,6 +213,16 @@ export class SyncEngine {
 		}
 		for (const path of this.enqueueCounts.keys()) {
 			this.pendingOutboxPaths.add(path);
+		}
+		for (const path of this.failedEnqueues.keys()) {
+			this.pendingOutboxPaths.add(path);
+		}
+	}
+
+	private async retryFailedEnqueues(): Promise<void> {
+		for (const [path, op] of [...this.failedEnqueues]) {
+			await enqueueOutbox(this.fs, this.outboxPath, op);
+			this.failedEnqueues.delete(path);
 		}
 	}
 
@@ -245,6 +271,7 @@ export class SyncEngine {
 					deadLettered,
 				};
 			}
+			await this.retryFailedEnqueues();
 			await this.ensureHydrated();
 			while (true) {
 				const drainResult = await this.drainOutboxOnce();
@@ -368,7 +395,10 @@ export class SyncEngine {
 			},
 			getRevision: () => this.getRevision(),
 			setRevision: (newRev) => this.setRevision(newRev),
-			shouldDeferApply: (op) => this.pendingOutboxPaths.has(op.path),
+			shouldDeferApply: (op) =>
+				[...this.pendingOutboxPaths].some((path) =>
+					pathsStructurallyConflict(path, op.path),
+				),
 		});
 		return applied;
 	}
@@ -400,4 +430,12 @@ export class SyncEngine {
 	isPending(path: string): boolean {
 		return this.pendingOutboxPaths.has(path);
 	}
+}
+
+function pathsStructurallyConflict(left: string, right: string): boolean {
+	return (
+		left === right ||
+		left.startsWith(`${right}/`) ||
+		right.startsWith(`${left}/`)
+	);
 }

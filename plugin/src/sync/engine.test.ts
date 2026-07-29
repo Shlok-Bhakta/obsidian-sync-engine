@@ -73,6 +73,18 @@ class MemoryVaultFsNoRemove implements VaultBlobFs {
 	}
 }
 
+class FlakyAppendVaultFs extends MemoryVaultFs {
+	private failuresRemaining = 1;
+
+	override async append(path: string, data: string): Promise<void> {
+		if (this.failuresRemaining > 0) {
+			this.failuresRemaining--;
+			throw new Error("disk temporarily unavailable");
+		}
+		await super.append(path, data);
+	}
+}
+
 /**
  * Fake transport modeling a shared server revision log: every `upload` /
  * `deleteRemote` call (ours or, via `simulateRemoteOp`, another client's)
@@ -694,6 +706,31 @@ describe("SyncEngine", () => {
 		const result = await engine.tick();
 		expect(result.ok).toBe(false);
 		expect(transport.calls).toEqual([]);
+		expect(await listOutbox(fs, OUTBOX)).toEqual([]);
+	});
+
+	test("a failed outbox append is reported and retried on the next tick", async () => {
+		const fs = new FlakyAppendVaultFs();
+		await fs.write("a.md", "local");
+		const transport = new FakeTransport();
+		const revision = makeRevisionStore(0);
+		const failures: string[] = [];
+		const engine = new SyncEngine({
+			fs,
+			transport,
+			outboxPath: OUTBOX,
+			inboxPath: INBOX,
+			getRevision: revision.get,
+			setRevision: revision.set,
+			onEnqueueFailure: (error) => failures.push(error.message),
+			debounceMs: 60_000,
+		});
+		engine.enqueuePut("a.md");
+		await flushMicrotasks();
+		expect(failures).toEqual(["disk temporarily unavailable"]);
+		const result = await engine.tick();
+		expect(result.ok).toBe(true);
+		expect(transport.uploads.map(({ path }) => path)).toEqual(["a.md"]);
 		expect(await listOutbox(fs, OUTBOX)).toEqual([]);
 	});
 

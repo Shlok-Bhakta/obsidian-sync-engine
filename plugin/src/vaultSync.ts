@@ -119,6 +119,9 @@ export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
 		onPermanentFailure: ({ op, error }) => {
 			status.lastError = `${op.path}: ${error}`;
 		},
+		onEnqueueFailure: (error, op) => {
+			status.lastError = `Could not persist ${op.path}: ${error.message}`;
+		},
 		isSuspended: () => plugin.isSyncSuspended(),
 	});
 

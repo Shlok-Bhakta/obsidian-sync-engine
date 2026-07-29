@@ -1,6 +1,7 @@
 import {
 	normalizePath,
 	TFile,
+	TFolder,
 	type DataAdapter,
 	type Vault,
 } from "obsidian";
@@ -18,10 +19,7 @@ export class ObsidianFs implements VaultBlobFs {
 	 * Exact inbound path/operation tokens suppress only the Vault event caused
 	 * by applying that same remote mutation. Unrelated user edits remain live.
 	 */
-	private readonly inboundEvents = new Map<
-		string,
-		{ operation: "put" | "delete"; timeout: ReturnType<typeof setTimeout> }
-	>();
+	private readonly inboundEvents = new Map<string, "put" | "delete">();
 
 	constructor(
 		private readonly adapter: DataAdapter,
@@ -30,23 +28,15 @@ export class ObsidianFs implements VaultBlobFs {
 
 	consumeInboundEvent(path: string, operation: "put" | "delete"): boolean {
 		const normalized = normalizePath(path);
-		const expected = this.inboundEvents.get(normalized);
-		if (expected?.operation !== operation) {
+		if (this.inboundEvents.get(normalized) !== operation) {
 			return false;
 		}
-		clearTimeout(expected.timeout);
 		this.inboundEvents.delete(normalized);
 		return true;
 	}
 
 	private expectInboundEvent(path: string, operation: "put" | "delete"): void {
-		const previous = this.inboundEvents.get(path);
-		if (previous) clearTimeout(previous.timeout);
-		const timeout = setTimeout(() => {
-			const expected = this.inboundEvents.get(path);
-			if (expected?.timeout === timeout) this.inboundEvents.delete(path);
-		}, 5000);
-		this.inboundEvents.set(path, { operation, timeout });
+		this.inboundEvents.set(path, operation);
 	}
 
 	async read(path: string): Promise<string> {
@@ -104,6 +94,13 @@ export class ObsidianFs implements VaultBlobFs {
 		if (existing instanceof TFile) {
 			await this.vault.modifyBinary(existing, data);
 			return;
+		}
+		if (existing instanceof TFolder) {
+			if (existing.children.length > 0) {
+				throw new Error(`Cannot replace non-empty folder "${normalized}"`);
+			}
+			// eslint-disable-next-line obsidianmd/prefer-file-manager-trash-file
+			await this.vault.delete(existing, true);
 		}
 		await this.ensureVaultParentDir(normalized);
 		await this.vault.createBinary(normalized, data);
@@ -163,6 +160,12 @@ export class ObsidianFs implements VaultBlobFs {
 	private async ensureVaultParentDir(normalizedPath: string): Promise<void> {
 		if (!this.vault) return;
 		for (const dir of ancestorDirs(normalizedPath)) {
+			const existing = this.vault.getAbstractFileByPath(dir);
+			if (existing instanceof TFile) {
+				this.expectInboundEvent(dir, "delete");
+				// eslint-disable-next-line obsidianmd/prefer-file-manager-trash-file
+				await this.vault.delete(existing, true);
+			}
 			if (!this.vault.getAbstractFileByPath(dir)) {
 				await this.vault.createFolder(dir);
 			}

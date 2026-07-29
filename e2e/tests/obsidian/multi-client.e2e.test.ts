@@ -283,4 +283,51 @@ describe("obsidian multi-client e2e", () => {
 			false,
 		);
 	}, 120_000);
+
+	test("E9: remote directory and file shape transitions converge", async () => {
+		const auth = (await clientA.readSettings()).clientSecret;
+		const upload = async (path: string, body: string) => {
+			const response = await fetch(`${stack.serverUrlLocal}/files`, {
+				method: "POST",
+				headers: {
+					Authorization: auth,
+					"X-Obsidian-Path": encodeURIComponent(path),
+				},
+				body,
+			});
+			expect(response.status).toBe(200);
+		};
+
+		await upload("shape/child.md", "nested");
+		await waitFor(
+			async () => {
+				await clientB.forceTick();
+				return Bun.file(clientB.vaultPath("shape/child.md")).exists();
+			},
+			{ timeoutMs: 60_000, label: "nested shape reaches B" },
+		);
+
+		await upload("shape", "now a file");
+		await waitFor(
+			async () => {
+				await clientB.forceTick();
+				const file = Bun.file(clientB.vaultPath("shape"));
+				return (await file.exists()) && (await file.text()) === "now a file";
+			},
+			{ timeoutMs: 60_000, label: "directory becomes file on B" },
+		);
+		expect(await Bun.file(clientB.vaultPath("shape/child.md")).exists()).toBe(
+			false,
+		);
+
+		await upload("shape/child.md", "nested again");
+		await waitFor(
+			async () => {
+				await clientB.forceTick();
+				const child = Bun.file(clientB.vaultPath("shape/child.md"));
+				return (await child.exists()) && (await child.text()) === "nested again";
+			},
+			{ timeoutMs: 60_000, label: "file becomes directory on B" },
+		);
+	}, 180_000);
 });
