@@ -10,6 +10,19 @@ import {
 import { CONTAINER_BIN, hostGatewayRunArgs } from "./container";
 
 const IMAGE = process.env.E2E_OBSIDIAN_IMAGE ?? "lscr.io/linuxserver/obsidian:latest";
+const EVAL_BRIDGE_KEY = "__obsidianSyncE2EAsync";
+
+type AsyncEvalState =
+	| { status: "pending" }
+	| { status: "fulfilled"; value?: string }
+	| { status: "rejected"; error: string };
+
+export type ClientDiagnostics = {
+	revision: number;
+	outboxDepth: number;
+	inboxDepth: number;
+	lastError: string | null;
+};
 
 export type ObsidianClientOptions = {
 	name: string;
@@ -222,9 +235,104 @@ export class ObsidianClient {
 	async eval(code: string): Promise<string> {
 		// Do NOT JSON-quote the code value: surrounding double quotes make the
 		// Obsidian CLI evaluate a string literal instead of executing the JS.
-		const out = await this.cli(["eval", `code=${code}`]);
-		const match = out.match(/=>\s*([\s\S]*)$/);
-		return (match?.[1] ?? out).trim();
+		const result = await this.cliRaw(["eval", `code=${code}`]);
+		const output = [result.stdout.trim(), result.stderr.trim()]
+			.filter(Boolean)
+			.join("\n");
+		if (result.exitCode !== 0) {
+			throw new Error(
+				`Obsidian eval failed (${result.exitCode}): ${output || "no diagnostic"}`,
+			);
+		}
+		const resultMarker = result.stdout.lastIndexOf("=>");
+		if (resultMarker < 0) {
+			throw new Error(
+				`Obsidian eval returned no result marker: ${output || "empty output"}`,
+			);
+		}
+		const value = result.stdout.slice(resultMarker + 2).trim();
+		const diagnostic = [value, result.stderr.trim()].filter(Boolean).join("\n");
+		if (
+			/^(?:(?:evaluation|syntax|reference|type|range)?\s*error\s*:)/i.test(
+				diagnostic,
+			) ||
+			/\b(?:uncaught|unhandled rejection)\b/i.test(diagnostic)
+		) {
+			throw new Error(`Obsidian eval failed: ${diagnostic}`);
+		}
+		return value;
+	}
+
+	/**
+	 * Evaluate a Promise-producing expression inside Obsidian and wait for its
+	 * actual settlement. obsidian-cli only awaits its own command dispatch, not
+	 * a Promise returned by `eval`, so a token stored in the renderer bridges
+	 * completion back to the harness.
+	 */
+	async evalAsync<T = unknown>(
+		expression: string,
+		options: { timeoutMs?: number; label?: string } = {},
+	): Promise<T> {
+		const token = `${this.name}-${crypto.randomUUID()}`;
+		const launch = `(() => {
+			const root = globalThis[${JSON.stringify(EVAL_BRIDGE_KEY)}] ??=
+				Object.create(null);
+			const token = ${JSON.stringify(token)};
+			root[token] = { status: "pending" };
+			Promise.resolve()
+				.then(() => (0, eval)(${JSON.stringify(expression)}))
+				.then(
+					(value) => {
+						const encoded = JSON.stringify(value);
+						root[token] = encoded === undefined
+							? { status: "fulfilled" }
+							: { status: "fulfilled", value: encoded };
+					},
+					(error) => {
+						root[token] = {
+							status: "rejected",
+							error: error instanceof Error
+								? (error.stack ?? error.message)
+								: String(error),
+						};
+					},
+				);
+			return token;
+		})()`;
+		const launchedToken = await this.eval(launch);
+		if (launchedToken !== token) {
+			throw new Error(
+				`Obsidian async eval launched the wrong token: ${launchedToken}`,
+			);
+		}
+
+		try {
+			const timeoutMs = options.timeoutMs ?? 60_000;
+			const deadline = Date.now() + timeoutMs;
+			while (Date.now() < deadline) {
+				const raw = await this.eval(
+					`JSON.stringify(globalThis[${JSON.stringify(EVAL_BRIDGE_KEY)}]?.[${JSON.stringify(token)}] ?? null)`,
+				);
+				const state = JSON.parse(raw) as AsyncEvalState | null;
+				if (state?.status === "rejected") {
+					throw new Error(state.error);
+				}
+				if (state?.status === "fulfilled") {
+					return state.value === undefined
+						? (undefined as T)
+						: (JSON.parse(state.value) as T);
+				}
+				await Bun.sleep(100);
+			}
+			throw new Error(
+				`Timed out after ${timeoutMs}ms waiting for ` +
+					(options.label ?? `${this.name} async eval`),
+			);
+		} finally {
+			await this.eval(
+				`delete globalThis[${JSON.stringify(EVAL_BRIDGE_KEY)}]?.[${JSON.stringify(token)}]`,
+			).catch(() => undefined);
+		}
 	}
 
 	async command(id: string): Promise<string> {
@@ -232,24 +340,79 @@ export class ObsidianClient {
 	}
 
 	async createNote(name: string, content: string): Promise<void> {
-		await this.cli([
-			"create",
-			`name=${name}`,
-			`content=${content.replace(/\n/g, "\\n")}`,
-			"overwrite",
-		]);
+		const path = name.endsWith(".md") ? name : `${name}.md`;
+		await this.writeNote(path, content);
 	}
 
 	async deleteNote(path: string): Promise<void> {
-		await this.cli(["delete", `path=${path}`, "permanent"]);
+		await this.evalAsync(
+			`(async () => {
+				const path = ${JSON.stringify(path)};
+				const file = app.vault.getAbstractFileByPath(path);
+				if (!file) throw new Error("Cannot delete missing path: " + path);
+				await app.vault.delete(file, true);
+				return true;
+			})()`,
+			{ label: `${this.name} delete ${path}` },
+		);
 	}
 
 	async appendNote(path: string, content: string): Promise<void> {
-		await this.cli([
-			"append",
-			`path=${path}`,
-			`content=${content.replace(/\n/g, "\\n")}`,
-		]);
+		await this.evalAsync(
+			`(async () => {
+				const path = ${JSON.stringify(path)};
+				const file = app.vault.getFileByPath(path);
+				if (!file) throw new Error("Cannot append missing file: " + path);
+				await app.vault.modify(file, (await app.vault.read(file)) + ${JSON.stringify(content)});
+				return true;
+			})()`,
+			{ label: `${this.name} append ${path}` },
+		);
+	}
+
+	async writeNote(path: string, content: string): Promise<void> {
+		await this.evalAsync(
+			`(async () => {
+				const path = ${JSON.stringify(path)};
+				const parts = path.split("/");
+				parts.pop();
+				let parent = "";
+				for (const part of parts) {
+					parent = parent ? parent + "/" + part : part;
+					if (!app.vault.getAbstractFileByPath(parent)) {
+						await app.vault.createFolder(parent);
+					}
+				}
+				const existing = app.vault.getFileByPath(path);
+				if (existing) await app.vault.modify(existing, ${JSON.stringify(content)});
+				else await app.vault.create(path, ${JSON.stringify(content)});
+				return true;
+			})()`,
+			{ label: `${this.name} write ${path}` },
+		);
+	}
+
+	async renameNote(from: string, to: string): Promise<void> {
+		await this.evalAsync(
+			`(async () => {
+				const from = ${JSON.stringify(from)};
+				const to = ${JSON.stringify(to)};
+				const file = app.vault.getAbstractFileByPath(from);
+				if (!file) throw new Error("Cannot rename missing path: " + from);
+				const parts = to.split("/");
+				parts.pop();
+				let parent = "";
+				for (const part of parts) {
+					parent = parent ? parent + "/" + part : part;
+					if (!app.vault.getAbstractFileByPath(parent)) {
+						await app.vault.createFolder(parent);
+					}
+				}
+				await app.vault.rename(file, to);
+				return true;
+			})()`,
+			{ label: `${this.name} rename ${from} to ${to}` },
+		);
 	}
 
 	async configurePlugin(settings: {
@@ -328,8 +491,53 @@ export class ObsidianClient {
 	}
 
 	async forceTick(): Promise<void> {
-		await this.eval(
-			`await app.plugins.getPlugin('obsidian-sync-engine').sync.engine.tick()`,
+		const result = await this.evalAsync<{ ok: boolean; error?: string }>(
+			`app.plugins.getPlugin('obsidian-sync-engine').sync.engine.tick()`,
+			{ label: `${this.name} sync tick` },
+		);
+		if (!result.ok) {
+			throw new Error(`Sync tick failed: ${result.error ?? "unknown error"}`);
+		}
+	}
+
+	async diagnostics(): Promise<ClientDiagnostics> {
+		return this.evalAsync<ClientDiagnostics>(
+			`(async () => {
+				const plugin = app.plugins.getPlugin("obsidian-sync-engine");
+				const countLines = async (path) => {
+					if (!(await app.vault.adapter.exists(path))) return 0;
+					return (await app.vault.adapter.read(path))
+						.split("\\n")
+						.filter((line) => line.trim().length > 0)
+						.length;
+				};
+				const outbox = plugin.sync.outboxPath;
+				const inbox = outbox.replace(/outbox\\.jsonl$/, "inbox.jsonl");
+				return {
+					revision: plugin.settings.revision,
+					outboxDepth: await countLines(outbox),
+					inboxDepth: await countLines(inbox),
+					lastError: plugin.sync.status.lastError,
+				};
+			})()`,
+			{ label: `${this.name} diagnostics` },
+		);
+	}
+
+	async snapshotFiles(): Promise<Record<string, string>> {
+		return this.evalAsync<Record<string, string>>(
+			`(async () => {
+				const result = {};
+				for (const file of app.vault.getFiles()) {
+					if (file.path === ".obsidian" || file.path.startsWith(".obsidian/")) continue;
+					const bytes = new Uint8Array(await app.vault.readBinary(file));
+					let binary = "";
+					for (const byte of bytes) binary += String.fromCharCode(byte);
+					result[file.path] = btoa(binary);
+				}
+				return result;
+			})()`,
+			{ label: `${this.name} vault snapshot` },
 		);
 	}
 }

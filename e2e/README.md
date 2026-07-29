@@ -34,12 +34,20 @@ cd e2e && bun test tests/obsidian
 | ID | Scenario |
 | --- | --- |
 | E1 | Fresh auth + vault seed |
-| E2 | `/bootstrap.zip` as second client |
+| E2 | `/bootstrap.zip` as a second client without startup re-uploads |
 | E3 | Edit on A → appears on B |
 | E4 | Delete on A → gone on B |
 | E5 | Self-echo does not duplicate |
 | E6 | Offline edits drain after reconnect |
 | E7 | Binary / html / nested round-trip |
 | E8 | Rapid put+delete does not stall B |
+| E9 | Remote file/directory shape transitions |
+| E10 | Causal subtree delete preserves newer descendants |
+| E11 | Four independent bootstrap clients under rapid edits, conflicts, rename/delete/recreate, and subtree races |
+
+The four-client scenario requires byte-identical vault/server snapshots, equal
+revisions, empty durable queues, and no plugin errors for five consecutive
+explicit sync rounds. Polling observes those conditions directly; fixed sleeps
+are not used as correctness gates.
 
 Runtime artifacts land in `e2e/.run/` (gitignored).

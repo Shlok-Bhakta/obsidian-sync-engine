@@ -5,6 +5,11 @@ import { $ } from "bun";
 import { ObsidianClient } from "../../src/obsidian-client";
 import { startStack, type Stack } from "../../src/stack";
 import {
+	assertBootstrapIsReadOnly,
+	readServerSnapshot,
+	waitForStableConvergence,
+} from "../../src/convergence";
+import {
 	SAMPLE_CONTENT_PATHS,
 	installPlugin,
 	writeObsidianConfig,
@@ -12,6 +17,12 @@ import {
 import { waitFor, waitForFile, sleep } from "../../src/wait";
 
 const RUN_ROOT = join(import.meta.dir, "../../.run");
+
+function decodeText(snapshot: { files: Record<string, string> }, path: string) {
+	const encoded = snapshot.files[path];
+	if (encoded === undefined) return undefined;
+	return Buffer.from(encoded, "base64").toString("utf8");
+}
 
 /**
  * Full multi-client e2e against real Obsidian (linuxserver image) driven only
@@ -21,6 +32,8 @@ describe("obsidian multi-client e2e", () => {
 	let stack: Stack;
 	let clientA: ObsidianClient;
 	let clientB: ObsidianClient;
+	let clientC: ObsidianClient;
+	let clientD: ObsidianClient;
 
 	beforeAll(async () => {
 		await mkdir(RUN_ROOT, { recursive: true });
@@ -53,11 +66,25 @@ describe("obsidian multi-client e2e", () => {
 	}, 300_000);
 
 	afterAll(async () => {
+		await clientD?.stop().catch(() => undefined);
+		await clientC?.stop().catch(() => undefined);
 		await clientB?.stop().catch(() => undefined);
 		await clientA?.stop().catch(() => undefined);
 		await stack?.stopServer().catch(() => undefined);
 	}, 120_000);
 	test("E1: fresh server auth + seed uploads vault content", async () => {
+		expect(
+			await clientA.evalAsync<string>(
+				`Promise.resolve("async-bridge-ready")`,
+			),
+		).toBe("async-bridge-ready");
+		await expect(
+			clientA.evalAsync(`Promise.reject(new Error("async-bridge-sentinel"))`),
+		).rejects.toThrow("async-bridge-sentinel");
+		await expect(clientA.eval("(() => {")).rejects.toThrow(
+			"Obsidian eval",
+		);
+
 		await clientA.authenticate();
 		const settings = await clientA.readSettings();
 		expect(settings.clientSecret).not.toBe("Made by server");
@@ -94,6 +121,7 @@ describe("obsidian multi-client e2e", () => {
 	}, 180_000);
 
 	test("E2: bootstrap.zip opens as client B at tip with empty first poll", async () => {
+		const serverBefore = await readServerSnapshot(stack);
 		const zipPath = join(RUN_ROOT, "bootstrap.zip");
 		const denied = await fetch(`${stack.serverUrlLocal}/bootstrap.zip`);
 		expect(denied.status).toBe(401);
@@ -122,20 +150,9 @@ describe("obsidian multi-client e2e", () => {
 		expect(bootData.clientSecret).toBeTruthy();
 
 		await clientB.start();
-		await clientB.configurePlugin({
-			serverUrl: stack.serverUrl,
-			clientName: bootData.clientName,
-			clientSecret: bootData.clientSecret,
-			revision: bootData.revision,
-		});
-
-		const before = await clientB.readSettings();
-		await clientB.forceTick();
-		await sleep(500);
-		await clientB.forceTick();
+		await assertBootstrapIsReadOnly(clientB, stack, serverBefore);
 		const after = await clientB.readSettings();
-
-		expect(after.revision).toBeGreaterThanOrEqual(before.revision);
+		expect(after.revision).toBe(serverBefore.revision);
 		for (const path of SAMPLE_CONTENT_PATHS) {
 			expect(await Bun.file(clientB.vaultPath(path)).exists()).toBe(true);
 		}
@@ -373,4 +390,169 @@ describe("obsidian multi-client e2e", () => {
 			);
 		}
 	}, 120_000);
+
+	test("E11: four independently bootstrapped clients survive adversarial edits and converge", async () => {
+		const stamp = Date.now();
+		clientC = new ObsidianClient({
+			name: "vault-c",
+			configHostDir: join(RUN_ROOT, `client-c-${stamp}`),
+			httpPort: 13300,
+			httpsPort: 13301,
+		});
+		clientD = new ObsidianClient({
+			name: "vault-d",
+			configHostDir: join(RUN_ROOT, `client-d-${stamp}`),
+			httpPort: 13400,
+			httpsPort: 13401,
+		});
+
+		const startIndependentBootstrap = async (
+			client: ObsidianClient,
+			archiveName: string,
+		) => {
+			const before = await readServerSnapshot(stack);
+			const response = await fetch(`${stack.serverUrlLocal}/bootstrap.zip`, {
+				headers: { Authorization: `Bearer ${stack.bootstrapToken}` },
+			});
+			expect(response.status).toBe(200);
+			const zipPath = join(RUN_ROOT, archiveName);
+			await writeFile(zipPath, Buffer.from(await response.arrayBuffer()));
+			await rm(client.vaultHostDir, { recursive: true, force: true });
+			await mkdir(client.vaultHostDir, { recursive: true });
+			await mkdir(client.configHostDir, { recursive: true });
+			await $`unzip -qo ${zipPath} -d ${client.vaultHostDir}`;
+			await writeObsidianConfig(
+				client.configHostDir,
+				client.vaultContainerPath,
+				client.name,
+			);
+			await client.start();
+			await assertBootstrapIsReadOnly(client, stack, before);
+		};
+
+		await waitForStableConvergence([clientA, clientB], stack, {
+			label: "A and B settle before adding bootstrap clients",
+		});
+		await startIndependentBootstrap(clientC, `bootstrap-c-${stamp}.zip`);
+		await startIndependentBootstrap(clientD, `bootstrap-d-${stamp}.zip`);
+
+		const clients = [clientA, clientB, clientC, clientD] as const;
+		await waitForStableConvergence(clients, stack, {
+			label: "all four bootstrap clients agree",
+		});
+		const credentials = await Promise.all(
+			clients.map(async (client) => (await client.readSettings()).clientSecret),
+		);
+		expect(new Set(credentials).size).toBe(clients.length);
+
+		// Rapid independent typing: each renderer performs its own ordered
+		// appends while all four clients mutate concurrently.
+		await Promise.all(
+			clients.map(async (client, clientIndex) => {
+				const path = `spam/client-${clientIndex}.md`;
+				await client.writeNote(path, `seed-${clientIndex}\n`);
+				for (let edit = 0; edit < 8; edit++) {
+					await client.appendNote(path, `asdf-${edit}-${clientIndex}\n`);
+				}
+			}),
+		);
+		const spam = await waitForStableConvergence(clients, stack, {
+			label: "four-way rapid append spam",
+		});
+		for (let clientIndex = 0; clientIndex < clients.length; clientIndex++) {
+			const expected =
+				`seed-${clientIndex}\n` +
+				Array.from(
+					{ length: 8 },
+					(_, edit) => `asdf-${edit}-${clientIndex}\n`,
+				).join("");
+			expect(decodeText(spam.server, `spam/client-${clientIndex}.md`)).toBe(
+				expected,
+			);
+		}
+
+		// The server chooses a serialized last writer. The contract is
+		// convergence, not which concurrently scheduled writer wins.
+		const conflictCandidates = clients.map(
+			(_, clientIndex) => `writer=${clientIndex};${"asdf".repeat(12)}`,
+		);
+		await Promise.all(
+			clients.map((client, clientIndex) =>
+				client.writeNote(
+					"conflict/shared.md",
+					conflictCandidates[clientIndex]!,
+				),
+			),
+		);
+		const conflict = await waitForStableConvergence(clients, stack, {
+			label: "same-path conflict convergence",
+		});
+		expect(conflictCandidates).toContain(
+			decodeText(conflict.server, "conflict/shared.md"),
+		);
+
+		await clientA.writeNote("race/recreate.md", "original");
+		await clientC.writeNote("race/rename-source.md", "rename-body");
+		await waitForStableConvergence(clients, stack, {
+			label: "race fixtures reach every client",
+		});
+		await Promise.all([
+			clientA.deleteNote("race/recreate.md"),
+			clientB.writeNote("race/recreate.md", "recreated-by-b"),
+			clientC.renameNote("race/rename-source.md", "race/rename-dest.md"),
+			clientD.writeNote("race/independent-d.md", "independent"),
+		]);
+		const transitions = await waitForStableConvergence(clients, stack, {
+			label: "delete recreate and rename-like transitions",
+		});
+		expect(transitions.server.files["race/rename-source.md"]).toBeUndefined();
+		expect(decodeText(transitions.server, "race/rename-dest.md")).toBe(
+			"rename-body",
+		);
+		expect(decodeText(transitions.server, "race/independent-d.md")).toBe(
+			"independent",
+		);
+		const recreated = decodeText(transitions.server, "race/recreate.md");
+		expect(recreated === undefined || recreated === "recreated-by-b").toBe(true);
+
+		await clientA.writeNote("nasty-folder/old-one.md", "old");
+		await clientA.writeNote("nasty-folder/deep/old-two.md", "old");
+		await waitForStableConvergence(clients, stack, {
+			label: "causal subtree baseline",
+		});
+		const baseRevision = (await clientA.diagnostics()).revision;
+
+		// B's descendant is newer than A's observed base. Push it first while A
+		// remains causally stale, then deliver A's parent delete with that base.
+		await clientB.writeNote("nasty-folder/new-from-b.md", "must-survive");
+		await waitFor(
+			async () => {
+				await clientB.forceTick();
+				const current = await readServerSnapshot(stack);
+				return current.files["nasty-folder/new-from-b.md"] ? current : false;
+			},
+			{ timeoutMs: 60_000, label: "newer descendant reaches server" },
+		);
+		const auth = (await clientA.readSettings()).clientSecret;
+		const deleted = await fetch(
+			`${stack.serverUrlLocal}/files?path=${encodeURIComponent("nasty-folder")}`,
+			{
+				method: "DELETE",
+				headers: {
+					Authorization: auth,
+					"X-Obsidian-Base-Revision": String(baseRevision),
+				},
+			},
+		);
+		expect(deleted.status).toBe(200);
+
+		const final = await waitForStableConvergence(clients, stack, {
+			timeoutMs: 150_000,
+			stableRounds: 5,
+			label: "four-client causal subtree convergence",
+		});
+		expect(final.server.files["nasty-folder/old-one.md"]).toBeUndefined();
+		expect(final.server.files["nasty-folder/deep/old-two.md"]).toBeUndefined();
+		expect(final.server.files["nasty-folder/new-from-b.md"]).toBeTruthy();
+	}, 360_000);
 });
