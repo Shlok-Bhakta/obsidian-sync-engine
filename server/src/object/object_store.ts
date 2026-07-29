@@ -155,6 +155,21 @@ export class ObjectStore {
 
         const [row] = (await sql.begin(async (tx) => {
             await tx`SELECT pg_advisory_xact_lock(hashtext(${REVISION_LOCK_KEY}))`;
+			const descendants = await tx<{ file_path: string }[]>`
+				SELECT file_path FROM files
+				WHERE file_is_deleted = FALSE
+				  AND position(${canonicalPath + "/"} in file_path) = 1
+				ORDER BY file_path
+			`;
+			for (const descendant of descendants) {
+				await tx`
+					UPDATE files
+					SET author_id = ${authorId}, file_is_deleted = TRUE,
+						content = NULL, updated_at = NOW(),
+						last_updated_revision = NEXTVAL('global_revision')
+					WHERE file_path = ${descendant.file_path}
+				`;
+			}
             return tx<FileContentRow[]>`
                 INSERT INTO files (file_path, author_id, file_is_deleted, content)
                 VALUES (${canonicalPath}, ${authorId}, TRUE, NULL)

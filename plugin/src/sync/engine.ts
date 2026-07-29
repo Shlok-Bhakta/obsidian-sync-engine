@@ -378,26 +378,33 @@ export class SyncEngine {
 	}
 
 	private async pushPut(path: string): Promise<{ revision: number }> {
+		this.assertActive();
 		const body = await this.fs.readBinary(path);
+		this.assertActive();
 		return this.transport.upload(path, body);
 	}
 
 	private async pushDelete(path: string): Promise<{ revision: number }> {
+		this.assertActive();
 		return this.transport.deleteRemote(path);
 	}
 
 	private async applyRemoteInbox(): Promise<number> {
+		this.assertActive();
 		const rev = await this.getRevision();
 		const ops = await this.transport.fetchInbox(rev);
+		this.assertActive();
 		await appendInbox(this.fs, this.inboxPath, ops);
 
 		let applied = 0;
 		await applyInbox(this.fs, this.inboxPath, {
 			applyPut: async (path) => {
+				this.assertActive();
 				await this.applyRemotePut(path);
 				applied++;
 			},
 			applyDelete: async (path) => {
+				this.assertActive();
 				await this.applyRemoteDelete(path);
 				applied++;
 			},
@@ -409,6 +416,12 @@ export class SyncEngine {
 				),
 		});
 		return applied;
+	}
+
+	private assertActive(): void {
+		if (this.isSuspended()) {
+			throw new Error("Sync is suspended until Obsidian reloads");
+		}
 	}
 
 	private async applyRemotePut(path: string): Promise<void> {

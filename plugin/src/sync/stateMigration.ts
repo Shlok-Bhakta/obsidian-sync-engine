@@ -38,11 +38,14 @@ async function mergeJournal(
 			? await adapter.read(targetQuarantine)
 			: "";
 		const recovered = await adapter.read(sourceQuarantine);
-		const separator =
-			existing.length === 0 || existing.endsWith("\n") ? "" : "\n";
+		const uniqueLines = new Set(
+			`${existing}\n${recovered}`
+				.split("\n")
+				.filter((line) => line.length > 0),
+		);
 		await adapter.write(
 			targetQuarantine,
-			`${existing}${separator}${recovered}`,
+			uniqueLines.size > 0 ? `${[...uniqueLines].join("\n")}\n` : "",
 		);
 	}
 	const merged = new Map<string, unknown>();

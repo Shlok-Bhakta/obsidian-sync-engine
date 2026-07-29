@@ -120,4 +120,24 @@ describe("migrateServerState", () => {
 			'{"id":"old"}\n{"id":"new"}\n',
 		);
 	});
+
+	test("a restart does not duplicate a migrated corrupt-tail sidecar", async () => {
+		const fs = new MemoryAdapter();
+		fs.dirs.add("state/legacy");
+		fs.dirs.add("state/encoded");
+		fs.files.set("state/legacy/outbox.jsonl", '{"id":"valid"}\n');
+		fs.files.set(
+			"state/legacy/outbox.jsonl.corrupt",
+			'{"id":"truncated"\n',
+		);
+		fs.files.set("state/encoded/outbox.jsonl", '{"id":"valid"}\n');
+		fs.files.set(
+			"state/encoded/outbox.jsonl.legacy.corrupt",
+			'{"id":"truncated"\n',
+		);
+		await migrateServerState(fs, "state", "legacy", "encoded");
+		expect(
+			fs.files.get("state/encoded/outbox.jsonl.legacy.corrupt"),
+		).toBe('{"id":"truncated"\n');
+	});
 });

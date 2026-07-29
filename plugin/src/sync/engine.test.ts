@@ -709,6 +709,40 @@ describe("SyncEngine", () => {
 		expect(await listOutbox(fs, OUTBOX)).toEqual([]);
 	});
 
+	test("a server switch during a tick stops before inbox access", async () => {
+		const fs = new MemoryVaultFs();
+		await fs.write("a.md", "local");
+		await enqueueOutbox(fs, OUTBOX, {
+			op: "put",
+			path: "a.md",
+			ts: 1,
+		});
+		let suspended = false;
+		const transport = new FakeTransport();
+		const upload = transport.upload.bind(transport);
+		transport.upload = async (path, body) => {
+			const result = await upload(path, body);
+			suspended = true;
+			return result;
+		};
+		const revision = makeRevisionStore(0);
+		const engine = new SyncEngine({
+			fs,
+			transport,
+			outboxPath: OUTBOX,
+			inboxPath: INBOX,
+			getRevision: revision.get,
+			setRevision: revision.set,
+			isSuspended: () => suspended,
+		});
+
+		const result = await engine.tick();
+
+		expect(result.ok).toBe(false);
+		expect(transport.calls).toEqual(["upload"]);
+		expect(revision.get()).toBe(0);
+	});
+
 	test("a failed outbox append is reported and retried on the next tick", async () => {
 		const fs = new FlakyAppendVaultFs();
 		await fs.write("a.md", "local");

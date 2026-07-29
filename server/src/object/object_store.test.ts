@@ -443,6 +443,25 @@ describe("object store", () => {
         const body = await deleteRes.json() as { path: string; revision: number };
         expect(body.path).toBe(rawPath);
     });
+    it("deleting a parent path tombstones every active descendant", async () => {
+        const client = await createClientFixture({ client_name: "alice" });
+        const objectStore = new ObjectStore();
+        const child = await objectStore.upload({
+            path: "dir/child.md",
+            content: "child",
+            id: client.id,
+        });
+
+        const result = await objectStore.delete("dir", client.id);
+        expect(result.revision).toBeGreaterThan(child.revision);
+        expect(await objectStore.download("dir/child.md")).toBeNull();
+
+        const inbox = await objectStore.inbox(child.revision);
+        expect(inbox.map(({ path, isDeleted }) => ({ path, isDeleted }))).toEqual([
+            { path: "dir/child.md", isDeleted: true },
+            { path: "dir", isDeleted: true },
+        ]);
+    });
     it("excludes soft-deleted files from the bootstrap zip", async () => {
         const client = await createClientFixture({ client_name: "alice" });
         const objectStore = new ObjectStore();

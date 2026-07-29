@@ -97,10 +97,26 @@ export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
 	const inboxPath = getInboxPath(plugin);
 	const deadLetterPath = getDeadLetterPath(plugin);
 	const status: SyncStatus = { lastTickAt: null, lastError: null };
+	const runtimeIdentity = plugin.settings.serverIdentity;
+	const runtimeServerUrl = plugin.settings.serverUrl;
+	const assertRuntimeIdentity = () => {
+		if (
+			plugin.isSyncSuspended() ||
+			plugin.settings.serverIdentity !== runtimeIdentity
+		) {
+			throw new Error("Sync runtime belongs to a different server; reload Obsidian");
+		}
+	};
 
 	const transport = new HttpTransport({
-		getServerUrl: () => plugin.settings.serverUrl,
-		getAuthorization: () => plugin.settings.clientSecret,
+		getServerUrl: () => {
+			assertRuntimeIdentity();
+			return runtimeServerUrl;
+		},
+		getAuthorization: () => {
+			assertRuntimeIdentity();
+			return plugin.settings.clientSecret;
+		},
 		request: requestUrl,
 	});
 
@@ -110,8 +126,12 @@ export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
 		outboxPath,
 		inboxPath,
 		deadLetterPath,
-		getRevision: () => plugin.settings.revision,
+		getRevision: () => {
+			assertRuntimeIdentity();
+			return plugin.settings.revision;
+		},
 		setRevision: (revision) => {
+			assertRuntimeIdentity();
 			plugin.settings.revision = revision;
 			return plugin.saveSettings();
 		},
@@ -122,7 +142,9 @@ export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
 		onEnqueueFailure: (error, op) => {
 			status.lastError = `Could not persist ${op.path}: ${error.message}`;
 		},
-		isSuspended: () => plugin.isSyncSuspended(),
+		isSuspended: () =>
+			plugin.isSyncSuspended() ||
+			plugin.settings.serverIdentity !== runtimeIdentity,
 	});
 
 	// Suppressed whenever the write/delete originated from *this* fs instance
