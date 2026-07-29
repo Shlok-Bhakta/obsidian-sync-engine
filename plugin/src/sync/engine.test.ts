@@ -786,6 +786,97 @@ describe("SyncEngine", () => {
 		]);
 	});
 
+	test("quiesce waits for an already-started inbound write", async () => {
+		const fs = new MemoryVaultFs();
+		const transport = new FakeTransport();
+		transport.simulateRemoteOp("put", "remote.md", "old-server-content");
+		let releaseWrite!: () => void;
+		let signalWriteStarted!: () => void;
+		const writeStarted = new Promise<void>((resolve) => {
+			signalWriteStarted = resolve;
+		});
+		const writeBinary = fs.writeBinary.bind(fs);
+		fs.writeBinary = async (path, data) => {
+			signalWriteStarted();
+			await new Promise<void>((resolve) => {
+				releaseWrite = resolve;
+			});
+			await writeBinary(path, data);
+		};
+		let suspended = false;
+		const revision = makeRevisionStore(0);
+		const engine = new SyncEngine({
+			fs,
+			transport,
+			outboxPath: OUTBOX,
+			inboxPath: INBOX,
+			getRevision: revision.get,
+			setRevision: revision.set,
+			isSuspended: () => suspended,
+		});
+
+		const tick = engine.tick();
+		await writeStarted;
+		suspended = true;
+		let quiesced = false;
+		const quiesce = engine.quiesce().then(() => {
+			quiesced = true;
+		});
+		await flushMicrotasks();
+		expect(quiesced).toBe(false);
+		releaseWrite();
+		await Promise.all([tick, quiesce]);
+		expect(quiesced).toBe(true);
+		expect(await fs.read("remote.md")).toBe("old-server-content");
+		expect(revision.get()).toBe(0);
+	});
+
+	test("quiesce waits for an already-started inbound removal", async () => {
+		const fs = new MemoryVaultFs();
+		await fs.write("remote.md", "old-server-content");
+		const transport = new FakeTransport();
+		transport.simulateRemoteOp("delete", "remote.md");
+		let releaseRemove!: () => void;
+		let signalRemoveStarted!: () => void;
+		const removeStarted = new Promise<void>((resolve) => {
+			signalRemoveStarted = resolve;
+		});
+		const remove = fs.remove.bind(fs);
+		fs.remove = async (path) => {
+			signalRemoveStarted();
+			await new Promise<void>((resolve) => {
+				releaseRemove = resolve;
+			});
+			await remove(path);
+		};
+		let suspended = false;
+		const revision = makeRevisionStore(0);
+		const engine = new SyncEngine({
+			fs,
+			transport,
+			outboxPath: OUTBOX,
+			inboxPath: INBOX,
+			getRevision: revision.get,
+			setRevision: revision.set,
+			isSuspended: () => suspended,
+		});
+
+		const tick = engine.tick();
+		await removeStarted;
+		suspended = true;
+		let quiesced = false;
+		const quiesce = engine.quiesce().then(() => {
+			quiesced = true;
+		});
+		await flushMicrotasks();
+		expect(quiesced).toBe(false);
+		releaseRemove();
+		await Promise.all([tick, quiesce]);
+		expect(quiesced).toBe(true);
+		expect(await fs.exists("remote.md")).toBe(false);
+		expect(revision.get()).toBe(0);
+	});
+
 	test("a failed outbox append is reported and retried on the next tick", async () => {
 		const fs = new FlakyAppendVaultFs();
 		await fs.write("a.md", "local");

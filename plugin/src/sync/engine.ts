@@ -201,6 +201,17 @@ export class SyncEngine {
 		}
 	}
 
+	/**
+	 * Stop scheduled work and wait for any already-running persistence/tick
+	 * (including its Vault mutation) to settle. Used before changing the
+	 * engine's server identity.
+	 */
+	async quiesce(): Promise<void> {
+		this.debouncer.cancel("tick");
+		await Promise.allSettled([...this.enqueueInFlight]);
+		if (this.tickInFlight) await this.tickInFlight;
+	}
+
 	private async refreshPending(path: string): Promise<void> {
 		if ((this.enqueueCounts.get(path) ?? 0) > 0) {
 			this.pendingOutboxPaths.add(path);
@@ -409,7 +420,10 @@ export class SyncEngine {
 				applied++;
 			},
 			getRevision: () => this.getRevision(),
-			setRevision: (newRev) => this.setRevision(newRev),
+			setRevision: (newRev) => {
+				this.assertActive();
+				return this.setRevision(newRev);
+			},
 			shouldDeferApply: (op) =>
 				[...this.pendingOutboxPaths].some((path) =>
 					pathsStructurallyConflict(path, op.path),

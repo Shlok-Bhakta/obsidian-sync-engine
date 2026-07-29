@@ -108,14 +108,17 @@ export default class ObsidianSyncPlugin extends Plugin {
 	}
 
 	async changeServerUrl(value: string): Promise<void> {
-		if (
+		const serverUrl = normalizeServerUrl(value);
+		if (serverUrl !== this.settings.serverUrl) {
+			// Gate new work first, then wait for any old-server Vault mutation
+			// to finish before committing the new identity and credentials.
+			this.reloadRequired = true;
+			await this.sync.engine.quiesce();
 			transitionServerSettings(
 				this.settings,
-				value,
+				serverUrl,
 				DEFAULT_SETTINGS.clientSecret,
-			)
-		) {
-			this.reloadRequired = true;
+			);
 			new Notice("Server changed. Reload Obsidian before pairing; sync state is isolated per server.");
 		}
 		await this.saveSettings();

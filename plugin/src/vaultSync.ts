@@ -152,23 +152,28 @@ export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
 	// user editing the vault, so applying an inbound change can never
 	// re-enqueue itself as an outbound one.
 	const isLocallyOriginated = (
+		file: TAbstractFile,
 		path: string,
 		event: "create" | "modify" | "delete" | "rename-delete",
 	) =>
 		!plugin.isSyncSuspended() &&
-		!fs.consumeInboundEvent(path, event) &&
+		!fs.consumeInboundEvent(file, path, event) &&
 		!isSyncEngineOwnedPath(plugin, path);
 
-	const enqueuePutIfLocal = (path: string, event: "create" | "modify") => {
-		if (isLocallyOriginated(path, event)) {
-			engine.enqueuePut(path);
+	const enqueuePutIfLocal = (
+		file: TAbstractFile,
+		event: "create" | "modify",
+	) => {
+		if (isLocallyOriginated(file, file.path, event)) {
+			engine.enqueuePut(file.path);
 		}
 	};
 	const enqueueDeleteIfLocal = (
+		file: TAbstractFile,
 		path: string,
 		event: "delete" | "rename-delete",
 	) => {
-		if (isLocallyOriginated(path, event)) {
+		if (isLocallyOriginated(file, path, event)) {
 			engine.enqueueDelete(path);
 		}
 	};
@@ -180,14 +185,14 @@ export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
 	plugin.registerEvent(
 		plugin.app.vault.on('modify', (file: TAbstractFile) => {
 			if (file instanceof TFile) {
-				enqueuePutIfLocal(file.path, "modify");
+				enqueuePutIfLocal(file, "modify");
 			}
 		}),
 	);
 	plugin.registerEvent(
 		plugin.app.vault.on('create', (file: TAbstractFile) => {
 			if (file instanceof TFile) {
-				enqueuePutIfLocal(file.path, "create");
+				enqueuePutIfLocal(file, "create");
 			}
 		}),
 	);
@@ -196,15 +201,15 @@ export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
 			// Folders have no content to sync — only their (already-deleted)
 			// child files matter, and those get their own 'delete' events.
 			if (file instanceof TFile) {
-				enqueueDeleteIfLocal(file.path, "delete");
+				enqueueDeleteIfLocal(file, file.path, "delete");
 			}
 		}),
 	);
 	plugin.registerEvent(
 		plugin.app.vault.on('rename', (file: TAbstractFile, oldPath: string) => {
 			if (file instanceof TFile) {
-				enqueueDeleteIfLocal(oldPath, "rename-delete");
-				enqueuePutIfLocal(file.path, "create");
+				enqueueDeleteIfLocal(file, oldPath, "rename-delete");
+				enqueuePutIfLocal(file, "create");
 			}
 		}),
 	);

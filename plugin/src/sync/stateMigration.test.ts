@@ -160,4 +160,24 @@ describe("migrateServerState", () => {
 			await fs.exists("state/encoded/outbox.jsonl.migration.bak"),
 		).toBe(false);
 	});
+
+	test("preserves duplicate entries within both source and destination", async () => {
+		const fs = new MemoryAdapter();
+		fs.dirs.add("state/legacy");
+		fs.dirs.add("state/encoded");
+		fs.files.set(
+			"state/legacy/outbox.jsonl",
+			'{"id":"old"}\n{"id":"old"}\n',
+		);
+		fs.files.set(
+			"state/encoded/outbox.jsonl",
+			'{"id":"new"}\n{"id":"new"}\n',
+		);
+
+		await migrateServerState(fs, "state", "legacy", "encoded");
+
+		expect(fs.files.get("state/encoded/outbox.jsonl")).toBe(
+			'{"id":"old"}\n{"id":"old"}\n{"id":"new"}\n{"id":"new"}\n',
+		);
+	});
 });

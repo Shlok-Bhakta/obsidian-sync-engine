@@ -52,11 +52,18 @@ async function mergeJournal(
 			uniqueLines.size > 0 ? `${[...uniqueLines].join("\n")}\n` : "",
 		);
 	}
-	const merged = new Map<string, unknown>();
-	for (const entry of [...older, ...newer]) {
-		merged.set(JSON.stringify(entry), entry);
-	}
-	const lines = [...merged.values()].map((entry) => JSON.stringify(entry));
+	const olderLines = older.map((entry) => JSON.stringify(entry));
+	const newerLines = newer.map((entry) => JSON.stringify(entry));
+	// A restart after installing a merged target leaves the entire source
+	// sequence as an exact target prefix. Only remove that complete replay;
+	// otherwise preserve every record (including legitimate duplicates) and
+	// the original old-before-new ordering.
+	const sourceAlreadyInstalled =
+		olderLines.length <= newerLines.length &&
+		olderLines.every((line, index) => newerLines[index] === line);
+	const lines = sourceAlreadyInstalled
+		? newerLines
+		: [...olderLines, ...newerLines];
 	await adapter.write(tmp, lines.length > 0 ? `${lines.join("\n")}\n` : "");
 	await adapter.rename(target, backup);
 	try {

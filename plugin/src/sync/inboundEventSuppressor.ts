@@ -22,4 +22,19 @@ export class InboundEventSuppressor {
 	cancel(path: string): void {
 		this.expected.delete(path);
 	}
+
+	/**
+	 * Vault events may be queued just after the mutation promise resolves.
+	 * Keep this exact expectation through the current event batch, then remove
+	 * only this generation so a later local action is never suppressed.
+	 */
+	settle(path: string): void {
+		const generation = this.expected.get(path);
+		if (!generation) return;
+		globalThis.setTimeout(() => {
+			if (this.expected.get(path) === generation) {
+				this.expected.delete(path);
+			}
+		}, 0);
+	}
 }

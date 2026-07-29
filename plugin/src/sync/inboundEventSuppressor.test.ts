@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, jest, test } from "bun:test";
 import { InboundEventSuppressor } from "./inboundEventSuppressor";
 
 describe("InboundEventSuppressor", () => {
@@ -19,11 +19,25 @@ describe("InboundEventSuppressor", () => {
 	});
 
 	test("unused alternative events are cleared when a mutation settles", () => {
+		jest.useFakeTimers();
 		const suppressor = new InboundEventSuppressor();
 		suppressor.expect("a.md", "rename-delete", "delete");
 		expect(suppressor.consume("a.md", "rename-delete")).toBe(true);
-		suppressor.cancel("a.md");
+		suppressor.settle("a.md");
+		jest.runAllTimers();
 		expect(suppressor.consume("a.md", "delete")).toBe(false);
 		expect(suppressor.consume("a.md", "delete")).toBe(false);
+		jest.useRealTimers();
+	});
+
+	test("a queued alternative can still be consumed before settlement", () => {
+		jest.useFakeTimers();
+		const suppressor = new InboundEventSuppressor();
+		suppressor.expect("a.md", "rename-delete", "delete");
+		suppressor.settle("a.md");
+		expect(suppressor.consume("a.md", "delete")).toBe(true);
+		jest.runAllTimers();
+		expect(suppressor.consume("a.md", "rename-delete")).toBe(false);
+		jest.useRealTimers();
 	});
 });
