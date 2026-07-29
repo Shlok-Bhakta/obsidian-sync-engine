@@ -94,9 +94,6 @@ export class SyncEngine {
 	 */
 	private readonly pendingOutboxPaths = new Set<string>();
 
-	/** Revisions returned by our own upload/deleteRemote, awaiting self-echo. */
-	private readonly echoRevs = new Set<number>();
-
 	/** Paths with an enqueue currently writing to the outbox. */
 	private readonly enqueueInFlight = new Set<Promise<void>>();
 	private readonly enqueueCounts = new Map<string, number>();
@@ -292,11 +289,11 @@ export class SyncEngine {
 			}
 
 			try {
-				const result =
-					op.op === "put"
-						? await this.pushPut(op.path)
-						: await this.pushDelete(op.path);
-				this.echoRevs.add(result.revision);
+				if (op.op === "put") {
+					await this.pushPut(op.path);
+				} else {
+					await this.pushDelete(op.path);
+				}
 				processedPaths.add(op.path);
 				pushed++;
 			} catch (error) {
@@ -371,12 +368,6 @@ export class SyncEngine {
 			},
 			getRevision: () => this.getRevision(),
 			setRevision: (newRev) => this.setRevision(newRev),
-			shouldSkipApply: (op) => {
-				if (this.echoRevs.delete(op.rev)) {
-					return true;
-				}
-				return false;
-			},
 			shouldDeferApply: (op) => this.pendingOutboxPaths.has(op.path),
 		});
 		return applied;

@@ -188,7 +188,12 @@ describe("SyncEngine", () => {
 
 		await engine.tick();
 
-		expect(transport.calls).toEqual(["upload", "fetchInbox", "download"]);
+		expect(transport.calls).toEqual([
+			"upload",
+			"fetchInbox",
+			"download",
+			"download",
+		]);
 		expect(transport.uploads.length).toBe(1);
 		expect(transport.uploads[0]?.path).toBe("local.md");
 		expect(
@@ -197,8 +202,7 @@ describe("SyncEngine", () => {
 		expect(await listOutbox(fs, OUTBOX)).toEqual([]);
 		expect(await fs.read("remote.md")).toBe("from the server");
 		expect(await readInbox(fs, INBOX)).toEqual([]);
-		// remote.md (rev 1) was applied for real; local.md's echo (rev 2) was
-		// recognized and skipped, but both still drove the cursor to 2.
+		// Both the remote change and authoritative self-echo were reconciled.
 		expect(revision.get()).toBe(2);
 	});
 
@@ -230,7 +234,7 @@ describe("SyncEngine", () => {
 		expect(revision.get()).toBe(0); // ...but our cursor hasn't moved.
 	});
 
-	test("self-echo: applying our own echoed line advances the cursor without re-downloading the file", async () => {
+	test("self-echo: applying our own echoed line advances and reconciles local content", async () => {
 		const fs = new MemoryVaultFs();
 		await fs.write("a.md", "content");
 		const transport = new FakeTransport();
@@ -250,13 +254,34 @@ describe("SyncEngine", () => {
 
 		await engine.tick();
 
-		// The upload's own log entry comes back through fetchInbox and is
-		// recognized via echoRevs, so the cursor still advances...
 		expect(revision.get()).toBe(1);
 		expect(transport.fetchInboxCalls).toEqual([0]);
 		expect(await readInbox(fs, INBOX)).toEqual([]);
-		// ...but the content is never re-downloaded/re-applied for our own echo.
-		expect(transport.calls).toEqual(["upload", "fetchInbox"]);
+		expect(transport.calls).toEqual(["upload", "fetchInbox", "download"]);
+		expect(await fs.read("a.md")).toBe("content");
+	});
+
+	test("an offline local put survives an older remote tombstone before its echo", async () => {
+		const fs = new MemoryVaultFs();
+		await fs.write("a.md", "offline edit");
+		const transport = new FakeTransport();
+		transport.simulateRemoteOp("delete", "a.md");
+		const revision = makeRevisionStore(0);
+		await enqueueOutbox(fs, OUTBOX, { op: "put", path: "a.md", ts: 1 });
+		const engine = new SyncEngine({
+			fs,
+			transport,
+			outboxPath: OUTBOX,
+			inboxPath: INBOX,
+			getRevision: revision.get,
+			setRevision: revision.set,
+			debounceMs: 0,
+		});
+		const result = await engine.tick();
+		expect(result.ok).toBe(true);
+		expect(revision.get()).toBe(2);
+		expect(await fs.read("a.md")).toBe("offline edit");
+		expect(transport.remoteFiles.get("a.md")).toBe("offline edit");
 	});
 
 	test("enqueuePut writes to the outbox immediately and coalesces rapid calls", async () => {

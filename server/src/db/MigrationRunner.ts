@@ -45,6 +45,17 @@ export async function bootstrapDB() {
                 created_at TIMESTAMP NOT NULL DEFAULT NOW()
             )
         `;
+		// Older releases created this table without UNIQUE(name). Repair that
+		// schema under the migration lock before relying on target conflicts.
+		await tx`
+			DELETE FROM migrations older
+			USING migrations newer
+			WHERE older.name = newer.name AND older.id > newer.id
+		`;
+		await tx`
+			CREATE UNIQUE INDEX IF NOT EXISTS migrations_name_unique
+			ON migrations (name)
+		`;
         const applied = await tx<MigrationRow[]>`SELECT name FROM migrations`;
         const appliedNames = new Set(applied.map(({ name }) => name));
         for (const migration of migrationsManifest) {
