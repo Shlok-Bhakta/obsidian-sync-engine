@@ -512,39 +512,44 @@ describe("obsidian multi-client e2e", () => {
 		expect(decodeText(transitions.server, "race/independent-d.md")).toBe(
 			"independent",
 		);
-		const recreated = decodeText(transitions.server, "race/recreate.md");
-		expect(recreated === undefined || recreated === "recreated-by-b").toBe(true);
+		expect(decodeText(transitions.server, "race/recreate.md")).toBe(
+			"recreated-by-b",
+		);
 
 		await clientA.writeNote("nasty-folder/old-one.md", "old");
 		await clientA.writeNote("nasty-folder/deep/old-two.md", "old");
 		await waitForStableConvergence(clients, stack, {
 			label: "causal subtree baseline",
 		});
-		const baseRevision = (await clientA.diagnostics()).revision;
 
-		// B's descendant is newer than A's observed base. Push it first while A
-		// remains causally stale, then deliver A's parent delete with that base.
-		await clientB.writeNote("nasty-folder/new-from-b.md", "must-survive");
-		await waitFor(
-			async () => {
-				await clientB.forceTick();
-				const current = await readServerSnapshot(stack);
-				return current.files["nasty-folder/new-from-b.md"] ? current : false;
-			},
-			{ timeoutMs: 60_000, label: "newer descendant reaches server" },
-		);
-		const auth = (await clientA.readSettings()).clientSecret;
-		const deleted = await fetch(
-			`${stack.serverUrlLocal}/files?path=${encodeURIComponent("nasty-folder")}`,
-			{
-				method: "DELETE",
-				headers: {
-					Authorization: auth,
-					"X-Obsidian-Base-Revision": String(baseRevision),
+		// Keep A causally stale without disabling its Vault listeners. B pushes
+		// a newer descendant, then A performs a real recursive Vault deletion;
+		// the child-file events must land durably before network ticks resume.
+		await clientA.pauseNetworkTicks();
+		try {
+			await clientB.writeNote("nasty-folder/new-from-b.md", "must-survive");
+			await waitFor(
+				async () => {
+					await clientB.forceTick();
+					const current = await readServerSnapshot(stack);
+					return current.files["nasty-folder/new-from-b.md"] ? current : false;
 				},
-			},
-		);
-		expect(deleted.status).toBe(200);
+				{ timeoutMs: 60_000, label: "newer descendant reaches server" },
+			);
+			await clientA.deleteNote("nasty-folder");
+			await waitFor(
+				async () => {
+					const diagnostics = await clientA.diagnostics();
+					return diagnostics.outboxDepth >= 2 ? diagnostics : false;
+				},
+				{
+					timeoutMs: 30_000,
+					label: "recursive Vault deletion reaches A durable outbox",
+				},
+			);
+		} finally {
+			await clientA.resumeNetworkTicks();
+		}
 
 		const final = await waitForStableConvergence(clients, stack, {
 			timeoutMs: 150_000,

@@ -11,6 +11,7 @@ import { CONTAINER_BIN, hostGatewayRunArgs } from "./container";
 
 const IMAGE = process.env.E2E_OBSIDIAN_IMAGE ?? "lscr.io/linuxserver/obsidian:latest";
 const EVAL_BRIDGE_KEY = "__obsidianSyncE2EAsync";
+const PAUSED_TICK_KEY = "__obsidianSyncE2EPausedTick";
 
 type AsyncEvalState =
 	| { status: "pending" }
@@ -498,6 +499,41 @@ export class ObsidianClient {
 		if (!result.ok) {
 			throw new Error(`Sync tick failed: ${result.error ?? "unknown error"}`);
 		}
+	}
+
+	/**
+	 * Pause network ticks without suspending Vault event capture. This lets an
+	 * E2E client remain causally stale while local mutations still reach its
+	 * durable outbox.
+	 */
+	async pauseNetworkTicks(): Promise<void> {
+		await this.evalAsync(
+			`(async () => {
+				const plugin = app.plugins.getPlugin("obsidian-sync-engine");
+				const engine = plugin.sync.engine;
+				const key = ${JSON.stringify(PAUSED_TICK_KEY)};
+				if (globalThis[key]) throw new Error("Network ticks are already paused");
+				globalThis[key] = { engine, tick: engine.tick };
+				engine.tick = async () => ({ ok: true, pushed: 0, applied: 0 });
+				await engine.quiesce();
+				return true;
+			})()`,
+			{ label: `${this.name} pause network ticks` },
+		);
+	}
+
+	async resumeNetworkTicks(): Promise<void> {
+		await this.evalAsync(
+			`(() => {
+				const key = ${JSON.stringify(PAUSED_TICK_KEY)};
+				const paused = globalThis[key];
+				if (!paused) throw new Error("Network ticks are not paused");
+				paused.engine.tick = paused.tick;
+				delete globalThis[key];
+				return true;
+			})()`,
+			{ label: `${this.name} resume network ticks` },
+		);
 	}
 
 	async diagnostics(): Promise<ClientDiagnostics> {
