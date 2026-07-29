@@ -260,6 +260,17 @@ describe("object store", () => {
             expect(settings.lastPulledRev).toBeUndefined();
             expect(typeof settings.clientName).toBe("string");
             expect(typeof settings.clientSecret).toBe("string");
+            expect(await Bun.file(join(
+                extractDir,
+                ".obsidian/plugins/obsidian-sync-engine/main.js",
+            )).exists()).toBe(true);
+            expect(await Bun.file(join(
+                extractDir,
+                ".obsidian/plugins/obsidian-sync-engine/manifest.json",
+            )).exists()).toBe(true);
+            expect(await Bun.file(
+                join(extractDir, ".obsidian/community-plugins.json"),
+            ).json()).toContain("obsidian-sync-engine");
         } finally {
             await rm(tmp, { recursive: true, force: true });
         }

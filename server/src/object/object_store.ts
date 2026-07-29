@@ -27,6 +27,36 @@ export const DEFAULT_OBJECT_STORE_DIR = resolve(
  * can never commit after a client has already observed a higher one.
  */
 const REVISION_LOCK_KEY = "obsidian-sync-revision";
+const PLUGIN_ID = "obsidian-sync-engine";
+const PLUGIN_DIR = resolve(
+	process.env.PLUGIN_DIST_DIR ?? join(import.meta.dir, "../../../plugin"),
+);
+
+async function addPluginToBootstrap(
+	entries: Record<string, Uint8Array>,
+): Promise<void> {
+	const pluginVaultDir = `.obsidian/plugins/${PLUGIN_ID}`;
+	for (const name of ["main.js", "manifest.json"] as const) {
+		const file = Bun.file(join(PLUGIN_DIR, name));
+		if (!(await file.exists())) {
+			throw new Error(
+				`Plugin artifact ${name} is missing from ${PLUGIN_DIR}; build the plugin before starting the server`,
+			);
+		}
+		entries[`${pluginVaultDir}/${name}`] = new Uint8Array(
+			await file.arrayBuffer(),
+		);
+	}
+	const styles = Bun.file(join(PLUGIN_DIR, "styles.css"));
+	if (await styles.exists()) {
+		entries[`${pluginVaultDir}/styles.css`] = new Uint8Array(
+			await styles.arrayBuffer(),
+		);
+	}
+	entries[".obsidian/community-plugins.json"] = new TextEncoder().encode(
+		JSON.stringify([PLUGIN_ID]),
+	);
+}
 
 export type ObjectStoreUploadContent = {
     path: string;
@@ -241,6 +271,7 @@ export class ObjectStore {
 				entries[canonicalPath] = new Uint8Array(file.content as Buffer);
             }
 
+			await addPluginToBootstrap(entries);
 			const clientName = `bootstrap-${randomUUID()}`;
             clientSecret = await createClient(clientName);
 			const dataPath = ".obsidian/plugins/obsidian-sync-engine/data.json";

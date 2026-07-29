@@ -47,7 +47,8 @@ directory when upgrading an existing deployment, then restart once.
 
 ```sh
 cd shared/protocol && npm ci
-cd ../../server && bun install
+cd ../../plugin && npm ci && npm run build
+cd ../server && bun install
 export DATABASE_URL=postgres://postgres:postgres@localhost:5433/dev_db
 export BOOTSTRAP_TOKEN='generate-a-long-random-secret'
 export PUBLIC_SERVER_URL='https://sync.example.com'
@@ -68,7 +69,7 @@ Copy `main.js`, `manifest.json` (and `styles.css` if present) into
 1. Set **Server URL** and **Client name**
 2. **Pair now** (first client on an empty server receives a secret)
 3. **Seed server** once to upload the vault
-4. Second devices: download `/bootstrap.zip` with `Authorization: Bearer $BOOTSTRAP_TOKEN`, unzip as a vault, then open Obsidian
+4. Second devices: download `/bootstrap.zip` with `Authorization: Bearer $BOOTSTRAP_TOKEN`, unzip as a vault, then open Obsidian. The archive includes and enables the built plugin.
 
 ## Privacy
 

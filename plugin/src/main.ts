@@ -69,9 +69,9 @@ export default class ObsidianSyncPlugin extends Plugin {
 			loaded,
 		);
 		this.settings.serverUrl = normalizeServerUrl(this.settings.serverUrl);
-		if (!loaded.serverIdentity) {
-			this.settings.serverIdentity = serverIdentityFor(this.settings.serverUrl);
-		}
+		// Recompute to migrate the legacy 32-bit identity and ensure the queue
+		// namespace is derived from the exact normalized server URL.
+		this.settings.serverIdentity = serverIdentityFor(this.settings.serverUrl);
 	}
 
 	async saveSettings() {
@@ -81,7 +81,7 @@ export default class ObsidianSyncPlugin extends Plugin {
 	async changeServerUrl(value: string): Promise<void> {
 		const serverUrl = normalizeServerUrl(value);
 		const identity = serverIdentityFor(serverUrl);
-		if (identity !== this.settings.serverIdentity) {
+		if (serverUrl !== this.settings.serverUrl) {
 			this.reloadRequired = true;
 			this.settings.revision = 0;
 			this.settings.clientSecret = DEFAULT_SETTINGS.clientSecret;

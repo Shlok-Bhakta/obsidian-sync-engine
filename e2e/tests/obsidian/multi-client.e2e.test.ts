@@ -109,15 +109,6 @@ describe("obsidian multi-client e2e", () => {
 		await mkdir(clientB.configHostDir, { recursive: true });
 		await $`unzip -qo ${zipPath} -d ${clientB.vaultHostDir}`;
 
-		// Ensure plugin binaries exist; preserve bootstrap-stamped data.json.
-		const stamped = await readFile(clientB.pluginDataPath(), "utf8").catch(
-			() => null,
-		);
-		await installPlugin(clientB.vaultHostDir);
-		if (stamped) {
-			await writeFile(clientB.pluginDataPath(), stamped);
-		}
-
 		await writeObsidianConfig(
 			clientB.configHostDir,
 			clientB.vaultContainerPath,

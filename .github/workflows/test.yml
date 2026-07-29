@@ -66,6 +66,11 @@ jobs:
         run: |
           npm ci
           # bun resolves the file: protocol package from server/
+      - name: Build bootstrap plugin artifacts
+        working-directory: plugin
+        run: |
+          npm ci
+          npm run build
       - run: bun install
       - run: bun test
 

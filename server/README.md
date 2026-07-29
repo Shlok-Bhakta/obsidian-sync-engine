@@ -9,7 +9,8 @@ Bun + Hono + PostgreSQL. HTTP polling MVP; WebSocket module is present but not r
 ./db_setup.sh
 
 cd shared/protocol && npm ci
-cd ../../server && bun install
+cd ../../plugin && npm ci && npm run build
+cd ../server && bun install
 export DATABASE_URL=postgres://postgres:postgres@localhost:5433/dev_db
 export BOOTSTRAP_TOKEN='long-random-secret'
 export PUBLIC_SERVER_URL='https://sync.example.com'
@@ -23,6 +24,7 @@ bun run dev
 | `DATABASE_URL` | Postgres connection string |
 | `BOOTSTRAP_TOKEN` | Required for `GET /bootstrap.zip` |
 | `PUBLIC_SERVER_URL` | Public base URL stamped into bootstrap vault settings |
+| `PLUGIN_DIST_DIR` | Optional directory containing built `main.js`, `manifest.json`, and `styles.css` |
 | `OBJECT_STORE_DIR` | Legacy on-disk store used only to backfill NULL BYTEA rows on upgrade |
 | `PORT` / `HOST` | Listen address (default `3000` / `0.0.0.0`) |
 

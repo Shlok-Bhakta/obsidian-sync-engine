@@ -2,6 +2,9 @@ import { App, Notice, PluginSettingTab, Setting, requestUrl } from 'obsidian';
 import ObsidianSyncPlugin from './main';
 import { ensureAuthenticated } from './auth';
 import { deserialize, MessageType, serialize } from 'obsidian-sync-protocol';
+import { serverIdentityFor } from "./sync/serverIdentity";
+
+export { normalizeServerUrl, serverIdentityFor } from "./sync/serverIdentity";
 
 export interface ObsidianSyncSettings {
 	serverUrl: string;
@@ -10,20 +13,6 @@ export interface ObsidianSyncSettings {
 	revision: number;
 	setupToken: string;
 	serverIdentity: string;
-}
-
-export function normalizeServerUrl(value: string): string {
-	return value.trim().replace(/\/+$/, "");
-}
-
-export function serverIdentityFor(value: string): string {
-	const normalized = normalizeServerUrl(value);
-	let hash = 0x811c9dc5;
-	for (let index = 0; index < normalized.length; index++) {
-		hash ^= normalized.charCodeAt(index);
-		hash = Math.imul(hash, 0x01000193);
-	}
-	return (hash >>> 0).toString(16).padStart(8, "0");
 }
 
 export const DEFAULT_SETTINGS: ObsidianSyncSettings = {

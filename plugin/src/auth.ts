@@ -45,6 +45,10 @@ export async function ensureAuthenticated(plugin: ObsidianSyncPlugin): Promise<v
 	}
 
 	if (message.type === MessageType.AUTH_SUCCESS) {
+		if (plugin.settings.setupToken) {
+			plugin.settings.setupToken = '';
+			await plugin.saveSettings();
+		}
 		return;
 	}
 
