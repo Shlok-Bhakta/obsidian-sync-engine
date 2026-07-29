@@ -174,6 +174,7 @@ export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
 		path: string,
 		event: "delete" | "rename-delete",
 	) => {
+		if (fs.consumeInboundEvent(file, path, event)) return;
 		const current = plugin.app.vault.getAbstractFileByPath(path);
 		if (
 			file instanceof TFile &&
@@ -186,7 +187,10 @@ export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
 			// erase it on every client.
 			return;
 		}
-		if (isLocallyOriginated(file, path, event)) {
+		if (
+			!plugin.isSyncSuspended() &&
+			!isSyncEngineOwnedPath(plugin, path)
+		) {
 			engine.enqueueDelete(path);
 		}
 	};

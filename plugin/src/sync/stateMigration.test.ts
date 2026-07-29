@@ -125,7 +125,7 @@ describe("migrateServerState", () => {
 		);
 	});
 
-	test("a restart does not duplicate a migrated corrupt-tail sidecar", async () => {
+	test("preserves identical corrupt records from both namespaces", async () => {
 		const fs = new MemoryAdapter();
 		fs.dirs.add("state/legacy");
 		fs.dirs.add("state/encoded");
@@ -142,7 +142,38 @@ describe("migrateServerState", () => {
 		await migrateServerState(fs, "state", "legacy", "encoded");
 		expect(
 			fs.files.get("state/encoded/outbox.jsonl.legacy.corrupt"),
-		).toBe('{"id":"truncated"\n');
+		).toBe('{"id":"truncated"\n{"id":"truncated"\n');
+	});
+
+	test("marker recovery installs the exact quarantine body without replay", async () => {
+		const fs = new MemoryAdapter();
+		fs.dirs.add("state/legacy");
+		fs.dirs.add("state/encoded");
+		fs.files.set("state/legacy/outbox.jsonl", '{"id":"old"}\n');
+		fs.files.set(
+			"state/encoded/outbox.jsonl",
+			'{"id":"old"}\n{"id":"new"}\n',
+		);
+		fs.files.set(
+			"state/encoded/outbox.jsonl.legacy.corrupt",
+			"broken\nbroken\n",
+		);
+		fs.files.set(
+			"state/encoded/outbox.jsonl.migration.json",
+			JSON.stringify({
+				body: '{"id":"old"}\n{"id":"new"}\n',
+				quarantineBody: "broken\nbroken\n",
+			}),
+		);
+
+		await migrateServerState(fs, "state", "legacy", "encoded");
+
+		expect(
+			fs.files.get("state/encoded/outbox.jsonl.legacy.corrupt"),
+		).toBe("broken\nbroken\n");
+		expect(
+			await fs.exists("state/encoded/outbox.jsonl.migration.json"),
+		).toBe(false);
 	});
 
 	test("recovers a destination backup before considering source-only fast path", async () => {
