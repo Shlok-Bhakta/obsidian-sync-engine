@@ -63,11 +63,34 @@ function parseMigrationMarker(raw: string): MigrationMarker | null {
 	}
 }
 
+/**
+ * Completes ObsidianFs.write() recovery before moving a journal between
+ * identity namespaces. The primary is committed once present; when it is
+ * absent, the backup is the last committed copy.
+ */
+async function recoverJournalWrite(
+	adapter: StateAdapter,
+	path: string,
+): Promise<void> {
+	const tmp = `${path}.tmp`;
+	const backup = `${path}.bak`;
+	if (!(await adapter.exists(path)) && (await adapter.exists(backup))) {
+		await adapter.rename(backup, path);
+	}
+	if (await adapter.exists(tmp)) await adapter.remove(tmp);
+	if ((await adapter.exists(path)) && (await adapter.exists(backup))) {
+		await adapter.remove(backup);
+	}
+}
+
 async function mergeJournal(
 	adapter: StateAdapter,
 	source: string,
 	target: string,
 ): Promise<void> {
+	await recoverJournalWrite(adapter, source);
+	await recoverJournalWrite(adapter, target);
+
 	const tmp = `${target}.migration.tmp`;
 	const backup = `${target}.migration.bak`;
 	const marker = `${target}.migration.json`;

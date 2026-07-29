@@ -242,6 +242,33 @@ describe("migrateServerState", () => {
 		);
 	});
 
+	test("recovers a source journal from its ordinary write backup", async () => {
+		const fs = new MemoryAdapter();
+		fs.dirs.add("state/legacy");
+		fs.dirs.add("state/encoded");
+		fs.files.set("state/legacy/outbox.jsonl.bak", '{"id":"old"}\n');
+
+		await migrateServerState(fs, "state", "legacy", "encoded");
+
+		expect(fs.files.get("state/encoded/outbox.jsonl")).toBe('{"id":"old"}\n');
+	});
+
+	test("recovers a destination journal backup before merging the source", async () => {
+		const fs = new MemoryAdapter();
+		fs.dirs.add("state/legacy");
+		fs.dirs.add("state/encoded");
+		fs.files.set("state/legacy/outbox.jsonl", '{"id":"old"}\n');
+		fs.files.set("state/encoded/outbox.jsonl.bak", '{"id":"new"}\n');
+		fs.files.set("state/encoded/outbox.jsonl.tmp", '{"id":"uncommitted"}\n');
+
+		await migrateServerState(fs, "state", "legacy", "encoded");
+
+		expect(fs.files.get("state/encoded/outbox.jsonl")).toBe(
+			'{"id":"old"}\n{"id":"new"}\n',
+		);
+		expect(await fs.exists("state/encoded/outbox.jsonl.tmp")).toBe(false);
+	});
+
 	test("recovers a destination backup before considering source-only fast path", async () => {
 		const fs = new MemoryAdapter();
 		fs.dirs.add("state/legacy");
