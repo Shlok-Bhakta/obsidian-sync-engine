@@ -115,6 +115,10 @@ describe("migrateServerState", () => {
 			"state/encoded/outbox.jsonl",
 			'{"id":"old"}\n{"id":"new"}\n',
 		);
+		fs.files.set(
+			"state/encoded/outbox.jsonl.migration.json",
+			JSON.stringify({ body: '{"id":"old"}\n{"id":"new"}\n' }),
+		);
 		await migrateServerState(fs, "state", "legacy", "encoded");
 		expect(fs.files.get("state/encoded/outbox.jsonl")).toBe(
 			'{"id":"old"}\n{"id":"new"}\n',
@@ -178,6 +182,23 @@ describe("migrateServerState", () => {
 
 		expect(fs.files.get("state/encoded/outbox.jsonl")).toBe(
 			'{"id":"old"}\n{"id":"old"}\n{"id":"new"}\n{"id":"new"}\n',
+		);
+	});
+
+	test("does not mistake a coincidental destination prefix for a restart", async () => {
+		const fs = new MemoryAdapter();
+		fs.dirs.add("state/legacy");
+		fs.dirs.add("state/encoded");
+		fs.files.set("state/legacy/outbox.jsonl", '{"id":"same"}\n');
+		fs.files.set(
+			"state/encoded/outbox.jsonl",
+			'{"id":"same"}\n{"id":"new"}\n',
+		);
+
+		await migrateServerState(fs, "state", "legacy", "encoded");
+
+		expect(fs.files.get("state/encoded/outbox.jsonl")).toBe(
+			'{"id":"same"}\n{"id":"same"}\n{"id":"new"}\n',
 		);
 	});
 });

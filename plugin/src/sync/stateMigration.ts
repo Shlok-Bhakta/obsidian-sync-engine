@@ -15,11 +15,39 @@ async function mergeJournal(
 ): Promise<void> {
 	const tmp = `${target}.migration.tmp`;
 	const backup = `${target}.migration.bak`;
+	const marker = `${target}.migration.json`;
+
+	// An explicit marker distinguishes a previously installed merge from a
+	// coincidental source/target prefix. It contains the prepared body so any
+	// crash point can resume without guessing from journal contents.
+	if (await adapter.exists(marker)) {
+		const { body } = JSON.parse(await adapter.read(marker)) as { body: string };
+		if (
+			!(await adapter.exists(target)) ||
+			(await adapter.read(target)) !== body
+		) {
+			await adapter.write(tmp, body);
+			if (await adapter.exists(target)) {
+				if (await adapter.exists(backup)) await adapter.remove(backup);
+				await adapter.rename(target, backup);
+			}
+			await adapter.rename(tmp, target);
+		}
+		if (await adapter.exists(source)) await adapter.remove(source);
+		if (await adapter.exists(tmp)) await adapter.remove(tmp);
+		if (await adapter.exists(backup)) await adapter.remove(backup);
+		await adapter.remove(marker);
+		return;
+	}
+
+	// Recover artifacts produced by versions that predate explicit markers.
 	if (!(await adapter.exists(target))) {
 		if (await adapter.exists(tmp)) {
-			await adapter.rename(tmp, target);
-			if (await adapter.exists(backup)) await adapter.remove(backup);
-		} else if (await adapter.exists(backup)) {
+			// Without a marker, the staged body's ownership is ambiguous; keep
+			// the known committed backup and rebuild from the durable source.
+			await adapter.remove(tmp);
+		}
+		if (await adapter.exists(backup)) {
 			await adapter.rename(backup, target);
 		}
 	}
@@ -54,27 +82,16 @@ async function mergeJournal(
 	}
 	const olderLines = older.map((entry) => JSON.stringify(entry));
 	const newerLines = newer.map((entry) => JSON.stringify(entry));
-	// A restart after installing a merged target leaves the entire source
-	// sequence as an exact target prefix. Only remove that complete replay;
-	// otherwise preserve every record (including legitimate duplicates) and
-	// the original old-before-new ordering.
-	const sourceAlreadyInstalled =
-		olderLines.length <= newerLines.length &&
-		olderLines.every((line, index) => newerLines[index] === line);
-	const lines = sourceAlreadyInstalled
-		? newerLines
-		: [...olderLines, ...newerLines];
-	await adapter.write(tmp, lines.length > 0 ? `${lines.join("\n")}\n` : "");
+	const lines = [...olderLines, ...newerLines];
+	const body = lines.length > 0 ? `${lines.join("\n")}\n` : "";
+	await adapter.write(tmp, body);
+	await adapter.write(marker, JSON.stringify({ body }));
 	await adapter.rename(target, backup);
-	try {
-		await adapter.rename(tmp, target);
-		await adapter.remove(backup);
-	} catch (error) {
-		if (!(await adapter.exists(target)) && (await adapter.exists(backup))) {
-			await adapter.rename(backup, target);
-		}
-		throw error;
-	}
+	// If any step fails, marker/source/artifacts remain for startup recovery.
+	await adapter.rename(tmp, target);
+	await adapter.remove(source);
+	await adapter.remove(backup);
+	await adapter.remove(marker);
 }
 
 /**

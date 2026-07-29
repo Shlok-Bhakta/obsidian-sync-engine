@@ -50,8 +50,8 @@ export class ObsidianFs implements VaultBlobFs {
 		event: InboundEvent,
 	): boolean {
 		const objectEvents = this.inboundObjects.get(file);
-		if (objectEvents?.delete(event)) {
-			if (objectEvents.size === 0) this.inboundObjects.delete(file);
+		if (objectEvents?.has(event)) {
+			this.inboundObjects.delete(file);
 			return true;
 		}
 		const normalized = normalizePath(path);
@@ -62,9 +62,9 @@ export class ObsidianFs implements VaultBlobFs {
 			file.stat.ctime === deletion.ctime &&
 			file.stat.mtime === deletion.mtime &&
 			file.stat.size === deletion.size &&
-			deletion.events.delete(event)
+			deletion.events.has(event)
 		) {
-			if (deletion.events.size === 0) this.inboundDeletions.delete(normalized);
+			this.inboundDeletions.delete(normalized);
 			return true;
 		}
 		return this.inboundEvents.consume(normalized, event);
@@ -91,6 +91,16 @@ export class ObsidianFs implements VaultBlobFs {
 
 	private cancelInboundObject(file: TAbstractFile): void {
 		this.inboundObjects.delete(file);
+	}
+
+	private settleInboundObject(file: TAbstractFile): void {
+		const generation = this.inboundObjects.get(file);
+		if (!generation) return;
+		globalThis.setTimeout(() => {
+			if (this.inboundObjects.get(file) === generation) {
+				this.inboundObjects.delete(file);
+			}
+		}, 0);
 	}
 
 	private expectInboundDeletion(file: TFile): void {
@@ -163,6 +173,7 @@ export class ObsidianFs implements VaultBlobFs {
 				expectedObject = existing;
 				this.expectInboundObject(existing, "modify");
 				await this.vault.modifyBinary(existing, data);
+				this.settleInboundObject(existing);
 				return;
 			}
 			if (existing instanceof TFolder) {

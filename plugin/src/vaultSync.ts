@@ -8,6 +8,7 @@ import type ObsidianSyncPlugin from './main';
 import { SyncEngine, type SyncTickResult } from './sync/engine';
 import { HttpTransport } from './sync/httpTransport';
 import { ObsidianFs } from './sync/obsidianFs';
+import { isStaleFileDeletion } from "./sync/vaultEvents";
 
 const TICK_INTERVAL_MS = 3000;
 const DEBOUNCE_MS = 1000;
@@ -173,6 +174,18 @@ export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
 		path: string,
 		event: "delete" | "rename-delete",
 	) => {
+		const current = plugin.app.vault.getAbstractFileByPath(path);
+		if (
+			file instanceof TFile &&
+			current instanceof TFile &&
+			isStaleFileDeletion(file, current)
+		) {
+			// Obsidian can deliver the old file's delete notification after a
+			// replacement already exists at the same path. The replacement is
+			// the desired final state; emitting this stale tombstone would
+			// erase it on every client.
+			return;
+		}
 		if (isLocallyOriginated(file, path, event)) {
 			engine.enqueueDelete(path);
 		}
