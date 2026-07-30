@@ -52,9 +52,17 @@ describe("canonicalizeSyncPath", () => {
 		expect(() => canonicalizeSyncPath("")).toThrow(InvalidSyncPathError);
 	});
 
-	test("rejects Obsidian configuration paths", () => {
+	test("allows Obsidian configuration paths", () => {
 		const configPath = [".", "obsidian/workspace.json"].join("");
-		expect(() => canonicalizeSyncPath(configPath)).toThrow(
+		expect(canonicalizeSyncPath(configPath)).toBe(configPath);
+	});
+
+	test("rejects this plugin's per-client data.json", () => {
+		const dataPath = [
+			".",
+			"obsidian/plugins/obsidian-sync-engine/data.json",
+		].join("");
+		expect(() => canonicalizeSyncPath(dataPath)).toThrow(
 			InvalidSyncPathError,
 		);
 	});

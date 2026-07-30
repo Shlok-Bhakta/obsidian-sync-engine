@@ -4,12 +4,11 @@ Self-hosted sync for Obsidian vaults. The MVP transport is **HTTP polling**.
 
 ## What syncs
 
-- Vault notes and attachments (create, modify, rename, delete)
-- Plugin bookkeeping files (`outbox.jsonl`, `inbox.jsonl`, `data.json`) are excluded
+- Vault notes, attachments, and `.obsidian` configuration
+- This plugin's per-client `data.json` and durable sync journals stay local
 
 ## What does not sync (MVP)
 
-- `.obsidian` config / other plugin settings (deferred; incomplete and privacy-sensitive)
 - Live WebSocket push (deferred)
 
 ## Limits
@@ -50,12 +49,8 @@ cd shared/protocol && npm ci
 cd ../../plugin && npm ci && npm run build
 cd ../server && bun install
 export DATABASE_URL=postgres://postgres:postgres@localhost:5433/dev_db
-export BOOTSTRAP_TOKEN='generate-a-long-random-secret'
-export PUBLIC_SERVER_URL='https://sync.example.com'
 bun run dev
 ```
-
-`BOOTSTRAP_TOKEN` is **required** for `GET /bootstrap.zip`. Without it the route returns 503; with a wrong token, 401.
 
 ### Plugin
 
@@ -66,16 +61,19 @@ cd plugin && npm ci && npm run build
 Copy `main.js`, `manifest.json` (and `styles.css` if present) into
 `<Vault>/.obsidian/plugins/obsidian-sync-engine/`.
 
-1. Set **Server URL** and **Client name**
-2. **Pair now** (first client on an empty server receives a secret)
-3. **Seed server** once to upload the vault
-4. Second devices: download `/bootstrap.zip` with `Authorization: Bearer $BOOTSTRAP_TOKEN`, unzip as a vault, then open Obsidian. The archive includes and enables the built plugin.
+1. Set **Server URL** and **Client name**. The first client to reach an empty server is enrolled automatically.
+2. **Seed server** once to upload the vault.
+3. Select **Create client package** for another device. The settings page copies a five-minute link.
+4. Open the link, select **Download ZIP**, extract it as a vault, and open it in Obsidian.
+
+The landing page can be previewed safely. Its download button works once; a
+successful or interrupted download consumes the package.
 
 ## Privacy
 
 - The sync server stores vault file bytes and paths in PostgreSQL
 - Client secrets authenticate every file/inbox request; treat them like passwords
-- Bootstrap zips mint a new client credential — protect `BOOTSTRAP_TOKEN`
+- Client-package links are temporary bearer credentials; send them only to the intended device
 
 ## Recovery
 

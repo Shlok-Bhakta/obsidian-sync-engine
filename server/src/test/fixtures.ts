@@ -1,9 +1,12 @@
 import { sql } from "bun";
 import { Hono } from "hono";
 import { registerObjectStoreRoutes } from "../object/object_store";
+import { registerClientInviteRoutes } from "../invites/clientInvites";
 
 export function createTestApp() {
-	return registerObjectStoreRoutes(new Hono());
+	const app = registerObjectStoreRoutes(new Hono());
+	registerClientInviteRoutes(app);
+	return app;
 }
 
 export type ClientRow = {

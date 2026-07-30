@@ -1,8 +1,8 @@
 import { App, Notice, PluginSettingTab, Setting, requestUrl } from 'obsidian';
 import ObsidianSyncPlugin from './main';
-import { ensureAuthenticated } from './auth';
 import { deserialize, MessageType, serialize } from 'obsidian-sync-protocol';
 import { serverIdentityFor } from "./sync/serverIdentity";
+import type { ClientInvite } from "./clientInvites";
 
 export {
 	normalizeServerUrl,
@@ -17,7 +17,6 @@ export interface ObsidianSyncSettings {
 	clientName: string;
 	clientSecret: string;
 	revision: number;
-	setupToken: string;
 	serverIdentity: string;
 }
 
@@ -26,7 +25,6 @@ export const DEFAULT_SETTINGS: ObsidianSyncSettings = {
 	clientName: 'Main computer',
 	clientSecret: 'Made by server',
 	revision: 0,
-	setupToken: "",
 	serverIdentity: serverIdentityFor("https://..."),
 };
 
@@ -40,6 +38,7 @@ const isHttpUrl = (value: string): boolean => {
 
 export class SyncSettingTab extends PluginSettingTab {
 	plugin: ObsidianSyncPlugin;
+	private clientInvite: ClientInvite | null = null;
 
 	constructor(app: App, plugin: ObsidianSyncPlugin) {
 		super(app, plugin);
@@ -102,31 +101,8 @@ export class SyncSettingTab extends PluginSettingTab {
 		updateServerUrlWarning(this.plugin.settings.serverUrl);
 
 		new Setting(containerEl)
-		.setName("Setup token")
-		.setDesc("Required only to enroll the first client. It must match the server setup token.")
-		.addText((text) =>
-			text
-				.setPlaceholder("Server setup token")
-				.setValue(this.plugin.settings.setupToken)
-				.onChange(async (value) => {
-					this.plugin.settings.setupToken = value;
-					await this.plugin.saveSettings();
-				}),
-		);
-
-		new Setting(containerEl)
-		.setName("Pair with server")
-		.setDesc("First client on an empty server receives a secret. Existing clients verify their secret over HTTP.")
-		.addButton((button) =>
-			button
-				.setButtonText('Pair now')
-				.setCta()
-				.onClick(() => void this.pairWithServer()),
-		);
-
-		new Setting(containerEl)
 		.setName("Client secret")
-		.setDesc("Issued by the server on first pair. Paste a secret here if restoring a client; do not share it.")
+		.setDesc("Issued automatically by the server. Do not share it.")
 		.addButton((button) =>
 			button
 				.setIcon('refresh-cw')
@@ -144,6 +120,58 @@ export class SyncSettingTab extends PluginSettingTab {
 					await this.plugin.saveSettings();
 				}),
 		);
+
+		new Setting(containerEl)
+		.setName("Add another client")
+		.setDesc("Create a one-time vault package. Its link expires in five minutes.")
+		.addButton((button) =>
+			button
+				.setButtonText("Create client package")
+				.setCta()
+				.onClick(async () => {
+					button.setDisabled(true);
+					try {
+						this.clientInvite = await this.plugin.createClientInvite();
+						this.display();
+						try {
+							await navigator.clipboard.writeText(this.clientInvite.url);
+							new Notice("Client link copied to clipboard");
+						} catch {
+							new Notice("Client package created. Copy its link below.");
+						}
+					} catch (error) {
+						new Notice(
+							"Could not create client package: " +
+								(error instanceof Error ? error.message : String(error)),
+						);
+						button.setDisabled(false);
+					}
+				}),
+		);
+
+		if (this.clientInvite) {
+			new Setting(containerEl)
+				.setName("New client link")
+				.setDesc("Send this link to the other device. The zip can be downloaded once.")
+				.addText((text) =>
+					text
+						.setValue(this.clientInvite?.url ?? "")
+						.setDisabled(true),
+				)
+				.addButton((button) =>
+					button
+						.setButtonText("Copy")
+						.onClick(async () => {
+							if (!this.clientInvite) return;
+							try {
+								await navigator.clipboard.writeText(this.clientInvite.url);
+								new Notice("Client link copied to clipboard");
+							} catch {
+								new Notice("Could not copy the client link");
+							}
+						}),
+				);
+		}
 
 		new Setting(containerEl)
 		.setName("Last synced revision")
@@ -164,16 +192,6 @@ export class SyncSettingTab extends PluginSettingTab {
 				.setCta()
 				.onClick(() => void this.plugin.seedFromVault()),
 		);
-	}
-
-	private async pairWithServer(): Promise<void> {
-		try {
-			await ensureAuthenticated(this.plugin);
-			new Notice('Paired with sync server');
-			this.display();
-		} catch (error) {
-			new Notice('Pairing failed: ' + (error instanceof Error ? error.message : String(error)));
-		}
 	}
 
 	private async refreshClientSecret(): Promise<void> {

@@ -233,7 +233,7 @@ describe("object store", () => {
         expect(body.path).toBe("test.txt");
         expect(body.revision).toBe(1);
     });
-    it("computes the current tip revision for bootstrap stamping", async () => {
+    it("computes the current tip revision for client-package stamping", async () => {
         const client = await createClientFixture({ client_name: "alice" });
         const objectStore = new ObjectStore();
         expect(await objectStore.getTipRevision()).toBe(0);
@@ -241,17 +241,17 @@ describe("object store", () => {
         await objectStore.upload({ path: "test2.txt", content: "Hello, world 2!", id: client.id });
         expect(await objectStore.getTipRevision()).toBe(2);
     });
-    it("stamps the current tip revision (not 0) into the bootstrap zip's data.json", async () => {
+    it("stamps the current tip revision (not 0) into the client zip's data.json", async () => {
         const client = await createClientFixture({ client_name: "alice" });
         const objectStore = new ObjectStore();
         const pluginDataPath = ".obsidian/plugins/obsidian-sync-engine/data.json";
         await objectStore.upload({ path: "note.md", content: "hello", id: client.id });
         expect(await objectStore.getTipRevision()).toBe(1);
 
-        const tmp = await mkdtemp(join(tmpdir(), "obsidian-bootstrap-test-"));
+        const tmp = await mkdtemp(join(tmpdir(), "obsidian-client-test-"));
         const zipPath = join(tmp, "vault.zip");
         try {
-            await objectStore.bootstrap_zip_create(zipPath);
+            await objectStore.client_zip_create(zipPath);
             const extractDir = join(tmp, "extracted");
             await $`unzip -qq ${zipPath} -d ${extractDir}`;
             const settings = await Bun.file(join(extractDir, pluginDataPath)).json() as Record<string, unknown>;
@@ -275,15 +275,15 @@ describe("object store", () => {
             await rm(tmp, { recursive: true, force: true });
         }
     });
-    it("bootstraps successfully when plugin data.json was never seeded", async () => {
+    it("packages successfully when plugin data.json was never seeded", async () => {
         const client = await createClientFixture({ client_name: "alice" });
         const objectStore = new ObjectStore();
         await objectStore.upload({ path: "note.md", content: "hello", id: client.id });
 
-        const tmp = await mkdtemp(join(tmpdir(), "obsidian-bootstrap-test-"));
+        const tmp = await mkdtemp(join(tmpdir(), "obsidian-client-test-"));
         const zipPath = join(tmp, "vault.zip");
         try {
-            await objectStore.bootstrap_zip_create(zipPath);
+            await objectStore.client_zip_create(zipPath);
             const extractDir = join(tmp, "extracted");
             await $`unzip -qq ${zipPath} -d ${extractDir}`;
             const settings = await Bun.file(
@@ -462,17 +462,17 @@ describe("object store", () => {
             { path: "dir", isDeleted: true },
         ]);
     });
-    it("excludes soft-deleted files from the bootstrap zip", async () => {
+    it("excludes soft-deleted files from the client zip", async () => {
         const client = await createClientFixture({ client_name: "alice" });
         const objectStore = new ObjectStore();
         await objectStore.upload({ path: "keep.md", content: "keep me", id: client.id });
         await objectStore.upload({ path: "gone.md", content: "delete me", id: client.id });
         await objectStore.delete("gone.md", client.id);
 
-        const tmp = await mkdtemp(join(tmpdir(), "obsidian-bootstrap-test-"));
+        const tmp = await mkdtemp(join(tmpdir(), "obsidian-client-test-"));
         const zipPath = join(tmp, "vault.zip");
         try {
-            await objectStore.bootstrap_zip_create(zipPath);
+            await objectStore.client_zip_create(zipPath);
             const extractDir = join(tmp, "extracted");
             await $`unzip -qq ${zipPath} -d ${extractDir}`;
 
@@ -482,7 +482,7 @@ describe("object store", () => {
             await rm(tmp, { recursive: true, force: true });
         }
     });
-    it("bootstrap zip contains bytes uploaded via the HTTP API (BYTEA-only storage)", async () => {
+    it("client zip contains bytes uploaded via the HTTP API (BYTEA-only storage)", async () => {
         const client = await createClientFixture({ client_name: "alice" });
         const app = createTestApp();
         await app.request("/files", {
@@ -498,10 +498,10 @@ describe("object store", () => {
         expect(fileRows[0].content?.toString()).toBe("hello from api");
 
         const objectStore = new ObjectStore();
-        const tmp = await mkdtemp(join(tmpdir(), "obsidian-bootstrap-test-"));
+        const tmp = await mkdtemp(join(tmpdir(), "obsidian-client-test-"));
         const zipPath = join(tmp, "vault.zip");
         try {
-            await objectStore.bootstrap_zip_create(zipPath);
+            await objectStore.client_zip_create(zipPath);
             const extractDir = join(tmp, "extracted");
             await $`unzip -qq ${zipPath} -d ${extractDir}`;
             const content = await Bun.file(join(extractDir, "note.md")).text();
@@ -664,27 +664,27 @@ describe("object store", () => {
         await objectStore.upload({ path: "gone.md", content: "delete me", id: client.id });
         const { revision: deleteRevision } = await objectStore.delete("gone.md", client.id);
 
-        const tmp = await mkdtemp(join(tmpdir(), "obsidian-bootstrap-test-"));
+        const tmp = await mkdtemp(join(tmpdir(), "obsidian-client-test-"));
         const zipPath = join(tmp, "vault.zip");
         try {
-            await objectStore.bootstrap_zip_create(zipPath);
+            await objectStore.client_zip_create(zipPath);
             const extractDir = join(tmp, "extracted");
             await $`unzip -qq ${zipPath} -d ${extractDir}`;
             const settings = await Bun.file(
                 join(extractDir, ".obsidian/plugins/obsidian-sync-engine/data.json"),
             ).json() as Record<string, unknown>;
             // The tip must be >= the delete's revision so a fresh client never
-            // re-fetches a tombstone it already excludes from the bootstrap.
+            // re-fetches a tombstone it already excludes from the package.
             expect(settings.revision).toBe(deleteRevision);
         } finally {
             await rm(tmp, { recursive: true, force: true });
         }
     });
 
-	it("rejects Obsidian configuration uploads at the server boundary", async () => {
+	it("allows Obsidian configuration uploads but rejects per-client data.json", async () => {
 		const client = await createClientFixture({ client_name: "alice" });
 		const app = createTestApp();
-		const response = await app.request("/files", {
+		const configResponse = await app.request("/files", {
 			method: "POST",
 			headers: {
 				Authorization: client.client_secret,
@@ -692,7 +692,17 @@ describe("object store", () => {
 			},
 			body: "private",
 		});
-		expect(response.status).toBe(400);
+		expect(configResponse.status).toBe(200);
+
+		const dataResponse = await app.request("/files", {
+			method: "POST",
+			headers: {
+				Authorization: client.client_secret,
+				"X-Obsidian-Path": ".obsidian/plugins/obsidian-sync-engine/data.json",
+			},
+			body: '{"clientSecret":"must-stay-local"}',
+		});
+		expect(dataResponse.status).toBe(400);
 	});
 
 	it("rejects invalid inbox cursors", async () => {

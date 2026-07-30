@@ -1,4 +1,4 @@
-import { Notice, Plugin, type WorkspaceLeaf } from 'obsidian';
+import { Notice, Plugin, requestUrl, type WorkspaceLeaf } from 'obsidian';
 import { ensureAuthenticated } from './auth';
 import {
 	DEFAULT_SETTINGS,
@@ -17,6 +17,10 @@ import {
 	type VaultSync,
 } from './vaultSync';
 import { migrateServerState } from "./sync/stateMigration";
+import {
+	requestClientInvite,
+	type ClientInvite,
+} from "./clientInvites";
 
 export default class ObsidianSyncPlugin extends Plugin {
 	settings!: ObsidianSyncSettings;
@@ -48,12 +52,6 @@ export default class ObsidianSyncPlugin extends Plugin {
 			name: 'Open sync status',
 			callback: () => void this.openSyncStatusView(),
 		});
-		this.addCommand({
-			id: 'authenticate-with-server',
-			name: 'Authenticate with server',
-			callback: () => void this.authenticate(),
-		});
-
 		this.addSettingTab(new SyncSettingTab(this.app, this));
 
 		// Best-effort: obtain / verify credentials once the plugin is up so a
@@ -120,7 +118,7 @@ export default class ObsidianSyncPlugin extends Plugin {
 				serverUrl,
 				DEFAULT_SETTINGS.clientSecret,
 			);
-			new Notice("Server changed. Reload Obsidian before pairing; sync state is isolated per server.");
+			new Notice("Server changed. Reload Obsidian to reconnect; sync state is isolated per server.");
 		}
 		await this.saveSettings();
 	}
@@ -131,7 +129,7 @@ export default class ObsidianSyncPlugin extends Plugin {
 
 	async authenticate(): Promise<void> {
 		if (this.reloadRequired) {
-			throw new Error("Reload Obsidian before pairing with the new server");
+			throw new Error("Reload Obsidian before reconnecting to the new server");
 		}
 		try {
 			await ensureAuthenticated(this);
@@ -141,6 +139,18 @@ export default class ObsidianSyncPlugin extends Plugin {
 			new Notice('Authentication failed: ' + this.formatError(error));
 			throw error;
 		}
+	}
+
+	async createClientInvite(): Promise<ClientInvite> {
+		if (this.reloadRequired) {
+			throw new Error("Reload Obsidian before creating a client package");
+		}
+		await ensureAuthenticated(this);
+		return requestClientInvite({
+			serverUrl: this.settings.serverUrl,
+			clientSecret: this.settings.clientSecret,
+			request: requestUrl,
+		});
 	}
 
 	/** Enqueues every file currently in the vault and pushes them out. Used for first-time bootstrap. */

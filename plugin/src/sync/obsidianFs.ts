@@ -38,6 +38,7 @@ export class ObsidianFs implements VaultBlobFs {
 			events: Set<InboundEvent>;
 		}
 	>();
+	private readonly inboundAdapterChanges = new Map<string, number>();
 
 	constructor(
 		private readonly adapter: DataAdapter,
@@ -68,6 +69,27 @@ export class ObsidianFs implements VaultBlobFs {
 			return true;
 		}
 		return this.inboundEvents.consume(normalized, event);
+	}
+
+	consumeInboundAdapterChange(path: string): boolean {
+		const normalized = normalizePath(path);
+		const count = this.inboundAdapterChanges.get(normalized) ?? 0;
+		if (count === 0) return false;
+		if (count === 1) this.inboundAdapterChanges.delete(normalized);
+		else this.inboundAdapterChanges.set(normalized, count - 1);
+		return true;
+	}
+
+	private expectInboundAdapterChange(path: string): void {
+		const normalized = normalizePath(path);
+		this.inboundAdapterChanges.set(
+			normalized,
+			(this.inboundAdapterChanges.get(normalized) ?? 0) + 1,
+		);
+	}
+
+	private cancelInboundAdapterChange(path: string): void {
+		this.consumeInboundAdapterChange(path);
 	}
 
 	private expectInboundEvent(path: string, ...events: InboundEvent[]): void {
@@ -183,6 +205,21 @@ export class ObsidianFs implements VaultBlobFs {
 				// eslint-disable-next-line obsidianmd/prefer-file-manager-trash-file
 				await this.vault.delete(existing, true);
 			}
+			// Obsidian deliberately does not index its hidden configuration
+			// directory in the Vault API. Apply those remote bytes through the
+			// adapter while marking the write so our adapter observer does not
+			// echo it back to the server.
+			if (normalized.startsWith(".")) {
+				await this.ensureParentDir(normalized);
+				this.expectInboundAdapterChange(normalized);
+				try {
+					await this.adapter.writeBinary(normalized, data);
+				} catch (error) {
+					this.cancelInboundAdapterChange(normalized);
+					throw error;
+				}
+				return;
+			}
 			await this.ensureVaultParentDir(normalized);
 			this.expectInboundEvent(normalized, "create");
 			await this.vault.createBinary(normalized, data);
@@ -198,7 +235,18 @@ export class ObsidianFs implements VaultBlobFs {
 		const normalized = normalizePath(path);
 		if (this.vault) {
 			const existing = this.vault.getAbstractFileByPath(normalized);
-			if (!existing) return;
+			if (!existing) {
+				if (normalized.startsWith(".") && await this.adapter.exists(normalized)) {
+					this.expectInboundAdapterChange(normalized);
+					try {
+						await this.adapter.remove(normalized);
+					} catch (error) {
+						this.cancelInboundAdapterChange(normalized);
+						throw error;
+					}
+				}
+				return;
+			}
 			if (existing instanceof TFile) {
 				this.expectInboundDeletion(existing);
 			}

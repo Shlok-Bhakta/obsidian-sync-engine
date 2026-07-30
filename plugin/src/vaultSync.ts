@@ -9,6 +9,8 @@ import { SyncEngine, type SyncTickResult } from './sync/engine';
 import { HttpTransport } from './sync/httpTransport';
 import { ObsidianFs } from './sync/obsidianFs';
 import { isStaleFileDeletion } from "./sync/vaultEvents";
+import { isSyncExcludedPath } from "./sync/excludedPaths";
+import type { DataAdapter, DataWriteOptions } from "obsidian";
 
 const TICK_INTERVAL_MS = 3000;
 const DEBOUNCE_MS = 1000;
@@ -48,10 +50,6 @@ function getDeadLetterPath(plugin: ObsidianSyncPlugin): string {
 	);
 }
 
-function getDataJsonPath(plugin: ObsidianSyncPlugin): string {
-	return normalizePath(`${getPluginDir(plugin)}/data.json`);
-}
-
 /**
  * True for the sync engine's own bookkeeping files. These must never be
  * enqueued for sync themselves, or writing them (to record a sync) would
@@ -61,27 +59,124 @@ function isSyncEngineOwnedPath(plugin: ObsidianSyncPlugin, path: string): boolea
 	const normalized = normalizePath(path);
 	const pluginDir = getPluginDir(plugin);
 	const configDir = normalizePath(plugin.app.vault.configDir);
-	if (normalized === configDir || normalized.startsWith(`${configDir}/`)) {
-		return true;
-	}
-	if (
-		normalized === getOutboxPath(plugin) ||
-		normalized === getInboxPath(plugin) ||
-		normalized === getDataJsonPath(plugin)
-	) {
-		return true;
-	}
-	// Queue sidecars written during recovery / dead-lettering.
-	if (
-		normalized.startsWith(`${pluginDir}/`) &&
-		(normalized.endsWith(".jsonl") ||
-			normalized.endsWith(".jsonl.corrupt") ||
-			normalized.endsWith(".jsonl.tmp") ||
-			normalized.endsWith("dead-letter.jsonl"))
-	) {
-		return true;
-	}
-	return false;
+	return isSyncExcludedPath({
+		path: normalized,
+		configDir,
+		pluginDir,
+	});
+}
+
+function registerConfigAdapterSync(
+	plugin: ObsidianSyncPlugin,
+	fs: ObsidianFs,
+	engine: SyncEngine,
+): void {
+	const adapter: DataAdapter = plugin.app.vault.adapter;
+	const configDir = normalizePath(plugin.app.vault.configDir);
+	const isConfigPath = (path: string) => {
+		const normalized = normalizePath(path);
+		return (
+			normalized === configDir ||
+			normalized.startsWith(`${configDir}/`)
+		);
+	};
+	const enqueuePut = (path: string) => {
+		const normalized = normalizePath(path);
+		if (
+			!isConfigPath(normalized) ||
+			fs.consumeInboundAdapterChange(normalized) ||
+			isSyncEngineOwnedPath(plugin, normalized)
+		) {
+			return;
+		}
+		engine.enqueuePut(normalized);
+	};
+	const enqueueDelete = (path: string) => {
+		const normalized = normalizePath(path);
+		if (
+			!isConfigPath(normalized) ||
+			fs.consumeInboundAdapterChange(normalized) ||
+			isSyncEngineOwnedPath(plugin, normalized)
+		) {
+			return;
+		}
+		engine.enqueueDelete(normalized);
+	};
+
+	const write = adapter.write.bind(adapter);
+	const writeBinary = adapter.writeBinary.bind(adapter);
+	const append = adapter.append.bind(adapter);
+	const appendBinary = adapter.appendBinary.bind(adapter);
+	const process = adapter.process.bind(adapter);
+	const remove = adapter.remove.bind(adapter);
+	const rename = adapter.rename.bind(adapter);
+	const copy = adapter.copy.bind(adapter);
+
+	adapter.write = async (
+		path: string,
+		data: string,
+		options?: DataWriteOptions,
+	) => {
+		await write(path, data, options);
+		enqueuePut(path);
+	};
+	adapter.writeBinary = async (
+		path: string,
+		data: ArrayBuffer,
+		options?: DataWriteOptions,
+	) => {
+		await writeBinary(path, data, options);
+		enqueuePut(path);
+	};
+	adapter.append = async (
+		path: string,
+		data: string,
+		options?: DataWriteOptions,
+	) => {
+		await append(path, data, options);
+		enqueuePut(path);
+	};
+	adapter.appendBinary = async (
+		path: string,
+		data: ArrayBuffer,
+		options?: DataWriteOptions,
+	) => {
+		await appendBinary(path, data, options);
+		enqueuePut(path);
+	};
+	adapter.process = async (
+		path: string,
+		fn: (data: string) => string,
+		options?: DataWriteOptions,
+	) => {
+		const result = await process(path, fn, options);
+		enqueuePut(path);
+		return result;
+	};
+	adapter.remove = async (path: string) => {
+		await remove(path);
+		enqueueDelete(path);
+	};
+	adapter.rename = async (path: string, newPath: string) => {
+		await rename(path, newPath);
+		enqueueDelete(path);
+		enqueuePut(newPath);
+	};
+	adapter.copy = async (path: string, newPath: string) => {
+		await copy(path, newPath);
+		enqueuePut(newPath);
+	};
+
+	plugin.register(() => {
+		adapter.write = write;
+		adapter.writeBinary = writeBinary;
+		adapter.append = append;
+		adapter.appendBinary = appendBinary;
+		adapter.process = process;
+		adapter.remove = remove;
+		adapter.rename = rename;
+		adapter.copy = copy;
+	});
 }
 
 /**
@@ -147,6 +242,7 @@ export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
 			plugin.isSyncSuspended() ||
 			plugin.settings.serverIdentity !== runtimeIdentity,
 	});
+	registerConfigAdapterSync(plugin, fs, engine);
 
 	// Suppressed whenever the write/delete originated from *this* fs instance
 	// (e.g. the engine applying a remote put/delete) rather than from the

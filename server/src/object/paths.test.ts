@@ -10,6 +10,17 @@ describe("canonicalizePath", () => {
 		expect(canonicalizePath("foo.md")).toBe("foo.md");
 	});
 
+	it("accepts Obsidian configuration except per-client data.json", () => {
+		expect(canonicalizePath(".obsidian/workspace.json")).toBe(
+			".obsidian/workspace.json",
+		);
+		expect(() =>
+			canonicalizePath(
+				".obsidian/plugins/obsidian-sync-engine/data.json",
+			),
+		).toThrow(InvalidPathError);
+	});
+
 	it("rejects an empty path", () => {
 		expect(() => canonicalizePath("")).toThrow(InvalidPathError);
 	});

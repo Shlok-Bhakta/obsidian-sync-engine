@@ -30,12 +30,11 @@ describe("server identity", () => {
 		expect(decodeURIComponent(identity)).toBe(url);
 	});
 
-	test("switching servers clears credentials, setup token, and revision", () => {
+	test("switching servers clears credentials and revision", () => {
 		const settings = {
 			serverUrl: "https://old.example",
 			serverIdentity: serverIdentityFor("https://old.example"),
 			clientSecret: "old-client-secret",
-			setupToken: "old-admin-token",
 			revision: 42,
 		};
 		expect(
@@ -45,7 +44,6 @@ describe("server identity", () => {
 			serverUrl: "https://new.example",
 			serverIdentity: serverIdentityFor("https://new.example"),
 			clientSecret: "unpaired",
-			setupToken: "",
 			revision: 0,
 		});
 	});
@@ -55,7 +53,6 @@ describe("server identity", () => {
 			serverUrl: "https://new.example",
 			serverIdentity: "identity-from-another-server",
 			clientSecret: "old-client-secret",
-			setupToken: "old-admin-token",
 			revision: 42,
 		};
 		resetServerCredentials(
@@ -64,7 +61,6 @@ describe("server identity", () => {
 			"unpaired",
 		);
 		expect(settings.clientSecret).toBe("unpaired");
-		expect(settings.setupToken).toBe("");
 		expect(settings.revision).toBe(0);
 		expect(settings.serverUrl).toBe("https://new.example");
 	});

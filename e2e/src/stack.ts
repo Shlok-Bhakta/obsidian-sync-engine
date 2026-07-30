@@ -16,8 +16,6 @@ export type Stack = {
 	serverPort: number;
 	objectStoreDir: string;
 	runDir: string;
-	/** Admin token required for GET /bootstrap.zip. */
-	bootstrapToken: string;
 	stopServer: () => Promise<void>;
 };
 
@@ -80,7 +78,6 @@ async function spawnServer(opts: {
 	databaseUrl: string;
 	objectStoreDir: string;
 	serverPort: number;
-	bootstrapToken: string;
 }): Promise<{ stop: () => Promise<void>; localUrl: string; containerUrl: string }> {
 	const proc = Bun.spawn(["bun", "run", "src/index.ts"], {
 		cwd: SERVER_DIR,
@@ -90,8 +87,6 @@ async function spawnServer(opts: {
 			OBJECT_STORE_DIR: opts.objectStoreDir,
 			PORT: String(opts.serverPort),
 			HOST: "0.0.0.0",
-			BOOTSTRAP_TOKEN: opts.bootstrapToken,
-			PUBLIC_SERVER_URL: `http://${hostGateway()}:${opts.serverPort}`,
 		},
 		stdout: "pipe",
 		stderr: "pipe",
@@ -163,14 +158,10 @@ export async function startStack(options: { wipe?: boolean; reuse?: Stack } = {}
 		await mkdir(objectStoreDir, { recursive: true });
 	}
 
-	const bootstrapToken =
-		process.env.E2E_BOOTSTRAP_TOKEN ?? "e2e-bootstrap-token";
-
 	const server = await spawnServer({
 		databaseUrl,
 		objectStoreDir,
 		serverPort,
-		bootstrapToken,
 	});
 
 	return {
@@ -180,7 +171,6 @@ export async function startStack(options: { wipe?: boolean; reuse?: Stack } = {}
 		serverPort,
 		objectStoreDir,
 		runDir,
-		bootstrapToken,
 		stopServer: server.stop,
 	};
 }

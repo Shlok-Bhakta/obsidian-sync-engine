@@ -27,9 +27,9 @@ Reload Obsidian and enable the plugin.
 
 ## Onboarding
 
-1. Set server URL + client name in settings
-2. **Pair now** (or run the Authenticate command)
-3. **Seed server** once for a fresh server
-4. Second clients should use a bootstrap zip protected by the server's `BOOTSTRAP_TOKEN`
+1. Set the server URL and client name. An empty server enrolls this first client automatically.
+2. Select **Seed server** once for a fresh server.
+3. Select **Create client package** to add another device, then send it the copied five-minute link.
+4. On the other device, open the link and select **Download ZIP**. The download works once.
 
 See the [repository README](../README.md) for limits, conflict policy, and privacy notes.

@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { Hono } from "hono";
 import { deserialize, MessageType, serialize } from "obsidian-sync-protocol";
 import { registerAuthRoutes } from "./auth";
+import { createClientFixture } from "../test/fixtures";
 
 async function readMessage(res: Response) {
 	const body = await res.json();
@@ -16,10 +17,7 @@ describe("HTTP /auth", () => {
 
 		const res = await app.request("/auth", {
 			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-				Authorization: `Bearer ${process.env.BOOTSTRAP_TOKEN}`,
-			},
+			headers: { "Content-Type": "application/json" },
 			body: serialize({
 				type: MessageType.AUTH_ACK,
 				client_name: "first-client",
@@ -41,10 +39,7 @@ describe("HTTP /auth", () => {
 
 		const first = await app.request("/auth", {
 			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-				Authorization: `Bearer ${process.env.BOOTSTRAP_TOKEN}`,
-			},
+			headers: { "Content-Type": "application/json" },
 			body: serialize({
 				type: MessageType.AUTH_ACK,
 				client_name: "only-client",
@@ -76,10 +71,7 @@ describe("HTTP /auth", () => {
 		const request = (clientName: string) =>
 			app.request("/auth", {
 				method: "POST",
-				headers: {
-					"Content-Type": "application/json",
-					Authorization: `Bearer ${process.env.BOOTSTRAP_TOKEN}`,
-				},
+				headers: { "Content-Type": "application/json" },
 				body: serialize({
 					type: MessageType.AUTH_ACK,
 					client_name: clientName,
@@ -95,10 +87,7 @@ describe("HTTP /auth", () => {
 		registerAuthRoutes(app);
 		const enrolled = await app.request("/auth", {
 			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-				Authorization: `Bearer ${process.env.BOOTSTRAP_TOKEN}`,
-			},
+			headers: { "Content-Type": "application/json" },
 			body: serialize({
 				type: MessageType.AUTH_ACK,
 				client_name: "rotate-me",
@@ -136,5 +125,37 @@ describe("HTTP /auth", () => {
 		if (message.type === MessageType.AUTH_INIT) {
 			expect(message.token).not.toBe(init.token);
 		}
+	});
+
+	it("rotating one client leaves every other client credential valid", async () => {
+		const app = new Hono();
+		registerAuthRoutes(app);
+		const first = await createClientFixture({ client_name: "first" });
+		const second = await createClientFixture({ client_name: "second" });
+
+		const rotated = await app.request("/reset-client-secret", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: serialize({
+				type: MessageType.AUTH_ACK,
+				client_name: first.client_name,
+				token: first.client_secret,
+			}),
+		});
+		expect(rotated.status).toBe(200);
+
+		const secondAuth = await app.request("/auth", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: serialize({
+				type: MessageType.AUTH_ACK,
+				client_name: second.client_name,
+				token: second.client_secret,
+			}),
+		});
+		expect(secondAuth.status).toBe(200);
+		expect((await readMessage(secondAuth)).type).toBe(
+			MessageType.AUTH_SUCCESS,
+		);
 	});
 });

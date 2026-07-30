@@ -22,7 +22,6 @@ type MutableServerSettings = {
 	serverUrl: string;
 	serverIdentity: string;
 	clientSecret: string;
-	setupToken: string;
 	revision: number;
 };
 
@@ -37,7 +36,6 @@ export function transitionServerSettings(
 	settings.serverUrl = serverUrl;
 	settings.serverIdentity = serverIdentityFor(serverUrl);
 	settings.clientSecret = defaultClientSecret;
-	settings.setupToken = "";
 	settings.revision = 0;
 	return true;
 }
@@ -49,6 +47,5 @@ export function resetServerCredentials(
 ): void {
 	settings.serverIdentity = nextIdentity;
 	settings.clientSecret = defaultClientSecret;
-	settings.setupToken = "";
 	settings.revision = 0;
 }

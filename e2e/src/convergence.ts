@@ -157,11 +157,18 @@ export async function waitForStableConvergence(
 	);
 }
 
+function userVaultFiles(files: Record<string, string>): Record<string, string> {
+	return Object.fromEntries(
+		Object.entries(files).filter(([path]) => !path.startsWith(".obsidian/")),
+	);
+}
+
 /**
- * A bootstrap client starts at the server tip and must remain read-only until
- * the user actually changes its vault.
+ * A packaged client starts with the server's user-vault bytes and must not
+ * re-upload those files. Obsidian may legitimately rewrite its own config
+ * while opening the vault; those `.obsidian` changes are synchronized.
  */
-export async function assertBootstrapIsReadOnly(
+export async function assertClientPackagePreservesVault(
 	client: ObsidianClient,
 	stack: Stack,
 	expected: SyncSnapshot,
@@ -169,16 +176,20 @@ export async function assertBootstrapIsReadOnly(
 	await waitForStableConvergence([client], stack, {
 		timeoutMs: 45_000,
 		stableRounds: 4,
-		label: `${client.name} bootstrap startup without outbound writes`,
+		label: `${client.name} packaged startup convergence`,
 	});
 	const after = await readServerSnapshot(stack);
 	if (
-		after.revision !== expected.revision ||
-		!filesEqual(after.files, expected.files)
+		!filesEqual(
+			userVaultFiles(after.files),
+			userVaultFiles(expected.files),
+		) ||
+		after.files[
+			".obsidian/plugins/obsidian-sync-engine/data.json"
+		] !== undefined
 	) {
 		throw new Error(
-			`${client.name} changed server state during bootstrap: expected revision ` +
-				`${expected.revision}, got ${after.revision}`,
+			`${client.name} changed user vault bytes during packaged startup`,
 		);
 	}
 }

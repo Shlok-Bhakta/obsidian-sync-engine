@@ -34,7 +34,7 @@ cd e2e && bun test tests/obsidian
 | ID | Scenario |
 | --- | --- |
 | E1 | Fresh auth + vault seed |
-| E2 | `/bootstrap.zip` as a second client without startup re-uploads |
+| E2 | Preview-safe, single-use client package as a second client without startup re-uploads |
 | E3 | Edit on A → appears on B |
 | E4 | Delete on A → gone on B |
 | E5 | Self-echo does not duplicate |
@@ -43,7 +43,7 @@ cd e2e && bun test tests/obsidian
 | E8 | Rapid put+delete does not stall B |
 | E9 | Remote file/directory shape transitions |
 | E10 | Causal subtree delete preserves newer descendants |
-| E11 | Four independent bootstrap clients under rapid edits, conflicts, rename/delete/recreate, and subtree races |
+| E11 | Four independent packaged clients under rapid edits, conflicts, rename/delete/recreate, and subtree races |
 
 The four-client scenario requires byte-identical vault/server snapshots, equal
 revisions, empty durable queues, and no plugin errors for five consecutive

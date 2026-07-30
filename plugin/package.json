@@ -9,7 +9,7 @@
 		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production && node package-plugin.mjs",
 		"version": "node version-bump.mjs && git add manifest.json versions.json",
 		"lint": "eslint .",
-		"test": "bun test src/sync"
+		"test": "bun test src"
 	},
 	"keywords": [],
 	"license": "0-BSD",

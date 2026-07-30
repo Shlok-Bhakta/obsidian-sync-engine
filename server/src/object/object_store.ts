@@ -1,13 +1,9 @@
 import { Context, Hono } from "hono";
 import { join, resolve } from "node:path";
-import { tmpdir } from "node:os";
-import { mkdtemp, rm } from "node:fs/promises";
-import { randomUUID } from "node:crypto";
 import { sql } from "bun";
 import { zipSync } from "fflate";
-import { createClient, getClientIdFromAuthorization } from "../auth/auth";
-import { revisionSchema } from "obsidian-sync-protocol";
-import { assertBootstrapAuthorized } from "../auth/bootstrapToken";
+import { getClientIdFromAuthorization } from "../auth/auth";
+import { CLIENT_DATA_PATH, revisionSchema } from "obsidian-sync-protocol";
 import { canonicalizePath, InvalidPathError } from "./paths";
 
 export { InvalidPathError };
@@ -32,7 +28,7 @@ const PLUGIN_DIR = resolve(
 	process.env.PLUGIN_DIST_DIR ?? join(import.meta.dir, "../../../plugin"),
 );
 
-async function addPluginToBootstrap(
+async function addPluginToArchive(
 	entries: Record<string, Uint8Array>,
 ): Promise<void> {
 	const pluginVaultDir = `.obsidian/plugins/${PLUGIN_ID}`;
@@ -53,8 +49,26 @@ async function addPluginToBootstrap(
 			await styles.arrayBuffer(),
 		);
 	}
-	entries[".obsidian/community-plugins.json"] = new TextEncoder().encode(
-		JSON.stringify([PLUGIN_ID]),
+	const communityPluginsPath = ".obsidian/community-plugins.json";
+	let communityPlugins: string[] = [];
+	const existing = entries[communityPluginsPath];
+	if (existing) {
+		try {
+			const parsed = JSON.parse(new TextDecoder().decode(existing));
+			if (Array.isArray(parsed)) {
+				communityPlugins = parsed.filter(
+					(value): value is string => typeof value === "string",
+				);
+			}
+		} catch {
+			// Replace invalid Obsidian plugin metadata with a usable list.
+		}
+	}
+	if (!communityPlugins.includes(PLUGIN_ID)) {
+		communityPlugins.push(PLUGIN_ID);
+	}
+	entries[communityPluginsPath] = new TextEncoder().encode(
+		JSON.stringify(communityPlugins),
 	);
 }
 
@@ -299,51 +313,58 @@ export class ObjectStore {
 		}
 	}
 
-    async bootstrap_zip_create(path: string): Promise<void> {
+    async createClientArchive(options: {
+		serverUrl: string;
+		clientName: string;
+		clientSecret: string;
+	}): Promise<Uint8Array> {
 		await this.assertContentComplete();
-		const publicServerUrl = getPublicServerUrl();
 		const entries: Record<string, Uint8Array> = {};
-		let clientSecret: string | null = null;
-        try {
-            // Snapshot the tip BEFORE reading file rows: if we read it after, a file
-            // landing between the read and the tip snapshot could be reflected in the
-            // tip without its bytes making it into the zip, so the client would never
-            // fetch it (it thinks it's already past that revision). Reading before
-            // means the worst case is an extra file the client already has bytes for
-            // (harmless) rather than a missing one (unrecoverable without a re-bootstrap).
-            const revision = await this.getTipRevision();
 
-            // Bootstrap should not ship tombstoned files; the client learns about
-            // deletes via the inbox once it starts polling from `revision`.
-            const files = await sql<{ file_path: string; content: Buffer | null }[]>`
-                SELECT file_path, content FROM files
-                WHERE file_is_deleted = FALSE AND content IS NOT NULL
-            `;
-            for (const file of files) {
-				const canonicalPath = canonicalizePath(file.file_path);
-				entries[canonicalPath] = new Uint8Array(file.content as Buffer);
-            }
+		// Snapshot the tip before reading rows. A concurrent write can then cause
+		// at worst an extra inbox fetch, never a missing file hidden behind the tip.
+		const revision = await this.getTipRevision();
+		const files = await sql<{ file_path: string; content: Buffer | null }[]>`
+			SELECT file_path, content FROM files
+			WHERE file_is_deleted = FALSE AND content IS NOT NULL
+		`;
+		for (const file of files) {
+			if (file.file_path === CLIENT_DATA_PATH) continue;
+			const canonicalPath = canonicalizePath(file.file_path);
+			entries[canonicalPath] = new Uint8Array(file.content as Buffer);
+		}
 
-			await addPluginToBootstrap(entries);
-			const clientName = `bootstrap-${randomUUID()}`;
-            clientSecret = await createClient(clientName);
-			const dataPath = ".obsidian/plugins/obsidian-sync-engine/data.json";
-			entries[dataPath] = new TextEncoder().encode(JSON.stringify({
-                clientName,
-                clientSecret,
-                revision,
-				serverUrl: publicServerUrl,
-            }, null, 2));
+		await addPluginToArchive(entries);
+		entries[CLIENT_DATA_PATH] = new TextEncoder().encode(JSON.stringify({
+			clientName: options.clientName,
+			clientSecret: options.clientSecret,
+			revision,
+			serverUrl: options.serverUrl,
+		}, null, 2));
+		return zipSync(entries, { level: 6 });
+    }
 
-			await Bun.write(path, zipSync(entries, { level: 6 }));
-        } catch (error) {
-			if (clientSecret) {
-				await sql`DELETE FROM clients WHERE client_secret = ${clientSecret}`.catch(
-					() => undefined,
-				);
-			}
+    async client_zip_create(
+		path: string,
+		serverUrl = "http://localhost:3000",
+	): Promise<void> {
+		const clientName = `client-${crypto.randomUUID()}`;
+		const [client] = await sql<{ id: string; client_secret: string }[]>`
+			INSERT INTO clients (client_name)
+			VALUES (${clientName})
+			RETURNING id, client_secret
+		`;
+		try {
+			const archive = await this.createClientArchive({
+				serverUrl,
+				clientName,
+				clientSecret: client.client_secret,
+			});
+			await Bun.write(path, archive);
+		} catch (error) {
+			await sql`DELETE FROM clients WHERE id = ${client.id}`.catch(() => undefined);
 			throw error;
-        }
+		}
     }
 
     // to create the client inbox
@@ -387,18 +408,6 @@ function resolvePathFromRequest(c: Context): string | undefined {
 	}
 }
 
-function getPublicServerUrl(): string {
-	const raw = process.env.PUBLIC_SERVER_URL?.trim();
-	if (!raw) {
-		throw new Error("PUBLIC_SERVER_URL is required to create a bootstrap archive");
-	}
-	const url = new URL(raw);
-	if (!["http:", "https:"].includes(url.protocol)) {
-		throw new Error("PUBLIC_SERVER_URL must use http or https");
-	}
-	return url.toString().replace(/\/$/, "");
-}
-
 async function requireClient(c: Context): Promise<string | Response> {
 	const authorization = c.req.header("Authorization");
 	if (!authorization) {
@@ -439,36 +448,6 @@ export function registerObjectStoreRoutes(app: Hono, store = objectStore) {
                 if (error instanceof InvalidPathError) {
                     return c.json({ error: "Invalid path" }, 400);
                 }
-                throw error;
-            }
-        })
-        .get('/bootstrap.zip', async (c) => {
-            const authz = assertBootstrapAuthorized({
-                authorizationHeader: c.req.header("Authorization"),
-                queryToken: c.req.query("token"),
-            });
-            if (!authz.ok) {
-                return c.json({ error: authz.error }, authz.status);
-            }
-
-            const tmp = await mkdtemp(join(tmpdir(), "obsidian-bootstrap-"));
-            const zipPath = join(tmp, "vault.zip");
-
-            try {
-                await store.bootstrap_zip_create(zipPath);
-
-                setTimeout(() => void rm(tmp, { recursive: true, force: true }), 10 * 60 * 1000);
-                return new Response(Bun.file(zipPath), {
-                    headers: {
-                        "Content-Type": "application/zip",
-                        "Content-Disposition": `attachment; filename="obsidian-bootstrap-${Date.now()}.zip"`,
-                        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-                        "Pragma": "no-cache",
-                        "Expires": "0",
-                    },
-                });
-            } catch (error) {
-                await rm(tmp, { recursive: true, force: true });
                 throw error;
             }
         })

@@ -54,8 +54,10 @@ export const messageSchema = z.discriminatedUnion('type', [
 export type Message = z.infer<typeof messageSchema>;
 
 const WINDOWS_DRIVE_RE = /^[a-zA-Z]:/;
+export const CLIENT_DATA_PATH =
+  ".obsidian/plugins/obsidian-sync-engine/data.json";
 
-/** Product-wide path policy: sync user vault content, never Obsidian config. */
+/** Product-wide path policy: sync the vault except this client's credentials. */
 export function isCanonicalSyncPath(path: string): boolean {
   if (
     typeof path !== "string" ||
@@ -73,7 +75,7 @@ export function isCanonicalSyncPath(path: string): boolean {
     segments.every(
       (segment) =>
         segment.length > 0 && segment !== "." && segment !== "..",
-    ) && segments[0] !== ".obsidian"
+    ) && path !== CLIENT_DATA_PATH
   );
 }
 

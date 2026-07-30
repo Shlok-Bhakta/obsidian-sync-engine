@@ -1,7 +1,6 @@
 import { sql } from "bun";
 import { Context, Hono } from "hono";
 import { deserialize, Message, MessageType } from "obsidian-sync-protocol";
-import { assertBootstrapAuthorized } from "./bootstrapToken";
 
 // this file is supposed to figure some stuff out
 // 1. if the client exists then see if the client secret is correct
@@ -18,7 +17,6 @@ export type AuthResult = {
 export async function auth(
 	clientName: string,
 	clientSecret: string,
-	allowFirstEnrollment = false,
 ): Promise<AuthResult> {
 	return sql.begin(async (tx) => {
 		await tx`SELECT pg_advisory_xact_lock(hashtext('obsidian-sync-first-client'))`;
@@ -32,7 +30,7 @@ export async function auth(
 		const [{ count }] = await tx<{ count: string }[]>`
 			SELECT COUNT(*)::text AS count FROM clients
 		`;
-		if (Number(count) > 0 || !allowFirstEnrollment) {
+		if (Number(count) > 0) {
 			return { authenticated: false, token: null };
 		}
 		const [created] = await tx<{ client_secret: string }[]>`
@@ -113,11 +111,7 @@ function withMessage<T extends MessageType>(
 export function registerAuthRoutes(app: Hono) {
 	// First-client enrollment and reconnect verification over HTTP.
 	app.post('/auth', withMessage(MessageType.AUTH_ACK, async (c, data) => {
-		const enrollment = assertBootstrapAuthorized({
-			authorizationHeader: c.req.header("Authorization"),
-			queryToken: undefined,
-		});
-		const authResult = await auth(data.client_name, data.token, enrollment.ok);
+		const authResult = await auth(data.client_name, data.token);
 
 		if (!authResult.authenticated) {
 			return c.json({

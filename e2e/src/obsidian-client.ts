@@ -421,14 +421,12 @@ export class ObsidianClient {
 		clientName: string;
 		clientSecret?: string;
 		revision?: number;
-		setupToken?: string;
 	}): Promise<void> {
 		const next = {
 			serverUrl: settings.serverUrl,
 			clientName: settings.clientName,
 			clientSecret: settings.clientSecret ?? "Made by server",
 			revision: settings.revision ?? 0,
-			setupToken: settings.setupToken ?? "",
 		};
 		const payload = JSON.stringify(next, null, 2);
 		const containerDataPath =
@@ -466,12 +464,15 @@ export class ObsidianClient {
 		);
 	}
 
-	async authenticate(): Promise<void> {
-		await this.command("obsidian-sync-engine:authenticate-with-server");
-	}
-
 	async seed(): Promise<void> {
 		await this.command("obsidian-sync-engine:seed-server-from-vault");
+	}
+
+	async createClientInvite(): Promise<{ url: string; expiresAt: string }> {
+		return this.evalAsync<{ url: string; expiresAt: string }>(
+			`app.plugins.getPlugin("obsidian-sync-engine").createClientInvite()`,
+			{ label: `${this.name} create client invite` },
+		);
 	}
 
 	async readSettings(): Promise<{
@@ -563,13 +564,25 @@ export class ObsidianClient {
 	async snapshotFiles(): Promise<Record<string, string>> {
 		return this.evalAsync<Record<string, string>>(
 			`(async () => {
+				const plugin = app.plugins.getPlugin("obsidian-sync-engine");
+				const pluginDir =
+					plugin.manifest.dir ??
+					app.vault.configDir + "/plugins/" + plugin.manifest.id;
+				const dataPath = pluginDir + "/data.json";
+				const stateDir = pluginDir + "/state";
 				const result = {};
-				for (const file of app.vault.getFiles()) {
-					if (file.path === ".obsidian" || file.path.startsWith(".obsidian/")) continue;
-					const bytes = new Uint8Array(await app.vault.readBinary(file));
+				for (const path of await plugin.sync.fs.listAllFiles()) {
+					if (
+						path === dataPath ||
+						path === stateDir ||
+						path.startsWith(stateDir + "/")
+					) continue;
+					const bytes = new Uint8Array(
+						await app.vault.adapter.readBinary(path),
+					);
 					let binary = "";
 					for (const byte of bytes) binary += String.fromCharCode(byte);
-					result[file.path] = btoa(binary);
+					result[path] = btoa(binary);
 				}
 				return result;
 			})()`,

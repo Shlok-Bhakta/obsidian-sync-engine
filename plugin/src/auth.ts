@@ -9,15 +9,12 @@ import type ObsidianSyncPlugin from './main';
  */
 export async function ensureAuthenticated(plugin: ObsidianSyncPlugin): Promise<void> {
 	if (plugin.isSyncSuspended()) {
-		throw new Error("Reload Obsidian before pairing with the new server");
+		throw new Error("Reload Obsidian before reconnecting to the new server");
 	}
 	const response = await requestUrl({
 		url: `${plugin.settings.serverUrl}/auth`,
 		method: 'POST',
 		contentType: 'application/json',
-		headers: plugin.settings.setupToken
-			? { Authorization: `Bearer ${plugin.settings.setupToken}` }
-			: undefined,
 		body: serialize({
 			type: MessageType.AUTH_ACK,
 			client_name: plugin.settings.clientName,
@@ -39,16 +36,11 @@ export async function ensureAuthenticated(plugin: ObsidianSyncPlugin): Promise<v
 	if (message.type === MessageType.AUTH_INIT) {
 		plugin.settings.clientSecret = message.token;
 		plugin.settings.clientName = message.client_name;
-		plugin.settings.setupToken = '';
 		await plugin.saveSettings();
 		return;
 	}
 
 	if (message.type === MessageType.AUTH_SUCCESS) {
-		if (plugin.settings.setupToken) {
-			plugin.settings.setupToken = '';
-			await plugin.saveSettings();
-		}
 		return;
 	}
 

@@ -5,7 +5,7 @@ import { $ } from "bun";
 import { ObsidianClient } from "../../src/obsidian-client";
 import { startStack, type Stack } from "../../src/stack";
 import {
-	assertBootstrapIsReadOnly,
+	assertClientPackagePreservesVault,
 	readServerSnapshot,
 	waitForStableConvergence,
 } from "../../src/convergence";
@@ -61,7 +61,6 @@ describe("obsidian multi-client e2e", () => {
 		await clientA.configurePlugin({
 			serverUrl: stack.serverUrl,
 			clientName: "e2e-client-a",
-			setupToken: stack.bootstrapToken,
 		});
 	}, 300_000);
 
@@ -85,8 +84,13 @@ describe("obsidian multi-client e2e", () => {
 			"Obsidian eval",
 		);
 
-		await clientA.authenticate();
-		const settings = await clientA.readSettings();
+		const settings = await waitFor(
+			async () => {
+				const current = await clientA.readSettings();
+				return current.clientSecret !== "Made by server" ? current : false;
+			},
+			{ timeoutMs: 30_000, label: "client A automatically claims server" },
+		);
 		expect(settings.clientSecret).not.toBe("Made by server");
 		expect(settings.clientSecret.length).toBeGreaterThan(8);
 
@@ -118,19 +122,26 @@ describe("obsidian multi-client e2e", () => {
 			expect(res.status).toBe(200);
 			expect((await res.arrayBuffer()).byteLength).toBeGreaterThan(0);
 		}
+		const snapshot = await readServerSnapshot(stack);
+		expect(
+			snapshot.files[".obsidian/plugins/obsidian-sync-engine/data.json"],
+		).toBeUndefined();
 	}, 180_000);
 
-	test("E2: bootstrap.zip opens as client B at tip with empty first poll", async () => {
+	test("E2: a preview-safe one-time client link opens B at the current tip", async () => {
 		const serverBefore = await readServerSnapshot(stack);
-		const zipPath = join(RUN_ROOT, "bootstrap.zip");
-		const denied = await fetch(`${stack.serverUrlLocal}/bootstrap.zip`);
-		expect(denied.status).toBe(401);
-
-		const res = await fetch(`${stack.serverUrlLocal}/bootstrap.zip`, {
-			headers: { Authorization: `Bearer ${stack.bootstrapToken}` },
-		});
+		const zipPath = join(RUN_ROOT, "client-package.zip");
+		const invite = await clientA.createClientInvite();
+		const invitePath = new URL(invite.url).pathname;
+		const localInviteUrl = `${stack.serverUrlLocal}${invitePath}`;
+		expect((await fetch(localInviteUrl)).status).toBe(200);
+		expect((await fetch(localInviteUrl)).status).toBe(200);
+		const res = await fetch(`${localInviteUrl}/download`, { method: "POST" });
 		expect(res.ok).toBe(true);
 		await writeFile(zipPath, Buffer.from(await res.arrayBuffer()));
+		expect(
+			(await fetch(`${localInviteUrl}/download`, { method: "POST" })).status,
+		).toBe(410);
 
 		await rm(clientB.vaultHostDir, { recursive: true, force: true });
 		await mkdir(clientB.vaultHostDir, { recursive: true });
@@ -150,9 +161,9 @@ describe("obsidian multi-client e2e", () => {
 		expect(bootData.clientSecret).toBeTruthy();
 
 		await clientB.start();
-		await assertBootstrapIsReadOnly(clientB, stack, serverBefore);
+		await assertClientPackagePreservesVault(clientB, stack, serverBefore);
 		const after = await clientB.readSettings();
-		expect(after.revision).toBe(serverBefore.revision);
+		expect(after.revision).toBeGreaterThanOrEqual(serverBefore.revision);
 		for (const path of SAMPLE_CONTENT_PATHS) {
 			expect(await Bun.file(clientB.vaultPath(path)).exists()).toBe(true);
 		}
@@ -173,6 +184,35 @@ describe("obsidian multi-client e2e", () => {
 				return text.includes("from A") ? text : false;
 			},
 			{ timeoutMs: 60_000, intervalMs: 1000, label: "SharedNote.md on B" },
+		);
+	}, 120_000);
+
+	test("E3b: Obsidian configuration syncs without overwriting client credentials", async () => {
+		const beforeA = await clientA.readSettings();
+		const beforeB = await clientB.readSettings();
+		expect(beforeA.clientSecret).not.toBe(beforeB.clientSecret);
+
+		await clientA.evalAsync(
+			`app.vault.adapter.write(".obsidian/e2e-config.json", JSON.stringify({ from: "A" }))`,
+			{ label: "write Obsidian config on A" },
+		);
+		await sleep(1200);
+		await clientA.forceTick();
+		await clientA.forceTick();
+		await waitFor(
+			async () => {
+				await clientB.forceTick();
+				const file = Bun.file(clientB.vaultPath(".obsidian/e2e-config.json"));
+				return (await file.exists()) && (await file.text()).includes('"from":"A"');
+			},
+			{ timeoutMs: 60_000, label: "Obsidian config reaches B" },
+		);
+
+		expect((await clientA.readSettings()).clientSecret).toBe(
+			beforeA.clientSecret,
+		);
+		expect((await clientB.readSettings()).clientSecret).toBe(
+			beforeB.clientSecret,
 		);
 	}, 120_000);
 
@@ -391,7 +431,7 @@ describe("obsidian multi-client e2e", () => {
 		}
 	}, 120_000);
 
-	test("E11: four independently bootstrapped clients survive adversarial edits and converge", async () => {
+	test("E11: four independently packaged clients survive adversarial edits and converge", async () => {
 		const stamp = Date.now();
 		clientC = new ObsidianClient({
 			name: "vault-c",
@@ -406,14 +446,17 @@ describe("obsidian multi-client e2e", () => {
 			httpsPort: 13401,
 		});
 
-		const startIndependentBootstrap = async (
+		const startIndependentClient = async (
 			client: ObsidianClient,
 			archiveName: string,
 		) => {
 			const before = await readServerSnapshot(stack);
-			const response = await fetch(`${stack.serverUrlLocal}/bootstrap.zip`, {
-				headers: { Authorization: `Bearer ${stack.bootstrapToken}` },
-			});
+			const invite = await clientA.createClientInvite();
+			const invitePath = new URL(invite.url).pathname;
+			const response = await fetch(
+				`${stack.serverUrlLocal}${invitePath}/download`,
+				{ method: "POST" },
+			);
 			expect(response.status).toBe(200);
 			const zipPath = join(RUN_ROOT, archiveName);
 			await writeFile(zipPath, Buffer.from(await response.arrayBuffer()));
@@ -427,18 +470,18 @@ describe("obsidian multi-client e2e", () => {
 				client.name,
 			);
 			await client.start();
-			await assertBootstrapIsReadOnly(client, stack, before);
+			await assertClientPackagePreservesVault(client, stack, before);
 		};
 
 		await waitForStableConvergence([clientA, clientB], stack, {
-			label: "A and B settle before adding bootstrap clients",
+			label: "A and B settle before adding packaged clients",
 		});
-		await startIndependentBootstrap(clientC, `bootstrap-c-${stamp}.zip`);
-		await startIndependentBootstrap(clientD, `bootstrap-d-${stamp}.zip`);
+		await startIndependentClient(clientC, `client-c-${stamp}.zip`);
+		await startIndependentClient(clientD, `client-d-${stamp}.zip`);
 
 		const clients = [clientA, clientB, clientC, clientD] as const;
 		await waitForStableConvergence(clients, stack, {
-			label: "all four bootstrap clients agree",
+			label: "all four packaged clients agree",
 		});
 		const credentials = await Promise.all(
 			clients.map(async (client) => (await client.readSettings()).clientSecret),

@@ -4,6 +4,7 @@
     "jsx": "react-jsx",
     "jsxImportSource": "hono/jsx",
     "types": ["bun-types"],
+    "target": "ESNext",
     "module": "esnext",
     "moduleResolution": "bundler",
     "noEmit": true

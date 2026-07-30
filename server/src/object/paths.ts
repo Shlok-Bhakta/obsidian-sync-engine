@@ -29,7 +29,7 @@ export function canonicalizePath(path: string): string {
 	if (!isCanonicalSyncPath(path)) {
 		throw new InvalidPathError(
 			String(path ?? ""),
-			"path must be canonical user-vault content (excluding .obsidian)",
+			"path must be canonical vault content (excluding client data.json)",
 		);
 	}
 	/*
@@ -62,10 +62,6 @@ export function canonicalizePath(path: string): string {
 			throw new InvalidPathError(path, `path must not contain a "${segment}" segment`);
 		}
 	}
-	if (segments[0] === ".obsidian") {
-		throw new InvalidPathError(path, "Obsidian configuration is private");
-	}
-
 	return path;
 }
 

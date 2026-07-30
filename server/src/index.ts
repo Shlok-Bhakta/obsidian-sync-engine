@@ -2,6 +2,10 @@ import { Hono } from 'hono'
 import { bootstrapDB } from './db/MigrationRunner'
 import { registerAuthRoutes } from './auth/auth';
 import { registerObjectStoreRoutes, objectStore } from './object/object_store';
+import {
+	cleanupExpiredClientInvites,
+	registerClientInviteRoutes,
+} from "./invites/clientInvites";
 
 await bootstrapDB();
 const filled = await objectStore.backfillContentFromLegacyDisk();
@@ -18,6 +22,14 @@ app.get('/', (c) => {
 
 registerAuthRoutes(app);
 registerObjectStoreRoutes(app);
+registerClientInviteRoutes(app);
+
+const inviteCleanup = setInterval(() => {
+	void cleanupExpiredClientInvites().catch((error) => {
+		console.error("Could not clean up expired client invites", error);
+	});
+}, 30_000);
+inviteCleanup.unref?.();
 
 export default {
   port: Number(process.env.PORT ?? 3000),

@@ -29,7 +29,7 @@ jobs:
         working-directory: shared/protocol
         run: npm ci
       - run: npm ci
-      - run: bun test src/sync
+      - run: bun test src
 
   server-unit:
     name: Server unit (bun + postgres)
@@ -54,8 +54,6 @@ jobs:
     env:
       DATABASE_URL: postgres://postgres:postgres@localhost:5434/test_db
       OBJECT_STORE_DIR: /tmp/ci-object-store
-      PUBLIC_SERVER_URL: http://localhost:3000
-      BOOTSTRAP_TOKEN: ci-test-setup-token
     steps:
       - uses: actions/checkout@v6
       - uses: oven-sh/setup-bun@v2
@@ -66,7 +64,7 @@ jobs:
         run: |
           npm ci
           # bun resolves the file: protocol package from server/
-      - name: Build bootstrap plugin artifacts
+      - name: Build client-package plugin artifacts
         working-directory: plugin
         run: |
           npm ci
