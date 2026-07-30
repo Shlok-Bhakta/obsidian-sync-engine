@@ -2,8 +2,20 @@ import { Context, Hono } from "hono";
 import { join, resolve } from "node:path";
 import { sql } from "bun";
 import { zipSync } from "fflate";
-import { getClientIdFromAuthorization } from "../auth/auth";
-import { CLIENT_DATA_PATH, revisionSchema } from "obsidian-sync-protocol";
+import {
+	type ClientAuthorizer,
+	getClientIdFromAuthorization,
+	requireClientId,
+} from "../auth/auth";
+import {
+	CLIENT_DATA_PATH,
+	clientConfigSchema,
+	deleteResponseSchema,
+	type InboxOp,
+	revisionSchema,
+	serializeInboxNdjson,
+	type UploadResponse,
+} from "obsidian-sync-protocol";
 import { canonicalizePath, InvalidPathError } from "./paths";
 
 export { InvalidPathError };
@@ -78,11 +90,7 @@ export type ObjectStoreUploadContent = {
     id: string;
 };
 
-export type ObjectStoreUploadResult = {
-    path: string;
-    bytesWritten: number;
-    revision: number;
-};
+export type ObjectStoreUploadResult = UploadResponse;
 
 export type ObjectStoreOutboxItem = {
     path: string;
@@ -335,12 +343,15 @@ export class ObjectStore {
 		}
 
 		await addPluginToArchive(entries);
-		entries[CLIENT_DATA_PATH] = new TextEncoder().encode(JSON.stringify({
+		const clientConfig = clientConfigSchema.parse({
 			clientName: options.clientName,
 			clientSecret: options.clientSecret,
 			revision,
 			serverUrl: options.serverUrl,
-		}, null, 2));
+		});
+		entries[CLIENT_DATA_PATH] = new TextEncoder().encode(
+			JSON.stringify(clientConfig, null, 2),
+		);
 		return zipSync(entries, { level: 6 });
     }
 
@@ -408,19 +419,11 @@ function resolvePathFromRequest(c: Context): string | undefined {
 	}
 }
 
-async function requireClient(c: Context): Promise<string | Response> {
-	const authorization = c.req.header("Authorization");
-	if (!authorization) {
-		return c.json({ error: "Unauthorized" }, 401);
-	}
-	try {
-		return await getClientIdFromAuthorization(authorization);
-	} catch {
-		return c.json({ error: "Unauthorized" }, 401);
-	}
-}
-
-export function registerObjectStoreRoutes(app: Hono, store = objectStore) {
+export function registerObjectStoreRoutes(
+	app: Hono,
+	store = objectStore,
+	authorize: ClientAuthorizer = getClientIdFromAuthorization,
+) {
     // Chain so Hono accumulates route types (needed by testClient inference).
     return app
         .post('/files', async (c) => {
@@ -434,7 +437,7 @@ export function registerObjectStoreRoutes(app: Hono, store = objectStore) {
             if (!path) {
                 return c.json({ error: "Request body is required" }, 400);
             }
-			const authorized = await requireClient(c);
+			const authorized = await requireClientId(c, authorize);
 			if (authorized instanceof Response) return authorized;
             const clientId = authorized;
             try {
@@ -452,7 +455,7 @@ export function registerObjectStoreRoutes(app: Hono, store = objectStore) {
             }
         })
         .get('/inbox', async (c) => {
-			const authorized = await requireClient(c);
+			const authorized = await requireClientId(c, authorize);
 			if (authorized instanceof Response) return authorized;
 			const rawRev = c.req.query("rev");
 			const parsedRev =
@@ -464,19 +467,19 @@ export function registerObjectStoreRoutes(app: Hono, store = objectStore) {
 			}
             const rev = parsedRev.data;
             const inbox = await store.inbox(rev);
-            const lines = inbox.map((item) => JSON.stringify({
+            const ops: InboxOp[] = inbox.map((item) => ({
                 rev: item.lastUpdatedRevision,
                 op: item.isDeleted ? "delete" : "put",
                 path: item.path,
             }));
-            const body = lines.length > 0 ? lines.join("\n") + "\n" : "";
+            const body = serializeInboxNdjson(ops);
             return new Response(body, {
                 status: 200,
                 headers: { "Content-Type": "application/x-ndjson" },
             });
         })
         .get('/files', async (c) => {
-			const authorized = await requireClient(c);
+			const authorized = await requireClientId(c, authorize);
 			if (authorized instanceof Response) return authorized;
 			let path: string | undefined;
 			try {
@@ -506,7 +509,7 @@ export function registerObjectStoreRoutes(app: Hono, store = objectStore) {
             }
         })
         .delete('/files', async (c) => {
-			const authorized = await requireClient(c);
+			const authorized = await requireClientId(c, authorize);
 			if (authorized instanceof Response) return authorized;
 			let path: string | undefined;
 			try {
@@ -538,7 +541,10 @@ export function registerObjectStoreRoutes(app: Hono, store = objectStore) {
                     clientId,
                     parsedBaseRevision.data,
                 );
-                return c.json({ path, revision: result.revision }, 200);
+                return c.json(
+					deleteResponseSchema.parse({ path, revision: result.revision }),
+					200,
+				);
             } catch (error) {
                 if (error instanceof InvalidPathError) {
                     return c.json({ error: "Invalid path" }, 400);

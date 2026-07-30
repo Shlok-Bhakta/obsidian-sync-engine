@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { MemorySyncFs } from "./fs";
+import { MemorySyncFs } from "../test/sync";
 import { readLines, writeLines } from "./jsonl";
 
 describe("jsonl", () => {

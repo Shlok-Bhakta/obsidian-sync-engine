@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import type { RequestUrlParam, RequestUrlResponse } from "obsidian";
+import type { HttpRequestFn } from "../http";
 import { PermanentRemoteError } from "./engine";
-import { HttpTransport, RemoteFileNotFoundError, type HttpRequestFn } from "./httpTransport";
+import { HttpTransport, RemoteFileNotFoundError } from "./httpTransport";
 
 const SERVER_URL = "https://sync.example.com";
 const SECRET = "obs_sync_test-secret";

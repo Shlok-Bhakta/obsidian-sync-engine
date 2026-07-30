@@ -81,6 +81,24 @@ export async function getClientIdFromAuthorization(authorization: string): Promi
 	return client[0].id as string;
 }
 
+export type ClientAuthorizer = (authorization: string) => Promise<string>;
+
+/** Shared route guard with an injectable credential lookup for focused tests. */
+export async function requireClientId(
+	c: Context,
+	authorize: ClientAuthorizer = getClientIdFromAuthorization,
+): Promise<string | Response> {
+	const authorization = c.req.header("Authorization");
+	if (!authorization) {
+		return c.json({ error: "Unauthorized" }, 401);
+	}
+	try {
+		return await authorize(authorization);
+	} catch {
+		return c.json({ error: "Unauthorized" }, 401);
+	}
+}
+
 function errorMessage(reason: string): Message {
 	return {
 		type: MessageType.ERROR,

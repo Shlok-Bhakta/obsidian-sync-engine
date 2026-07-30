@@ -1,3 +1,5 @@
+import { isCanonicalSyncPath } from "obsidian-sync-protocol";
+
 /** Thrown by `canonicalizeSyncPath` when a path cannot be made safe to sync. */
 export class InvalidSyncPathError extends Error {
 	constructor(readonly path: string) {
@@ -43,4 +45,3 @@ export function ancestorDirs(path: string): string[] {
 	}
 	return dirs;
 }
-import { isCanonicalSyncPath } from "obsidian-sync-protocol";

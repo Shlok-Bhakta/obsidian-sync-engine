@@ -1,5 +1,11 @@
 import { join } from "node:path";
 import { mkdir } from "node:fs/promises";
+import {
+	clientConfigSchema,
+	clientInviteSchema,
+	type ClientConfig,
+	type ClientInvite,
+} from "obsidian-sync-protocol";
 import { waitFor } from "./wait";
 import {
 	installPlugin,
@@ -12,6 +18,12 @@ import { CONTAINER_BIN, hostGatewayRunArgs } from "./container";
 const IMAGE = process.env.E2E_OBSIDIAN_IMAGE ?? "lscr.io/linuxserver/obsidian:latest";
 const EVAL_BRIDGE_KEY = "__obsidianSyncE2EAsync";
 const PAUSED_TICK_KEY = "__obsidianSyncE2EPausedTick";
+
+type ConfigurableClientSettings = Pick<
+	ClientConfig,
+	"serverUrl" | "clientName"
+> &
+	Partial<Pick<ClientConfig, "clientSecret" | "revision">>;
 
 type AsyncEvalState =
 	| { status: "pending" }
@@ -416,18 +428,13 @@ export class ObsidianClient {
 		);
 	}
 
-	async configurePlugin(settings: {
-		serverUrl: string;
-		clientName: string;
-		clientSecret?: string;
-		revision?: number;
-	}): Promise<void> {
-		const next = {
+	async configurePlugin(settings: ConfigurableClientSettings): Promise<void> {
+		const next = clientConfigSchema.parse({
 			serverUrl: settings.serverUrl,
 			clientName: settings.clientName,
 			clientSecret: settings.clientSecret ?? "Made by server",
 			revision: settings.revision ?? 0,
-		};
+		});
 		const payload = JSON.stringify(next, null, 2);
 		const containerDataPath =
 			`${this.vaultContainerPath}/.obsidian/plugins/obsidian-sync-engine/data.json`;
@@ -468,28 +475,19 @@ export class ObsidianClient {
 		await this.command("obsidian-sync-engine:seed-server-from-vault");
 	}
 
-	async createClientInvite(): Promise<{ url: string; expiresAt: string }> {
-		return this.evalAsync<{ url: string; expiresAt: string }>(
+	async createClientInvite(): Promise<ClientInvite> {
+		const invite = await this.evalAsync<unknown>(
 			`app.plugins.getPlugin("obsidian-sync-engine").createClientInvite()`,
 			{ label: `${this.name} create client invite` },
 		);
+		return clientInviteSchema.parse(invite);
 	}
 
-	async readSettings(): Promise<{
-		serverUrl: string;
-		clientName: string;
-		clientSecret: string;
-		revision: number;
-	}> {
+	async readSettings(): Promise<ClientConfig> {
 		const raw = await this.eval(
 			`JSON.stringify(app.plugins.getPlugin('obsidian-sync-engine').settings)`,
 		);
-		return JSON.parse(raw) as {
-			serverUrl: string;
-			clientName: string;
-			clientSecret: string;
-			revision: number;
-		};
+		return clientConfigSchema.parse(JSON.parse(raw));
 	}
 
 	async forceTick(): Promise<void> {

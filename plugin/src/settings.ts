@@ -1,6 +1,7 @@
 import { App, Notice, PluginSettingTab, Setting, requestUrl } from 'obsidian';
 import ObsidianSyncPlugin from './main';
 import { deserialize, MessageType, serialize } from 'obsidian-sync-protocol';
+import type { ClientConfig } from "obsidian-sync-protocol";
 import { serverIdentityFor } from "./sync/serverIdentity";
 import type { ClientInvite } from "./clientInvites";
 
@@ -12,11 +13,7 @@ export {
 	transitionServerSettings,
 } from "./sync/serverIdentity";
 
-export interface ObsidianSyncSettings {
-	serverUrl: string;
-	clientName: string;
-	clientSecret: string;
-	revision: number;
+export interface ObsidianSyncSettings extends ClientConfig {
 	serverIdentity: string;
 }
 

@@ -1,10 +1,14 @@
 import { sql } from "bun";
 import { describe, expect, it } from "bun:test";
 import { unzipSync } from "fflate";
+import {
+	CLIENT_DATA_PATH,
+	clientConfigSchema,
+	clientInviteSchema,
+} from "obsidian-sync-protocol";
 import { createClientFixture, createTestApp } from "../test/fixtures";
 
 const decoder = new TextDecoder();
-const DATA_PATH = ".obsidian/plugins/obsidian-sync-engine/data.json";
 
 async function createInvite(app: ReturnType<typeof createTestApp>, secret: string) {
 	const response = await app.request("https://sync.example/client-invites", {
@@ -12,7 +16,7 @@ async function createInvite(app: ReturnType<typeof createTestApp>, secret: strin
 		headers: { Authorization: secret },
 	});
 	expect(response.status).toBe(201);
-	return response.json() as Promise<{ url: string; expiresAt: string }>;
+	return clientInviteSchema.parse(await response.json());
 }
 
 describe("client invite packages", () => {
@@ -67,12 +71,9 @@ describe("client invite packages", () => {
 		expect(decoder.decode(archive[".obsidian/workspace.json"])).toBe(
 			'{"layout":"owner"}',
 		);
-		const settings = JSON.parse(decoder.decode(archive[DATA_PATH])) as {
-			clientName: string;
-			clientSecret: string;
-			serverUrl: string;
-			revision: number;
-		};
+		const settings = clientConfigSchema.parse(
+			JSON.parse(decoder.decode(archive[CLIENT_DATA_PATH])),
+		);
 		expect(settings.serverUrl).toBe("https://sync.example");
 		expect(settings.clientName).not.toBe(owner.client_name);
 		expect(settings.clientSecret).toStartWith("obs_sync_");

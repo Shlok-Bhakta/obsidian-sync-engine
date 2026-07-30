@@ -28,6 +28,9 @@ jobs:
       - name: Install protocol deps
         working-directory: shared/protocol
         run: npm ci
+      - name: Test shared protocol
+        working-directory: shared/protocol
+        run: npm test
       - run: npm ci
       - run: bun test src
 

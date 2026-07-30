@@ -1,4 +1,8 @@
 import { describe, expect, jest, test } from "bun:test";
+import {
+	createRevisionStore,
+	MemoryVaultFs,
+} from "../test/sync";
 import type { InboxOp } from "./inbox";
 import { readInbox } from "./inbox";
 import { enqueue as enqueueOutbox, list as listOutbox } from "./outbox";
@@ -12,49 +16,6 @@ import {
 const OUTBOX = "outbox.jsonl";
 const INBOX = "inbox.jsonl";
 
-/** In-memory vault fs with the binary/remove/list extensions SyncEngine wants. */
-class MemoryVaultFs implements VaultBlobFs {
-	private readonly files = new Map<string, string>();
-
-	async read(path: string): Promise<string> {
-		const data = this.files.get(path);
-		if (data === undefined) {
-			throw new Error(`ENOENT: no such file: ${path}`);
-		}
-		return data;
-	}
-
-	async write(path: string, data: string): Promise<void> {
-		this.files.set(path, data);
-	}
-
-	async append(path: string, data: string): Promise<void> {
-		this.files.set(path, (this.files.get(path) ?? "") + data);
-	}
-
-	async exists(path: string): Promise<boolean> {
-		return this.files.has(path);
-	}
-
-	async mkdir(): Promise<void> {}
-
-	async readBinary(path: string): Promise<ArrayBuffer> {
-		return new TextEncoder().encode(await this.read(path)).buffer;
-	}
-
-	async writeBinary(path: string, data: ArrayBuffer): Promise<void> {
-		this.files.set(path, new TextDecoder().decode(data));
-	}
-
-	async remove(path: string): Promise<void> {
-		this.files.delete(path);
-	}
-
-	async listAllFiles(): Promise<string[]> {
-		return [...this.files.keys()];
-	}
-}
-
 /** Vault fs whose remove always fails — exercises applyRemoteDelete failure paths. */
 class MemoryVaultFsNoRemove implements VaultBlobFs {
 	private readonly inner = new MemoryVaultFs();
@@ -63,7 +24,6 @@ class MemoryVaultFsNoRemove implements VaultBlobFs {
 	write = this.inner.write.bind(this.inner);
 	append = this.inner.append.bind(this.inner);
 	exists = this.inner.exists.bind(this.inner);
-	mkdir = this.inner.mkdir.bind(this.inner);
 	readBinary = this.inner.readBinary.bind(this.inner);
 	writeBinary = this.inner.writeBinary.bind(this.inner);
 	listAllFiles = this.inner.listAllFiles.bind(this.inner);
@@ -161,16 +121,6 @@ class FakeTransport implements SyncTransport {
 	}
 }
 
-function makeRevisionStore(initial = 0) {
-	let revision = initial;
-	return {
-		get: () => revision,
-		set: (rev: number) => {
-			revision = rev;
-		},
-	};
-}
-
 /** Flush pending microtask chains (e.g. a fire-and-forget debounced enqueue). */
 async function flushMicrotasks(times = 20): Promise<void> {
 	for (let i = 0; i < times; i++) {
@@ -185,7 +135,7 @@ describe("SyncEngine", () => {
 		const transport = new FakeTransport();
 		// Another client's change, already in the shared log before our tick.
 		transport.simulateRemoteOp("put", "remote.md", "from the server");
-		const revision = makeRevisionStore(0);
+		const revision = createRevisionStore(0);
 
 		await enqueueOutbox(fs, OUTBOX, {
 			op: "put",
@@ -227,7 +177,7 @@ describe("SyncEngine", () => {
 		const fs = new MemoryVaultFs();
 		await fs.write("a.md", "content");
 		const transport = new FakeTransport();
-		const revision = makeRevisionStore(0);
+		const revision = createRevisionStore(0);
 
 		await enqueueOutbox(fs, OUTBOX, { op: "put", path: "a.md", ts: 1 });
 
@@ -255,7 +205,7 @@ describe("SyncEngine", () => {
 		const fs = new MemoryVaultFs();
 		await fs.write("a.md", "content");
 		const transport = new FakeTransport();
-		const revision = makeRevisionStore(0);
+		const revision = createRevisionStore(0);
 
 		await enqueueOutbox(fs, OUTBOX, { op: "put", path: "a.md", ts: 1 });
 
@@ -283,7 +233,7 @@ describe("SyncEngine", () => {
 		await fs.write("a.md", "offline edit");
 		const transport = new FakeTransport();
 		transport.simulateRemoteOp("delete", "a.md");
-		const revision = makeRevisionStore(0);
+		const revision = createRevisionStore(0);
 		await enqueueOutbox(fs, OUTBOX, { op: "put", path: "a.md", ts: 1 });
 		const engine = new SyncEngine({
 			fs,
@@ -305,7 +255,7 @@ describe("SyncEngine", () => {
 		const fs = new MemoryVaultFs();
 		await fs.write("a.md", "v1");
 		const transport = new FakeTransport();
-		const revision = makeRevisionStore(0);
+		const revision = createRevisionStore(0);
 		const engine = new SyncEngine({
 			fs,
 			transport,
@@ -330,7 +280,7 @@ describe("SyncEngine", () => {
 		await fs.write("a.md", "a");
 		await fs.write("b.md", "b");
 		const transport = new FakeTransport();
-		const revision = makeRevisionStore(0);
+		const revision = createRevisionStore(0);
 		const engine = new SyncEngine({
 			fs,
 			transport,
@@ -354,7 +304,7 @@ describe("SyncEngine", () => {
 		await fs.write("a.md", "a");
 		await fs.write("b.md", "b");
 		const transport = new FakeTransport();
-		const revision = makeRevisionStore(0);
+		const revision = createRevisionStore(0);
 		const engine = new SyncEngine({
 			fs,
 			transport,
@@ -380,7 +330,7 @@ describe("SyncEngine", () => {
 		const fs = new MemoryVaultFs();
 		await fs.write("a.md", "local-v2");
 		const transport = new FakeTransport();
-		const revision = makeRevisionStore(0);
+		const revision = createRevisionStore(0);
 		const engine = new SyncEngine({
 			fs,
 			transport,
@@ -412,7 +362,7 @@ describe("SyncEngine", () => {
 			await fs.write("a.md", "a");
 			await fs.write("b.md", "b");
 			const transport = new FakeTransport();
-			const revision = makeRevisionStore(0);
+			const revision = createRevisionStore(0);
 			const engine = new SyncEngine({
 				fs,
 				transport,
@@ -452,7 +402,7 @@ describe("SyncEngine", () => {
 		await fs.write("a.md", "a");
 		await fs.write("b.md", "b");
 		const transport = new FakeTransport();
-		const revision = makeRevisionStore(0);
+		const revision = createRevisionStore(0);
 		const engine = new SyncEngine({
 			fs,
 			transport,
@@ -478,7 +428,7 @@ describe("SyncEngine", () => {
 		const fs = new MemoryVaultFs();
 		await fs.write("a.md", "content");
 		const transport = new FakeTransport();
-		const revision = makeRevisionStore(0);
+		const revision = createRevisionStore(0);
 
 		await enqueueOutbox(fs, OUTBOX, { op: "put", path: "a.md", ts: 1 });
 		await fs.remove("a.md"); // deleted locally before the put could be pushed
@@ -504,7 +454,7 @@ describe("SyncEngine", () => {
 		const fs = new MemoryVaultFs();
 		await fs.write("a.md", "content");
 		const transport = new FakeTransport();
-		const revision = makeRevisionStore(0);
+		const revision = createRevisionStore(0);
 
 		await enqueueOutbox(fs, OUTBOX, { op: "put", path: "a.md", ts: 1 });
 		await fs.remove("a.md");
@@ -531,7 +481,7 @@ describe("SyncEngine", () => {
 		const fs = new MemoryVaultFsNoRemove();
 		const transport = new FakeTransport();
 		transport.simulateRemoteOp("delete", "gone.md");
-		const revision = makeRevisionStore(0);
+		const revision = createRevisionStore(0);
 
 		const engine = new SyncEngine({
 			fs,
@@ -562,7 +512,7 @@ describe("SyncEngine", () => {
 			err.name = "RemoteFileNotFoundError";
 			throw err;
 		};
-		const revision = makeRevisionStore(0);
+		const revision = createRevisionStore(0);
 
 		const engine = new SyncEngine({
 			fs,
@@ -586,7 +536,7 @@ describe("SyncEngine", () => {
 		await fs.write("local.md", "mine");
 		const transport = new FakeTransport();
 		transport.simulateRemoteOp("put", "local.md", "remote-wins-if-not-pending");
-		const revision = makeRevisionStore(0);
+		const revision = createRevisionStore(0);
 
 		await enqueueOutbox(fs, OUTBOX, { op: "put", path: "local.md", ts: 1 });
 
@@ -613,7 +563,7 @@ describe("SyncEngine", () => {
 		const fs = new MemoryVaultFs();
 		await fs.write("a.md", "a");
 		const transport = new FakeTransport();
-		const revision = makeRevisionStore(0);
+		const revision = createRevisionStore(0);
 
 		await enqueueOutbox(fs, OUTBOX, { op: "put", path: "a.md", ts: 1 });
 
@@ -656,7 +606,7 @@ describe("SyncEngine", () => {
 		await fs.write("big.md", "too big");
 		await fs.write("ok.md", "fine");
 		const transport = new FakeTransport();
-		const revision = makeRevisionStore(0);
+		const revision = createRevisionStore(0);
 		const deadLetterPath = "dead-letter.jsonl";
 
 		await enqueueOutbox(fs, OUTBOX, { op: "put", path: "big.md", ts: 1 });
@@ -695,7 +645,7 @@ describe("SyncEngine", () => {
 		const fs = new MemoryVaultFs();
 		await fs.write("a.md", "local");
 		const transport = new FakeTransport();
-		const revision = makeRevisionStore(0);
+		const revision = createRevisionStore(0);
 		const engine = new SyncEngine({
 			fs,
 			transport,
@@ -730,7 +680,7 @@ describe("SyncEngine", () => {
 			suspended = true;
 			return result;
 		};
-		const revision = makeRevisionStore(0);
+		const revision = createRevisionStore(0);
 		const engine = new SyncEngine({
 			fs,
 			transport,
@@ -766,7 +716,7 @@ describe("SyncEngine", () => {
 			});
 			return download(path);
 		};
-		const revision = makeRevisionStore(0);
+		const revision = createRevisionStore(0);
 		const engine = new SyncEngine({
 			fs,
 			transport,
@@ -809,7 +759,7 @@ describe("SyncEngine", () => {
 			await writeBinary(path, data);
 		};
 		let suspended = false;
-		const revision = makeRevisionStore(0);
+		const revision = createRevisionStore(0);
 		const engine = new SyncEngine({
 			fs,
 			transport,
@@ -855,7 +805,7 @@ describe("SyncEngine", () => {
 			await remove(path);
 		};
 		let suspended = false;
-		const revision = makeRevisionStore(0);
+		const revision = createRevisionStore(0);
 		const engine = new SyncEngine({
 			fs,
 			transport,
@@ -886,7 +836,7 @@ describe("SyncEngine", () => {
 		const fs = new FlakyAppendVaultFs();
 		await fs.write("a.md", "local");
 		const transport = new FakeTransport();
-		const revision = makeRevisionStore(0);
+		const revision = createRevisionStore(0);
 		const failures: string[] = [];
 		const engine = new SyncEngine({
 			fs,
@@ -909,7 +859,7 @@ describe("SyncEngine", () => {
 	test("deleteRemote for a never-uploaded path still succeeds via transport", async () => {
 		const fs = new MemoryVaultFs();
 		const transport = new FakeTransport();
-		const revision = makeRevisionStore(0);
+		const revision = createRevisionStore(0);
 
 		await enqueueOutbox(fs, OUTBOX, {
 			op: "delete",
@@ -937,7 +887,7 @@ describe("SyncEngine", () => {
 	test("a newly enqueued delete carries the client's observed revision", async () => {
 		const fs = new MemoryVaultFs();
 		const transport = new FakeTransport();
-		const revision = makeRevisionStore(7);
+		const revision = createRevisionStore(7);
 		const engine = new SyncEngine({
 			fs,
 			transport,

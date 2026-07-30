@@ -1,8 +1,9 @@
+import type { InboxOp } from "obsidian-sync-protocol";
 import type { SyncFs } from "./fs";
 import { readLines, writeLines } from "./jsonl";
 import { mutexFor } from "./mutex";
 
-export type InboxOp = { rev: number; op: "put" | "delete"; path: string };
+export type { InboxOp } from "obsidian-sync-protocol";
 
 export async function writeInbox(
 	fs: SyncFs,

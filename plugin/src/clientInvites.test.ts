@@ -1,9 +1,10 @@
 import { describe, expect, test } from "bun:test";
+import type { RequestUrlParam, RequestUrlResponse } from "obsidian";
 import { requestClientInvite } from "./clientInvites";
 
 describe("requestClientInvite", () => {
 	test("creates an authenticated invite and returns its five-minute link", async () => {
-		let captured: Record<string, unknown> | undefined;
+		let captured: RequestUrlParam | undefined;
 		const invite = await requestClientInvite({
 			serverUrl: "https://sync.example/",
 			clientSecret: "obs_sync_secret",
@@ -11,12 +12,14 @@ describe("requestClientInvite", () => {
 				captured = options;
 				return {
 					status: 201,
+					headers: {},
+					arrayBuffer: new ArrayBuffer(0),
 					json: {
 						url: "https://sync.example/client-invites/abc",
 						expiresAt: "2030-01-01T00:05:00.000Z",
 					},
 					text: "",
-				};
+				} satisfies RequestUrlResponse;
 			},
 		});
 
@@ -37,9 +40,11 @@ describe("requestClientInvite", () => {
 				clientSecret: "do-not-print-me",
 				request: async () => ({
 					status: 401,
+					headers: {},
+					arrayBuffer: new ArrayBuffer(0),
 					json: { error: "Unauthorized" },
 					text: '{"error":"Unauthorized"}',
-				}),
+				} satisfies RequestUrlResponse),
 			});
 		} catch (caught) {
 			error = caught;

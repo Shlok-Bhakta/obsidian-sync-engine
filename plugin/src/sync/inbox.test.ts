@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { MemorySyncFs } from "./fs";
+import { createRevisionStore, MemorySyncFs } from "../test/sync";
 import {
 	appendInbox,
 	applyInbox,
@@ -9,16 +9,6 @@ import {
 } from "./inbox";
 
 const INBOX = "inbox.jsonl";
-
-function makeRevisionStore(initial = 0) {
-	let revision = initial;
-	return {
-		get: () => revision,
-		set: (rev: number) => {
-			revision = rev;
-		},
-	};
-}
 
 describe("inbox", () => {
 	test("readInbox returns empty array when file is missing", async () => {
@@ -45,7 +35,7 @@ describe("inbox", () => {
 			{ rev: 2, op: "delete", path: "b.md" },
 		]);
 
-		const revision = makeRevisionStore(0);
+		const revision = createRevisionStore(0);
 		const applied: InboxOp[] = [];
 
 		await applyInbox(fs, INBOX, {
@@ -72,7 +62,7 @@ describe("inbox", () => {
 			{ rev: 3, op: "delete", path: "c.md" },
 		]);
 
-		const revision = makeRevisionStore(0);
+		const revision = createRevisionStore(0);
 		const applied: string[] = [];
 
 		let applyError: unknown;
@@ -112,7 +102,7 @@ describe("inbox", () => {
 			{ rev: 3, op: "put", path: "c.md" },
 		]);
 
-		const revision = makeRevisionStore(0);
+		const revision = createRevisionStore(0);
 		const applied: string[] = [];
 
 		await applyInbox(fs, INBOX, {
@@ -163,7 +153,7 @@ describe("inbox", () => {
 			{ rev: 3, op: "put", path: "c.md" },
 		]);
 
-		const revision = makeRevisionStore(0);
+		const revision = createRevisionStore(0);
 		const applied: string[] = [];
 		const echoRevs = new Set([2]);
 
@@ -195,7 +185,7 @@ describe("inbox", () => {
 			{ rev: 2, op: "put", path: "b.md" },
 		]);
 
-		const revision = makeRevisionStore(1); // a.md already applied in a prior run
+		const revision = createRevisionStore(1); // a.md already applied in a prior run
 		const applied: string[] = [];
 
 		await applyInbox(fs, INBOX, {

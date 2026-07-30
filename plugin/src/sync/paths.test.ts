@@ -28,33 +28,8 @@ describe("canonicalizeSyncPath", () => {
 		expect(canonicalizeSyncPath("a/b/c.md")).toBe("a/b/c.md");
 	});
 
-	test("rejects backslashes rather than guessing path intent", () => {
+	test("wraps shared-policy failures in a client-specific error", () => {
 		expect(() => canonicalizeSyncPath("a\\b\\c.md")).toThrow(InvalidSyncPathError);
-	});
-
-	test("rejects noncanonical separators and current-directory segments", () => {
-		expect(() => canonicalizeSyncPath("a//./b/c.md")).toThrow(InvalidSyncPathError);
-	});
-
-	test("rejects a parent-directory traversal segment", () => {
-		expect(() => canonicalizeSyncPath("../a.md")).toThrow(InvalidSyncPathError);
-	});
-
-	test("rejects an absolute path", () => {
-		expect(() => canonicalizeSyncPath("/etc/passwd")).toThrow(InvalidSyncPathError);
-	});
-
-	test("rejects a windows drive-letter path", () => {
-		expect(() => canonicalizeSyncPath("C:/Windows/system32")).toThrow(InvalidSyncPathError);
-	});
-
-	test("rejects an empty path", () => {
-		expect(() => canonicalizeSyncPath("")).toThrow(InvalidSyncPathError);
-	});
-
-	test("allows Obsidian configuration paths", () => {
-		const configPath = [".", "obsidian/workspace.json"].join("");
-		expect(canonicalizeSyncPath(configPath)).toBe(configPath);
 	});
 
 	test("rejects this plugin's per-client data.json", () => {

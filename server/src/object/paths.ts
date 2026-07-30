@@ -1,3 +1,5 @@
+import { isCanonicalSyncPath } from "obsidian-sync-protocol";
+
 /**
  * Server-side canonicalization for client-supplied vault-relative paths.
  *
@@ -15,8 +17,6 @@ export class InvalidPathError extends Error {
 	}
 }
 
-import { isCanonicalSyncPath } from "obsidian-sync-protocol";
-
 /**
  * Validates and returns `path` unchanged if it is an already-normalized,
  * vault-relative path. Throws `InvalidPathError` otherwise.
@@ -31,36 +31,6 @@ export function canonicalizePath(path: string): string {
 			String(path ?? ""),
 			"path must be canonical vault content (excluding client data.json)",
 		);
-	}
-	/*
-	 * Keep the detailed checks below for useful server diagnostics. The shared
-	 * predicate above is the authoritative product boundary used by clients,
-	 * wire schemas, and the server.
-	 */
-	if (typeof path !== "string" || path.length === 0) {
-		throw new InvalidPathError(String(path ?? ""), "path must not be empty");
-	}
-	if (path.includes("\0")) {
-		throw new InvalidPathError(path, "path must not contain a NUL byte");
-	}
-	if (path.includes("\\")) {
-		throw new InvalidPathError(path, "path must not contain a backslash");
-	}
-	if (path.startsWith("/") || /^[a-zA-Z]:/.test(path)) {
-		throw new InvalidPathError(path, "path must be vault-relative, not absolute");
-	}
-	if (path.endsWith("/")) {
-		throw new InvalidPathError(path, "path must not end with a trailing slash");
-	}
-
-	const segments = path.split("/");
-	for (const segment of segments) {
-		if (segment.length === 0) {
-			throw new InvalidPathError(path, "path must not contain empty segments (e.g. \"a//b\")");
-		}
-		if (segment === "." || segment === "..") {
-			throw new InvalidPathError(path, `path must not contain a "${segment}" segment`);
-		}
 	}
 	return path;
 }

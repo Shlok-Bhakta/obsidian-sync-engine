@@ -1,8 +1,17 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { sql } from "bun";
-import { type Context, Hono } from "hono";
-import { createClient, getClientIdFromAuthorization } from "../auth/auth";
+import { Hono } from "hono";
+import {
+	createClient,
+	type ClientAuthorizer,
+	getClientIdFromAuthorization,
+	requireClientId,
+} from "../auth/auth";
 import { objectStore, type ObjectStore } from "../object/object_store";
+import {
+	clientInviteSchema,
+	type ClientInvite,
+} from "obsidian-sync-protocol";
 
 export const CLIENT_INVITE_LIFETIME_MS = 5 * 60 * 1000;
 
@@ -23,18 +32,6 @@ function noStoreHeaders(): Record<string, string> {
 		"Referrer-Policy": "no-referrer",
 		"X-Robots-Tag": "noindex, nofollow, noarchive",
 	};
-}
-
-async function requireClient(c: Context): Promise<string | Response> {
-	const authorization = c.req.header("Authorization");
-	if (!authorization) {
-		return c.json({ error: "Unauthorized" }, 401);
-	}
-	try {
-		return await getClientIdFromAuthorization(authorization);
-	} catch {
-		return c.json({ error: "Unauthorized" }, 401);
-	}
 }
 
 export async function cleanupExpiredClientInvites(
@@ -151,18 +148,20 @@ function landingPage(token: string): string {
 export function registerClientInviteRoutes(
 	app: Hono,
 	store: ObjectStore = objectStore,
+	authorize: ClientAuthorizer = getClientIdFromAuthorization,
 ) {
 	return app
 		.post("/client-invites", async (c) => {
-			const authorized = await requireClient(c);
+			const authorized = await requireClientId(c, authorize);
 			if (authorized instanceof Response) return authorized;
 			const requestUrl = new URL(c.req.url);
 			const serverUrl = requestUrl.origin;
 			const invite = await createInvite({ store, serverUrl });
-			return c.json({
+			const response: ClientInvite = clientInviteSchema.parse({
 				url: `${serverUrl}/client-invites/${invite.token}`,
 				expiresAt: invite.expiresAt.toISOString(),
-			}, 201);
+			});
+			return c.json(response, 201);
 		})
 		.get("/client-invites/:token", async (c) => {
 			const token = c.req.param("token");

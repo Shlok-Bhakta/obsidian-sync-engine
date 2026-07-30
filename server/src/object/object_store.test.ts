@@ -3,6 +3,11 @@ import { testClient } from "hono/testing";
 import { join } from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import {
+	CLIENT_DATA_PATH,
+	clientConfigSchema,
+	uploadResponseSchema,
+} from "obsidian-sync-protocol";
 import { createClientFixture, createTestApp, FileRow } from "../test/fixtures";
 import { ObjectStore, ObjectStoreUploadContent } from "./object_store";
 import { describe, it, expect } from "bun:test";
@@ -229,7 +234,7 @@ describe("object store", () => {
             headers: { Authorization: client.client_secret, "X-Obsidian-Path": "test.txt" },
             body: "Hello, world!",
         });
-        const body = await res.json() as { path: string; bytesWritten: number; revision: number };
+        const body = uploadResponseSchema.parse(await res.json());
         expect(body.path).toBe("test.txt");
         expect(body.revision).toBe(1);
     });
@@ -244,7 +249,6 @@ describe("object store", () => {
     it("stamps the current tip revision (not 0) into the client zip's data.json", async () => {
         const client = await createClientFixture({ client_name: "alice" });
         const objectStore = new ObjectStore();
-        const pluginDataPath = ".obsidian/plugins/obsidian-sync-engine/data.json";
         await objectStore.upload({ path: "note.md", content: "hello", id: client.id });
         expect(await objectStore.getTipRevision()).toBe(1);
 
@@ -254,10 +258,11 @@ describe("object store", () => {
             await objectStore.client_zip_create(zipPath);
             const extractDir = join(tmp, "extracted");
             await $`unzip -qq ${zipPath} -d ${extractDir}`;
-            const settings = await Bun.file(join(extractDir, pluginDataPath)).json() as Record<string, unknown>;
+            const rawSettings = await Bun.file(join(extractDir, CLIENT_DATA_PATH)).json();
+            const settings = clientConfigSchema.parse(rawSettings);
             expect(settings.revision).toBe(1);
             expect(settings.serverUrl).toBe("http://localhost:3000");
-            expect(settings.lastPulledRev).toBeUndefined();
+            expect((rawSettings as Record<string, unknown>).lastPulledRev).toBeUndefined();
             expect(typeof settings.clientName).toBe("string");
             expect(typeof settings.clientSecret).toBe("string");
             expect(await Bun.file(join(
@@ -286,9 +291,9 @@ describe("object store", () => {
             await objectStore.client_zip_create(zipPath);
             const extractDir = join(tmp, "extracted");
             await $`unzip -qq ${zipPath} -d ${extractDir}`;
-            const settings = await Bun.file(
-                join(extractDir, ".obsidian/plugins/obsidian-sync-engine/data.json"),
-            ).json() as Record<string, unknown>;
+            const settings = clientConfigSchema.parse(await Bun.file(
+                join(extractDir, CLIENT_DATA_PATH),
+            ).json());
             expect(settings.revision).toBe(1);
             expect(typeof settings.clientSecret).toBe("string");
         } finally {
@@ -659,7 +664,6 @@ describe("object store", () => {
     it("stamps a tip revision that includes soft-delete revisions", async () => {
         const client = await createClientFixture({ client_name: "alice" });
         const objectStore = new ObjectStore();
-        const pluginDataPath = ".obsidian/plugins/obsidian-sync-engine/data.json";
         await objectStore.upload({ path: "keep.md", content: "keep me", id: client.id });
         await objectStore.upload({ path: "gone.md", content: "delete me", id: client.id });
         const { revision: deleteRevision } = await objectStore.delete("gone.md", client.id);
@@ -670,9 +674,9 @@ describe("object store", () => {
             await objectStore.client_zip_create(zipPath);
             const extractDir = join(tmp, "extracted");
             await $`unzip -qq ${zipPath} -d ${extractDir}`;
-            const settings = await Bun.file(
-                join(extractDir, ".obsidian/plugins/obsidian-sync-engine/data.json"),
-            ).json() as Record<string, unknown>;
+            const settings = clientConfigSchema.parse(await Bun.file(
+                join(extractDir, CLIENT_DATA_PATH),
+            ).json());
             // The tip must be >= the delete's revision so a fresh client never
             // re-fetches a tombstone it already excludes from the package.
             expect(settings.revision).toBe(deleteRevision);

@@ -1,22 +1,13 @@
-import type { RequestUrlParam, RequestUrlResponse } from "obsidian";
+import type { RequestUrlResponse } from "obsidian";
 import {
-	inboxOpSchema,
-	revisionResponseSchema,
+	deleteResponseSchema,
+	deserializeInboxNdjson,
+	type InboxOp,
 	revisionSchema,
+	uploadResponseSchema,
 } from "obsidian-sync-protocol";
+import type { HttpRequestFn } from "../http";
 import { PermanentRemoteError, type SyncTransport } from "./engine";
-import type { InboxOp } from "./inbox";
-
-/**
- * Shape of Obsidian's `requestUrl`. Kept as a plain function type (rather than
- * importing the value) so this module never pulls in the real `obsidian`
- * package at runtime — only its types — which lets it run under `bun test`
- * outside the Obsidian renderer. Callers pass the real `requestUrl` in
- * production and a fake in tests.
- */
-export type HttpRequestFn = (
-	params: RequestUrlParam,
-) => Promise<RequestUrlResponse>;
 
 export type HttpTransportOptions = {
 	getServerUrl: () => string;
@@ -32,14 +23,6 @@ export class RemoteFileNotFoundError extends Error {
 		this.name = "RemoteFileNotFoundError";
 		this.path = path;
 	}
-}
-
-/** Split an NDJSON response body into parsed, schema-validated inbox lines. */
-function parseNdjson(body: string): InboxOp[] {
-	return body
-		.split("\n")
-		.filter((line) => line.trim().length > 0)
-		.map((line) => inboxOpSchema.parse(JSON.parse(line)));
 }
 
 function assertOk(response: RequestUrlResponse, action: string): void {
@@ -84,7 +67,8 @@ export class HttpTransport implements SyncTransport {
 			throw: false,
 		});
 		assertOk(response, `Upload of "${path}"`);
-		return revisionResponseSchema.parse(response.json);
+		const result = uploadResponseSchema.parse(response.json);
+		return { revision: result.revision };
 	}
 
 	async deleteRemote(
@@ -106,7 +90,8 @@ export class HttpTransport implements SyncTransport {
 			throw: false,
 		});
 		assertOk(response, `Delete of "${path}"`);
-		return revisionResponseSchema.parse(response.json);
+		const result = deleteResponseSchema.parse(response.json);
+		return { revision: result.revision };
 	}
 
 	async download(path: string): Promise<ArrayBuffer> {
@@ -132,6 +117,6 @@ export class HttpTransport implements SyncTransport {
 			throw: false,
 		});
 		assertOk(response, "Fetching inbox");
-		return parseNdjson(response.text);
+		return deserializeInboxNdjson(response.text);
 	}
 }
