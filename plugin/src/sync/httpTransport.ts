@@ -1,10 +1,9 @@
 import type { RequestUrlResponse } from "obsidian";
 import {
-	deleteResponseSchema,
 	deserializeInboxNdjson,
 	type InboxOp,
+	revisionResponseSchema,
 	revisionSchema,
-	uploadResponseSchema,
 } from "obsidian-sync-protocol";
 import type { HttpRequestFn } from "../http";
 import { PermanentRemoteError, type SyncTransport } from "./engine";
@@ -67,8 +66,7 @@ export class HttpTransport implements SyncTransport {
 			throw: false,
 		});
 		assertOk(response, `Upload of "${path}"`);
-		const result = uploadResponseSchema.parse(response.json);
-		return { revision: result.revision };
+		return revisionResponseSchema.parse(response.json);
 	}
 
 	async deleteRemote(
@@ -90,8 +88,7 @@ export class HttpTransport implements SyncTransport {
 			throw: false,
 		});
 		assertOk(response, `Delete of "${path}"`);
-		const result = deleteResponseSchema.parse(response.json);
-		return { revision: result.revision };
+		return revisionResponseSchema.parse(response.json);
 	}
 
 	async download(path: string): Promise<ArrayBuffer> {

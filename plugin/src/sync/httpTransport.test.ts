@@ -81,6 +81,16 @@ describe("HttpTransport", () => {
 		expect(result).toEqual({ revision: 4 });
 	});
 
+	test("mutation responses preserve the revision-only contract", async () => {
+		const { request } = recordingRequest(() =>
+			fakeResponse({ json: { revision: 5 } }),
+		);
+		const transport = makeTransport(request);
+
+		expect(await transport.upload("a.md", "hello")).toEqual({ revision: 5 });
+		expect(await transport.deleteRemote("a.md")).toEqual({ revision: 5 });
+	});
+
 	test("download GETs /files and returns the raw arrayBuffer", async () => {
 		const bytes = new TextEncoder().encode("file contents").buffer;
 		const { request, calls } = recordingRequest(() =>

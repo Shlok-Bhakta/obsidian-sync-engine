@@ -8,10 +8,7 @@ import {
 	requireClientId,
 } from "../auth/auth";
 import { objectStore, type ObjectStore } from "../object/object_store";
-import {
-	clientInviteSchema,
-	type ClientInvite,
-} from "obsidian-sync-protocol";
+import type { ClientInvite } from "obsidian-sync-protocol";
 
 export const CLIENT_INVITE_LIFETIME_MS = 5 * 60 * 1000;
 
@@ -157,10 +154,10 @@ export function registerClientInviteRoutes(
 			const requestUrl = new URL(c.req.url);
 			const serverUrl = requestUrl.origin;
 			const invite = await createInvite({ store, serverUrl });
-			const response: ClientInvite = clientInviteSchema.parse({
+			const response: ClientInvite = {
 				url: `${serverUrl}/client-invites/${invite.token}`,
 				expiresAt: invite.expiresAt.toISOString(),
-			});
+			};
 			return c.json(response, 201);
 		})
 		.get("/client-invites/:token", async (c) => {

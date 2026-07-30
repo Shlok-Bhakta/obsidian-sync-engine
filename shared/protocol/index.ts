@@ -147,9 +147,7 @@ export function serializeInboxNdjson(ops: readonly InboxOp[]): string {
 	if (ops.length === 0) {
 		return "";
 	}
-	return `${ops
-		.map((op) => JSON.stringify(inboxOpSchema.parse(op)))
-		.join("\n")}\n`;
+	return `${ops.map((op) => JSON.stringify(op)).join("\n")}\n`;
 }
 
 export function deserializeInboxNdjson(body: string): InboxOp[] {

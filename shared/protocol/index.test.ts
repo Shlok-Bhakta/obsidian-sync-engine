@@ -46,6 +46,17 @@ describe("HTTP contracts", () => {
 		expect(serializeInboxNdjson([])).toBe("");
 	});
 
+	test("serialization preserves existing server behavior without adding validation", () => {
+		const legacyOperation = {
+			rev: 1,
+			op: "put",
+			path: "../legacy.md",
+		} as const;
+		expect(serializeInboxNdjson([legacyOperation])).toBe(
+			`${JSON.stringify(legacyOperation)}\n`,
+		);
+	});
+
 	test("rejects malformed inbox operations", () => {
 		expect(() =>
 			deserializeInboxNdjson('{"rev":-1,"op":"put","path":"a.md"}\n'),

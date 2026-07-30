@@ -9,8 +9,8 @@ import {
 } from "../auth/auth";
 import {
 	CLIENT_DATA_PATH,
-	clientConfigSchema,
-	deleteResponseSchema,
+	type ClientConfig,
+	type DeleteResponse,
 	type InboxOp,
 	revisionSchema,
 	serializeInboxNdjson,
@@ -343,12 +343,12 @@ export class ObjectStore {
 		}
 
 		await addPluginToArchive(entries);
-		const clientConfig = clientConfigSchema.parse({
+		const clientConfig: ClientConfig = {
 			clientName: options.clientName,
 			clientSecret: options.clientSecret,
 			revision,
 			serverUrl: options.serverUrl,
-		});
+		};
 		entries[CLIENT_DATA_PATH] = new TextEncoder().encode(
 			JSON.stringify(clientConfig, null, 2),
 		);
@@ -541,10 +541,11 @@ export function registerObjectStoreRoutes(
                     clientId,
                     parsedBaseRevision.data,
                 );
-                return c.json(
-					deleteResponseSchema.parse({ path, revision: result.revision }),
-					200,
-				);
+				const response: DeleteResponse = {
+					path,
+					revision: result.revision,
+				};
+                return c.json(response, 200);
             } catch (error) {
                 if (error instanceof InvalidPathError) {
                     return c.json({ error: "Invalid path" }, 400);
