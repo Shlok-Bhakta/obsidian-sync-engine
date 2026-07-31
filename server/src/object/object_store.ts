@@ -21,12 +21,6 @@ import { serverLogger, type Logger } from "../logger";
 
 export { InvalidPathError };
 
-export const DEFAULT_OBJECT_STORE_DIR = resolve(
-    import.meta.dir,
-    "../../",
-    process.env.OBJECT_STORE_DIR ?? "object-data",
-);
-
 /**
  * Advisory-lock key shared by every upload/delete. Holding it from the
  * moment we ask Postgres for the next revision until the transaction
@@ -122,14 +116,11 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
 
 // Object store backed entirely by Postgres: file bytes live in the `files.content`
 // BYTEA column alongside their metadata, written in the same transaction so there is
-// no window where metadata and bytes can disagree (no dual-write race with disk).
+// no window where metadata and bytes can disagree.
 export class ObjectStore {
 	private readonly logger: Logger;
 
-    constructor(
-		private readonly rootDirectory = DEFAULT_OBJECT_STORE_DIR,
-		logger: Logger = serverLogger,
-	) {
+    constructor(logger: Logger = serverLogger) {
 		this.logger = logger.child("object_store");
 	}
 
@@ -296,7 +287,7 @@ export class ObjectStore {
 		return revision;
     }
 
-    /** Downloads a file's bytes. Returns null if the file doesn't exist, is soft-deleted, or has no content. */
+    /** Downloads a file's bytes. Returns null if the file doesn't exist or is soft-deleted. */
     async download(path: string): Promise<ArrayBuffer | null> {
 		const startedAt = Date.now();
         const canonicalPath = canonicalizePath(path);
@@ -321,92 +312,6 @@ export class ObjectStore {
 		return data;
     }
 
-    /**
-     * One-shot upgrade helper: for rows with NULL content, copy bytes from the
-     * legacy filesystem object store (OBJECT_STORE_DIR) if present. Safe to call
-     * repeatedly — only fills missing BYTEA values and never bumps revisions.
-     */
-    async backfillContentFromLegacyDisk(): Promise<number> {
-		const startedAt = Date.now();
-		this.logger.info("legacy_backfill.started", {
-			rootDirectory: this.rootDirectory,
-		});
-        const missing = await sql<{ file_path: string }[]>`
-            SELECT file_path FROM files
-            WHERE file_is_deleted = FALSE AND content IS NULL
-        `;
-        let filled = 0;
-        for (const { file_path } of missing) {
-			this.logger.debug("legacy_backfill.file_started", { path: file_path });
-            let diskPath: string;
-            try {
-                diskPath = resolve(this.rootDirectory, file_path);
-                if (
-                    diskPath !== resolve(this.rootDirectory) &&
-                    !diskPath.startsWith(resolve(this.rootDirectory) + "/")
-                ) {
-					this.logger.warn("legacy_backfill.file_skipped", {
-						path: file_path,
-						reason: "outside_root",
-					});
-                    continue;
-                }
-            } catch {
-				this.logger.warn("legacy_backfill.file_skipped", {
-					path: file_path,
-					reason: "invalid_path",
-				});
-                continue;
-            }
-            const file = Bun.file(diskPath);
-            if (!(await file.exists())) {
-				this.logger.warn("legacy_backfill.file_skipped", {
-					path: file_path,
-					reason: "file_missing",
-				});
-                continue;
-            }
-            const bytes = Buffer.from(await file.arrayBuffer());
-            const result = await sql`
-                UPDATE files
-                SET content = ${bytes}, updated_at = NOW()
-                WHERE file_path = ${file_path}
-                  AND file_is_deleted = FALSE
-                  AND content IS NULL
-            `;
-            if (Number(result.count ?? 0) > 0) {
-                filled++;
-				this.logger.info("legacy_backfill.file_completed", {
-					path: file_path,
-					bytes: bytes.byteLength,
-				});
-            }
-        }
-		this.logger.info("legacy_backfill.completed", {
-			missingRows: missing.length,
-			filled,
-			durationMs: Date.now() - startedAt,
-		});
-        return filled;
-    }
-
-	async assertContentComplete(): Promise<void> {
-		this.logger.debug("content_check.started");
-		const [{ count }] = await sql<{ count: string }[]>`
-			SELECT COUNT(*)::text AS count FROM files
-			WHERE file_is_deleted = FALSE AND content IS NULL
-		`;
-		if (Number(count) > 0) {
-			this.logger.error("content_check.failed", {
-				incompleteFiles: Number(count),
-			});
-			throw new Error(
-				`Object store is not ready: ${count} active file(s) have no content`,
-			);
-		}
-		this.logger.info("content_check.completed", { incompleteFiles: 0 });
-	}
-
     async createClientArchive(options: {
 		serverUrl: string;
 		clientName: string;
@@ -417,15 +322,14 @@ export class ObjectStore {
 			serverUrl: options.serverUrl,
 			clientName: options.clientName,
 		});
-		await this.assertContentComplete();
 		const entries: Record<string, Uint8Array> = {};
 
 		// Snapshot the tip before reading rows. A concurrent write can then cause
 		// at worst an extra inbox fetch, never a missing file hidden behind the tip.
 		const revision = await this.getTipRevision();
-		const files = await sql<{ file_path: string; content: Buffer | null }[]>`
+		const files = await sql<{ file_path: string; content: Buffer }[]>`
 			SELECT file_path, content FROM files
-			WHERE file_is_deleted = FALSE AND content IS NOT NULL
+			WHERE file_is_deleted = FALSE
 		`;
 		this.logger.info("client_archive.files_loaded", {
 			fileCount: files.length,
@@ -434,7 +338,7 @@ export class ObjectStore {
 		for (const file of files) {
 			if (file.file_path === CLIENT_DATA_PATH) continue;
 			const canonicalPath = canonicalizePath(file.file_path);
-			entries[canonicalPath] = new Uint8Array(file.content as Buffer);
+			entries[canonicalPath] = new Uint8Array(file.content);
 		}
 
 		await addPluginToArchive(entries);

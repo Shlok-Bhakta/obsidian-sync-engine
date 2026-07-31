@@ -56,7 +56,6 @@ jobs:
           --health-retries 20
     env:
       DATABASE_URL: postgres://postgres:postgres@localhost:5434/test_db
-      OBJECT_STORE_DIR: /tmp/ci-object-store
     steps:
       - uses: actions/checkout@v6
       - uses: oven-sh/setup-bun@v2

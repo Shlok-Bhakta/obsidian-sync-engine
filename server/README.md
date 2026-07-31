@@ -29,7 +29,6 @@ eligible to sync regardless of size.
 | --- | --- |
 | `DATABASE_URL` | Postgres connection string |
 | `PLUGIN_DIST_DIR` | Optional directory containing built `main.js`, `manifest.json`, and `styles.css` |
-| `OBJECT_STORE_DIR` | Legacy on-disk store used only to backfill NULL BYTEA rows on upgrade |
 | `PORT` / `HOST` | Listen address (default `3000` / `0.0.0.0`) |
 
 An empty server enrolls its first client automatically. Authenticated clients
@@ -41,6 +40,5 @@ and expires after five minutes.
 
 ```sh
 export DATABASE_URL=postgres://postgres:postgres@localhost:5434/test_db
-export OBJECT_STORE_DIR=/tmp/object-store
 bun test
 ```

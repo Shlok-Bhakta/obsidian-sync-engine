@@ -1,5 +1,4 @@
 import { join } from "node:path";
-import { mkdir, rm } from "node:fs/promises";
 import { waitFor } from "./wait";
 import { CONTAINER_BIN, hostGateway } from "./container";
 
@@ -14,8 +13,6 @@ export type Stack = {
 	/** URL the harness uses (localhost). */
 	serverUrlLocal: string;
 	serverPort: number;
-	objectStoreDir: string;
-	runDir: string;
 	stopServer: () => Promise<void>;
 };
 
@@ -76,7 +73,6 @@ export async function wipeTestDatabase(databaseUrl: string): Promise<void> {
 
 async function spawnServer(opts: {
 	databaseUrl: string;
-	objectStoreDir: string;
 	serverPort: number;
 }): Promise<{ stop: () => Promise<void>; localUrl: string; containerUrl: string }> {
 	const proc = Bun.spawn(["bun", "run", "src/index.ts"], {
@@ -84,7 +80,6 @@ async function spawnServer(opts: {
 		env: {
 			...process.env,
 			DATABASE_URL: opts.databaseUrl,
-			OBJECT_STORE_DIR: opts.objectStoreDir,
 			PORT: String(opts.serverPort),
 			HOST: "0.0.0.0",
 		},
@@ -135,32 +130,21 @@ export async function startStack(options: { wipe?: boolean; reuse?: Stack } = {}
 		"postgres://postgres:postgres@localhost:5434/test_db";
 	await waitPostgres(databaseUrl);
 
-	let runDir: string;
-	let objectStoreDir: string;
 	let serverPort: number;
 
 	if (options.reuse) {
-		runDir = options.reuse.runDir;
-		objectStoreDir = options.reuse.objectStoreDir;
 		serverPort = options.reuse.serverPort;
 		await options.reuse.stopServer().catch(() => undefined);
 	} else {
-		runDir = join(REPO_ROOT, "e2e", ".run", `run-${Date.now()}`);
-		await mkdir(runDir, { recursive: true });
-		objectStoreDir = join(runDir, "object-store");
-		await mkdir(objectStoreDir, { recursive: true });
 		serverPort = await freePort();
 	}
 
 	if (wipe) {
 		await wipeTestDatabase(databaseUrl);
-		await rm(objectStoreDir, { recursive: true, force: true });
-		await mkdir(objectStoreDir, { recursive: true });
 	}
 
 	const server = await spawnServer({
 		databaseUrl,
-		objectStoreDir,
 		serverPort,
 	});
 
@@ -169,8 +153,6 @@ export async function startStack(options: { wipe?: boolean; reuse?: Stack } = {}
 		serverUrl: server.containerUrl,
 		serverUrlLocal: server.localUrl,
 		serverPort,
-		objectStoreDir,
-		runDir,
 		stopServer: server.stop,
 	};
 }

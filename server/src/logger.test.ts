@@ -2,7 +2,6 @@ import { describe, expect, it } from "bun:test";
 import { Hono } from "hono";
 import { FakeLogger } from "./logger";
 import {
-	DEFAULT_OBJECT_STORE_DIR,
 	ObjectStore,
 	registerObjectStoreRoutes,
 } from "./object/object_store";
@@ -29,7 +28,7 @@ describe("FakeLogger", () => {
 		const logger = new FakeLogger();
 		const app = registerObjectStoreRoutes(
 			new Hono(),
-			new ObjectStore(DEFAULT_OBJECT_STORE_DIR, logger),
+			new ObjectStore(logger),
 			async () => "client-id",
 			logger,
 		);

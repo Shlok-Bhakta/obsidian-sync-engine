@@ -487,7 +487,7 @@ describe("object store", () => {
             await rm(tmp, { recursive: true, force: true });
         }
     });
-    it("client zip contains bytes uploaded via the HTTP API (BYTEA-only storage)", async () => {
+    it("client zip contains bytes uploaded via the HTTP API", async () => {
         const client = await createClientFixture({ client_name: "alice" });
         const app = createTestApp();
         await app.request("/files", {
@@ -496,7 +496,7 @@ describe("object store", () => {
             body: "hello from api",
         });
 
-        // Confirm bytes live only in Postgres, never touched the filesystem object store dir.
+        // Confirm the uploaded bytes are persisted in Postgres.
         const fileRows = await sql<FileRow[]>`SELECT * FROM files WHERE file_path = ${"note.md"}`;
         expect(fileRows.length).toBe(1);
         expect(fileRows[0].content).not.toBeNull();

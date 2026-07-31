@@ -17,9 +17,6 @@ startupLogger.info("server.starting", {
 });
 try {
   await bootstrapDB(serverLogger);
-  const filled = await objectStore.backfillContentFromLegacyDisk();
-  startupLogger.info("legacy_backfill.ready", { filled });
-  await objectStore.assertContentComplete();
 } catch (error) {
   startupLogger.error("server.startup_failed", { error });
   throw error;

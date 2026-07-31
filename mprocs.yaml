@@ -9,7 +9,6 @@ procs:
     shell: "cd server && bun test --watch"
     env:
       DATABASE_URL: "postgres://postgres:postgres@localhost:5434/test_db"
-      OBJECT_STORE_DIR: "test_object_store"
   db:
     shell: "./db_setup.sh"
   pluginmove:
@@ -19,4 +18,3 @@ procs:
   rainfrog:
     shell: "sleep 2 && rainfrog --url postgres://postgres:postgres@localhost:5433/dev_db"
   
-

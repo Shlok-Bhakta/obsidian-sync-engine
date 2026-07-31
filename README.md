@@ -17,13 +17,6 @@ Self-hosted sync for Obsidian vaults. The MVP transport is **HTTP polling**.
 - Permanently rejected files are **dead-lettered** so they do not block other paths
 - Paths must be vault-relative and canonical (no `..`, absolute paths, or backslashes)
 
-## Upgrading from the filesystem object store
-
-Primary file bytes now live in Postgres (`BYTEA`). On startup the server copies
-any still-missing bytes from `OBJECT_STORE_DIR` into NULL `content` rows **before
-accepting requests**. Point `OBJECT_STORE_DIR` at your previous object-data
-directory when upgrading an existing deployment, then restart once.
-
 ## Conflict / convergence policy
 
 - Local edits are written to a durable outbox **immediately**, then drained over the network
@@ -107,7 +100,6 @@ successful or interrupted download consumes the package.
 ```sh
 cd plugin && bun test src/sync
 DATABASE_URL=postgres://postgres:postgres@localhost:5434/test_db \
-  OBJECT_STORE_DIR=/tmp/object-store \
   bun test --cwd server
 ```
 

@@ -1,7 +1,4 @@
 import { sql } from "bun";
-import { rm } from "node:fs/promises";
-import { DEFAULT_OBJECT_STORE_DIR } from "../object/object_store";
-import { mkdir } from "node:fs/promises";
 
 const TEST_DB_MARKER = "test_db";
 
@@ -53,27 +50,4 @@ export async function cleanDatabase() {
 			END LOOP;
 		END $$;
 	`);
-}
-
-
-export async function cleanObjectStore() {
-	try{
-		await rm(DEFAULT_OBJECT_STORE_DIR, { recursive: true }); 
-	} catch (e) {
-		console.log("Object store directory does not exist, creating it");
-	} finally {
-		try {
-			await mkdir(DEFAULT_OBJECT_STORE_DIR, { recursive: true });
-		} catch (e) {
-			console.error("Object store directory could not be created", e);
-		}
-	}
-}
-
-export async function deleteObjectStore() {
-	try {
-		await rm(DEFAULT_OBJECT_STORE_DIR, { recursive: true });
-	} catch (e) {
-		console.log("Object store directory does not exist, skipping deletion");
-	}
 }
