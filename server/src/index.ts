@@ -6,6 +6,7 @@ import {
 	cleanupExpiredClientInvites,
 	registerClientInviteRoutes,
 } from "./invites/clientInvites";
+import { MAX_REQUEST_BODY_SIZE } from "./config";
 import { serverLogger } from "./logger";
 
 const startupLogger = serverLogger.child("startup");
@@ -95,12 +96,12 @@ inviteCleanup.unref?.();
 startupLogger.info("server.ready", {
   port: Number(process.env.PORT ?? 3000),
   hostname: process.env.HOST ?? "0.0.0.0",
-  maxRequestBodySize: 1024 * 1024 * 10,
+  maxRequestBodySize: MAX_REQUEST_BODY_SIZE,
 });
 
 export default {
   port: Number(process.env.PORT ?? 3000),
   hostname: process.env.HOST ?? "0.0.0.0",
   fetch: app.fetch,
-  maxRequestBodySize: 1024 * 1024 * 10, // 10MB
+  maxRequestBodySize: MAX_REQUEST_BODY_SIZE,
 };

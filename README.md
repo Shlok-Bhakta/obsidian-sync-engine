@@ -13,8 +13,8 @@ Self-hosted sync for Obsidian vaults. The MVP transport is **HTTP polling**.
 
 ## Limits
 
-- Max upload body: **10 MiB** (server `maxRequestBodySize`)
-- Oversized or permanently rejected files are **dead-lettered** so they do not block other paths
+- Files of any size are eligible for sync; the server imposes no practical per-file upload limit
+- Permanently rejected files are **dead-lettered** so they do not block other paths
 - Paths must be vault-relative and canonical (no `..`, absolute paths, or backslashes)
 
 ## Upgrading from the filesystem object store

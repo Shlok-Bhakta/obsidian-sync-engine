@@ -20,6 +20,9 @@ request, object-store/database operations, revisions, paths, byte counts, and
 errors as structured JSON. Server logging is always enabled; credentials and
 file contents are never logged.
 
+The server imposes no practical per-file upload limit, so all vault files are
+eligible to sync regardless of size.
+
 ## Environment
 
 | Variable | Purpose |
