@@ -15,6 +15,11 @@ export DATABASE_URL=postgres://postgres:postgres@localhost:5433/dev_db
 bun run dev
 ```
 
+The server logs startup, migrations, authentication outcomes, every HTTP
+request, object-store/database operations, revisions, paths, byte counts, and
+errors as structured JSON. Server logging is always enabled; credentials and
+file contents are never logged.
+
 ## Environment
 
 | Variable | Purpose |

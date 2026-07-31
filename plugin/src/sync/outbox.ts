@@ -1,6 +1,7 @@
 import type { SyncFs } from "./fs";
 import { readLines, writeLines } from "./jsonl";
 import { mutexFor } from "./mutex";
+import { NoopLogger, type Logger } from "../logger";
 
 export type OutboxOp = {
 	op: "put" | "delete";
@@ -36,14 +37,44 @@ export async function enqueue(
 	fs: SyncFs,
 	outboxPath: string,
 	op: OutboxOp,
+	injectedLogger: Logger = new NoopLogger(),
 ): Promise<void> {
+	const logger = injectedLogger.child("outbox");
+	logger.debug("enqueue.waiting_for_lock", {
+		outboxPath,
+		path: op.path,
+		operation: op.op,
+	});
 	return mutexFor(outboxPath).run(async () => {
+		logger.debug("enqueue.lock_acquired", {
+			outboxPath,
+			path: op.path,
+			operation: op.op,
+		});
 		await fs.append(outboxPath, JSON.stringify(op) + "\n");
+		logger.info("enqueue.appended", {
+			outboxPath,
+			path: op.path,
+			operation: op.op,
+			baseRevision: op.baseRevision,
+		});
 	});
 }
 
-export async function list(fs: SyncFs, outboxPath: string): Promise<OutboxOp[]> {
-	return coalesce(await readLines<OutboxOp>(fs, outboxPath));
+export async function list(
+	fs: SyncFs,
+	outboxPath: string,
+	injectedLogger: Logger = new NoopLogger(),
+): Promise<OutboxOp[]> {
+	const logger = injectedLogger.child("outbox");
+	const raw = await readLines<OutboxOp>(fs, outboxPath, logger);
+	const coalesced = coalesce(raw);
+	logger.debug("list.completed", {
+		outboxPath,
+		rawOperations: raw.length,
+		coalescedOperations: coalesced.length,
+	});
+	return coalesced;
 }
 
 /**
@@ -69,19 +100,49 @@ export async function drain(
 	fs: SyncFs,
 	outboxPath: string,
 	handler: (op: OutboxOp) => Promise<void>,
+	injectedLogger: Logger = new NoopLogger(),
 ): Promise<void> {
+	const logger = injectedLogger.child("outbox");
+	logger.debug("drain.snapshot_waiting_for_lock", { outboxPath });
 	const snapshot = await mutexFor(outboxPath).run(() =>
-		readLines<OutboxOp>(fs, outboxPath),
+		readLines<OutboxOp>(fs, outboxPath, logger),
 	);
+	logger.info("drain.started", {
+		outboxPath,
+		operationCount: snapshot.length,
+	});
 	for (const op of snapshot) {
+		logger.debug("drain.handler_started", {
+			path: op.path,
+			operation: op.op,
+		});
 		await handler(op);
+		logger.debug("drain.handler_completed", {
+			path: op.path,
+			operation: op.op,
+		});
 		await mutexFor(outboxPath).run(async () => {
-			const current = await readLines<OutboxOp>(fs, outboxPath);
+			const current = await readLines<OutboxOp>(fs, outboxPath, logger);
 			const index = current.findIndex((candidate) => sameOp(candidate, op));
 			if (index >= 0) {
 				current.splice(index, 1);
-				await writeLines(fs, outboxPath, current);
+				await writeLines(fs, outboxPath, current, logger);
+				logger.info("drain.acknowledged", {
+					path: op.path,
+					operation: op.op,
+					remainingOperations: current.length,
+				});
+			} else {
+				logger.warn("drain.acknowledgement_missing", {
+					path: op.path,
+					operation: op.op,
+					remainingOperations: current.length,
+				});
 			}
 		});
 	}
+	logger.info("drain.completed", {
+		outboxPath,
+		processedOperations: snapshot.length,
+	});
 }

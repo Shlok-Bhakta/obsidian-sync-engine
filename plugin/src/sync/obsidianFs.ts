@@ -12,6 +12,7 @@ import {
 	type InboundEvent,
 } from "./inboundEventSuppressor";
 import { ancestorDirs } from "./paths";
+import { NoopLogger, type Logger } from "../logger";
 
 /**
  * VaultBlobFs backed by Obsidian's `app.vault.adapter`. All reads/writes go
@@ -39,11 +40,15 @@ export class ObsidianFs implements VaultBlobFs {
 		}
 	>();
 	private readonly inboundAdapterChanges = new Map<string, number>();
+	private readonly logger: Logger;
 
 	constructor(
 		private readonly adapter: DataAdapter,
 		private readonly vault?: Vault,
-	) {}
+		logger: Logger = new NoopLogger(),
+	) {
+		this.logger = logger.child("fs");
+	}
 
 	consumeInboundEvent(
 		file: TAbstractFile,
@@ -53,6 +58,11 @@ export class ObsidianFs implements VaultBlobFs {
 		const objectEvents = this.inboundObjects.get(file);
 		if (objectEvents?.has(event)) {
 			this.inboundObjects.delete(file);
+			this.logger.debug("inbound_event.consumed", {
+				path,
+				event,
+				source: "object",
+			});
 			return true;
 		}
 		const normalized = normalizePath(path);
@@ -66,9 +76,22 @@ export class ObsidianFs implements VaultBlobFs {
 			deletion.events.has(event)
 		) {
 			this.inboundDeletions.delete(normalized);
+			this.logger.debug("inbound_event.consumed", {
+				path: normalized,
+				event,
+				source: "deletion",
+			});
 			return true;
 		}
-		return this.inboundEvents.consume(normalized, event);
+		const consumed = this.inboundEvents.consume(normalized, event);
+		if (consumed) {
+			this.logger.debug("inbound_event.consumed", {
+				path: normalized,
+				event,
+				source: "path",
+			});
+		}
+		return consumed;
 	}
 
 	consumeInboundAdapterChange(path: string): boolean {
@@ -77,6 +100,9 @@ export class ObsidianFs implements VaultBlobFs {
 		if (count === 0) return false;
 		if (count === 1) this.inboundAdapterChanges.delete(normalized);
 		else this.inboundAdapterChanges.set(normalized, count - 1);
+		this.logger.debug("inbound_adapter_change.consumed", {
+			path: normalized,
+		});
 		return true;
 	}
 
@@ -140,12 +166,22 @@ export class ObsidianFs implements VaultBlobFs {
 
 	async read(path: string): Promise<string> {
 		const normalized = normalizePath(path);
+		this.logger.debug("read.started", { path: normalized });
 		await this.recoverJournal(normalized);
-		return this.adapter.read(normalized);
+		const data = await this.adapter.read(normalized);
+		this.logger.debug("read.completed", {
+			path: normalized,
+			bytes: data.length,
+		});
+		return data;
 	}
 
 	async write(path: string, data: string): Promise<void> {
 		const normalized = normalizePath(path);
+		this.logger.debug("write.started", {
+			path: normalized,
+			bytes: data.length,
+		});
 		await this.ensureParentDir(normalized);
 		await this.recoverJournal(normalized);
 		const tmpPath = `${normalized}.tmp`;
@@ -160,13 +196,25 @@ export class ObsidianFs implements VaultBlobFs {
 		if (await this.adapter.exists(backupPath)) {
 			await this.adapter.remove(backupPath);
 		}
+		this.logger.debug("write.completed", {
+			path: normalized,
+			bytes: data.length,
+		});
 	}
 
 	async append(path: string, data: string): Promise<void> {
 		const normalized = normalizePath(path);
+		this.logger.debug("append.started", {
+			path: normalized,
+			bytes: data.length,
+		});
 		await this.ensureParentDir(normalized);
 		await this.recoverJournal(normalized);
 		await this.adapter.append(normalized, data);
+		this.logger.debug("append.completed", {
+			path: normalized,
+			bytes: data.length,
+		});
 	}
 
 	async exists(path: string): Promise<boolean> {
@@ -178,14 +226,30 @@ export class ObsidianFs implements VaultBlobFs {
 	}
 
 	async readBinary(path: string): Promise<ArrayBuffer> {
-		return this.adapter.readBinary(normalizePath(path));
+		const normalized = normalizePath(path);
+		this.logger.debug("read_binary.started", { path: normalized });
+		const data = await this.adapter.readBinary(normalized);
+		this.logger.debug("read_binary.completed", {
+			path: normalized,
+			bytes: data.byteLength,
+		});
+		return data;
 	}
 
 	async writeBinary(path: string, data: ArrayBuffer): Promise<void> {
 		const normalized = normalizePath(path);
+		this.logger.debug("write_binary.started", {
+			path: normalized,
+			bytes: data.byteLength,
+		});
 		if (!this.vault) {
 			await this.ensureParentDir(normalized);
 			await this.adapter.writeBinary(normalized, data);
+			this.logger.debug("write_binary.completed", {
+				path: normalized,
+				bytes: data.byteLength,
+				target: "adapter",
+			});
 			return;
 		}
 		let expectedObject: TAbstractFile | null = null;
@@ -196,6 +260,11 @@ export class ObsidianFs implements VaultBlobFs {
 				this.expectInboundObject(existing, "modify");
 				await this.vault.modifyBinary(existing, data);
 				this.settleInboundObject(existing);
+				this.logger.debug("write_binary.completed", {
+					path: normalized,
+					bytes: data.byteLength,
+					target: "vault_modify",
+				});
 				return;
 			}
 			if (existing instanceof TFolder) {
@@ -218,33 +287,57 @@ export class ObsidianFs implements VaultBlobFs {
 					this.cancelInboundAdapterChange(normalized);
 					throw error;
 				}
+				this.logger.debug("write_binary.completed", {
+					path: normalized,
+					bytes: data.byteLength,
+					target: "hidden_adapter",
+				});
 				return;
 			}
 			await this.ensureVaultParentDir(normalized);
 			this.expectInboundEvent(normalized, "create");
 			await this.vault.createBinary(normalized, data);
 			this.settleInboundEvent(normalized);
+			this.logger.debug("write_binary.completed", {
+				path: normalized,
+				bytes: data.byteLength,
+				target: "vault_create",
+			});
 		} catch (error) {
 			this.cancelInboundEvent(normalized);
 			if (expectedObject) this.cancelInboundObject(expectedObject);
+			this.logger.error("write_binary.failed", {
+				path: normalized,
+				error,
+			});
 			throw error;
 		}
 	}
 
 	async remove(path: string): Promise<void> {
 		const normalized = normalizePath(path);
+		this.logger.debug("remove.started", { path: normalized });
 		if (this.vault) {
 			const existing = this.vault.getAbstractFileByPath(normalized);
 			if (!existing) {
+				let removed = false;
 				if (normalized.startsWith(".") && await this.adapter.exists(normalized)) {
 					this.expectInboundAdapterChange(normalized);
 					try {
 						await this.adapter.remove(normalized);
+						removed = true;
 					} catch (error) {
 						this.cancelInboundAdapterChange(normalized);
 						throw error;
 					}
 				}
+				this.logger.debug("remove.completed", {
+					path: normalized,
+					existed: removed,
+					target: normalized.startsWith(".")
+						? "hidden_adapter"
+						: "vault",
+				});
 				return;
 			}
 			if (existing instanceof TFile) {
@@ -260,20 +353,51 @@ export class ObsidianFs implements VaultBlobFs {
 				}
 				throw error;
 			}
+			this.logger.debug("remove.completed", {
+				path: normalized,
+				existed: true,
+				target: "vault",
+			});
 			return;
 		}
 		if (await this.adapter.exists(normalized)) {
 			await this.adapter.remove(normalized);
+			this.logger.debug("remove.completed", {
+				path: normalized,
+				existed: true,
+				target: "adapter",
+			});
+		} else {
+			this.logger.debug("remove.completed", {
+				path: normalized,
+				existed: false,
+				target: "adapter",
+			});
 		}
 	}
 
 	/** Recursively lists every file path in the vault, mirroring the old main.ts `listVaultFiles`. */
 	async listAllFiles(): Promise<string[]> {
-		return this.listFilesUnder("");
+		this.logger.info("list_all_files.started");
+		const files = await this.listFilesUnder("");
+		this.logger.info("list_all_files.completed", { fileCount: files.length });
+		return files;
 	}
 
 	private async listFilesUnder(folderPath: string): Promise<string[]> {
-		const listed = await this.adapter.list(folderPath);
+		this.logger.debug("list_folder.started", { folderPath });
+		let listed: { files: string[]; folders: string[] };
+		try {
+			listed = await this.adapter.list(folderPath);
+		} catch (error) {
+			this.logger.error("list_folder.failed", { folderPath, error });
+			throw error;
+		}
+		this.logger.debug("list_folder.completed", {
+			folderPath,
+			directFiles: listed.files.length,
+			directFolders: listed.folders.length,
+		});
 		const nested = await Promise.all(
 			listed.folders.map((childFolderPath) =>
 				this.listFilesUnder(childFolderPath),

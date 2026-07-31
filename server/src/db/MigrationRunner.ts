@@ -2,6 +2,7 @@ import { sql } from "bun";
 import migration0001 from "./migrations/0001_init.sql" with { type: "file" };
 import migration0002 from "./migrations/0002_bytea_content.sql" with { type: "file" };
 import migration0003 from "./migrations/0003_client_invites.sql" with { type: "file" };
+import { serverLogger, type Logger } from "../logger";
 // import migration0004 from "./migrations/0004_yjs_compaction_index.sql" with { type: "file" };
 // import migration0005 from "./migrations/0005_blob_upload_staging.sql" with { type: "file" };
 
@@ -34,8 +35,11 @@ const migrationsManifest: Migration[] = [
 ]
 
 
-export async function bootstrapDB() {
-    await canConnect();
+export async function bootstrapDB(injectedLogger: Logger = serverLogger) {
+	const logger = injectedLogger.child("migrations");
+	const startedAt = Date.now();
+	logger.info("bootstrap.started", { migrationCount: migrationsManifest.length });
+    await canConnect(logger);
     await sql.begin(async (tx) => {
         await tx`SELECT pg_advisory_xact_lock(hashtext('obsidian-sync-migrations'))`;
         await tx`
@@ -58,26 +62,42 @@ export async function bootstrapDB() {
 		`;
         const applied = await tx<MigrationRow[]>`SELECT name FROM migrations`;
         const appliedNames = new Set(applied.map(({ name }) => name));
+		logger.info("manifest.loaded", {
+			applied: [...appliedNames],
+			pending: migrationsManifest
+				.map(({ name }) => name)
+				.filter((name) => !appliedNames.has(name)),
+		});
         for (const migration of migrationsManifest) {
             if (appliedNames.has(migration.name)) {
+				logger.debug("migration.skipped", {
+					migration: migration.name,
+					reason: "already_applied",
+				});
                 continue;
             }
+			logger.info("migration.started", { migration: migration.name });
             await tx.unsafe(await Bun.file(migration.sql).text());
             await tx`
                 INSERT INTO migrations (name, created_at)
                 VALUES (${migration.name}, NOW())
                 ON CONFLICT (name) DO NOTHING
             `;
-            console.log(`Applied migration ${migration.name}`);
+            logger.info("migration.completed", { migration: migration.name });
         }
     });
+	logger.info("bootstrap.completed", {
+		durationMs: Date.now() - startedAt,
+	});
 }
 
-async function canConnect() {
+async function canConnect(logger: Logger) {
+	logger.debug("connection_check.started");
     let result = await sql`SELECT 1;`.values();
-    // console.log(result[0][0]);
     if (result[0][0] === 1) {
+		logger.info("connection_check.completed");
     } else {
+		logger.error("connection_check.failed", { result });
         throw new Error("something somewhere is goofed up. Could not run SELECT 1; on the db");
     }
 

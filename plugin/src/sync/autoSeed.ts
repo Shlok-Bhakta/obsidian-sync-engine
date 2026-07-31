@@ -7,9 +7,21 @@
 export async function seedVaultIfRevisionZero(
 	revision: number,
 	seed: () => Promise<void>,
+	injectedLogger: Logger = new NoopLogger(),
 ): Promise<boolean> {
-	if (revision !== 0) return false;
+	const logger = injectedLogger.child("auto_seed");
+	if (revision !== 0) {
+		logger.info("decision", {
+			revision,
+			shouldSeed: false,
+			reason: "revision_not_zero",
+		});
+		return false;
+	}
 
+	logger.info("decision", { revision, shouldSeed: true });
 	await seed();
+	logger.info("callback.completed", { revision });
 	return true;
 }
+import { NoopLogger, type Logger } from "../logger";

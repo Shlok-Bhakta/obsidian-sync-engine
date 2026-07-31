@@ -1,10 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import type { RequestUrlParam, RequestUrlResponse } from "obsidian";
 import { requestClientInvite } from "./clientInvites";
+import { FakeLogger } from "./logger";
 
 describe("requestClientInvite", () => {
 	test("creates an authenticated invite and returns its five-minute link", async () => {
 		let captured: RequestUrlParam | undefined;
+		const logger = new FakeLogger();
 		const invite = await requestClientInvite({
 			serverUrl: "https://sync.example/",
 			clientSecret: "obs_sync_secret",
@@ -21,6 +23,7 @@ describe("requestClientInvite", () => {
 					text: "",
 				} satisfies RequestUrlResponse;
 			},
+			logger,
 		});
 
 		expect(captured).toMatchObject({
@@ -30,6 +33,12 @@ describe("requestClientInvite", () => {
 			throw: false,
 		});
 		expect(invite.url).toBe("https://sync.example/client-invites/abc");
+		expect(logger.entries.map(({ event }) => event)).toEqual([
+			"request.started",
+			"request.completed",
+			"response.validated",
+		]);
+		expect(JSON.stringify(logger.entries)).not.toContain("obs_sync_secret");
 	});
 
 	test("surfaces a rejected request without exposing the secret", async () => {

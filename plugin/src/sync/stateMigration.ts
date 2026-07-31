@@ -1,4 +1,5 @@
 import type { DataAdapter } from "obsidian";
+import { NoopLogger, type Logger } from "../logger";
 
 const JOURNALS = ["outbox.jsonl", "inbox.jsonl", "dead-letter.jsonl"] as const;
 
@@ -225,21 +226,37 @@ export async function migrateServerState(
 	stateRoot: string,
 	previousIdentity: string,
 	nextIdentity: string,
+	injectedLogger: Logger = new NoopLogger(),
 ): Promise<void> {
-	if (!previousIdentity || previousIdentity === nextIdentity) return;
+	const logger = injectedLogger.child("state_migration");
+	if (!previousIdentity || previousIdentity === nextIdentity) {
+		logger.debug("skipped", { reason: "identity_unchanged" });
+		return;
+	}
 	const sourceDir = `${stateRoot}/${previousIdentity}`;
-	if (!(await adapter.exists(sourceDir))) return;
+	if (!(await adapter.exists(sourceDir))) {
+		logger.debug("skipped", {
+			reason: "source_missing",
+			sourceDir,
+		});
+		return;
+	}
 	const targetDir = `${stateRoot}/${nextIdentity}`;
 	if (!(await adapter.exists(targetDir))) {
+		logger.info("directory_move_started", { sourceDir, targetDir });
 		await adapter.rename(sourceDir, targetDir);
+		logger.info("directory_move_completed", { sourceDir, targetDir });
 		return;
 	}
 	for (const journal of JOURNALS) {
+		logger.debug("journal_merge_started", { journal, sourceDir, targetDir });
 		await mergeJournal(
 			adapter,
 			`${sourceDir}/${journal}`,
 			`${targetDir}/${journal}`,
 		);
+		logger.debug("journal_merge_completed", { journal, sourceDir, targetDir });
 	}
 	await adapter.rmdir(sourceDir, true);
+	logger.info("completed", { sourceDir, targetDir });
 }

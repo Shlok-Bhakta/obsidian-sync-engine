@@ -62,6 +62,9 @@ export class SyncSettingTab extends PluginSettingTab {
 				.setPlaceholder('Main computer')
 				.setValue(this.plugin.settings.clientName)
 				.onChange(async (value) => {
+					this.plugin.logger.info("settings.client_name_changed", {
+						clientName: value,
+					});
 					this.plugin.settings.clientName = value;
 					await this.plugin.saveSettings();
 				}),
@@ -113,6 +116,9 @@ export class SyncSettingTab extends PluginSettingTab {
 				.setPlaceholder('Made by server')
 				.setValue(this.plugin.settings.clientSecret)
 				.onChange(async (value) => {
+					this.plugin.logger.warn("settings.client_secret_changed_manually", {
+						valuePresent: value.length > 0,
+					});
 					this.plugin.settings.clientSecret = value;
 					await this.plugin.saveSettings();
 				}),
@@ -130,13 +136,20 @@ export class SyncSettingTab extends PluginSettingTab {
 					try {
 						this.clientInvite = await this.plugin.createClientInvite();
 						this.display();
-						try {
-							await navigator.clipboard.writeText(this.clientInvite.url);
-							new Notice("Client link copied to clipboard");
-						} catch {
-							new Notice("Client package created. Copy its link below.");
-						}
-					} catch (error) {
+							try {
+								await navigator.clipboard.writeText(this.clientInvite.url);
+								this.plugin.logger.info("client_invite.clipboard_copy_completed");
+								new Notice("Client link copied to clipboard");
+							} catch (error) {
+								this.plugin.logger.warn("client_invite.clipboard_copy_failed", {
+									error,
+								});
+								new Notice("Client package created. Copy its link below.");
+							}
+						} catch (error) {
+							this.plugin.logger.error("client_invite.create_failed", {
+								error,
+							});
 						new Notice(
 							"Could not create client package: " +
 								(error instanceof Error ? error.message : String(error)),
@@ -160,11 +173,15 @@ export class SyncSettingTab extends PluginSettingTab {
 						.setButtonText("Copy")
 						.onClick(async () => {
 							if (!this.clientInvite) return;
-							try {
-								await navigator.clipboard.writeText(this.clientInvite.url);
-								new Notice("Client link copied to clipboard");
-							} catch {
-								new Notice("Could not copy the client link");
+								try {
+									await navigator.clipboard.writeText(this.clientInvite.url);
+									this.plugin.logger.info("client_invite.clipboard_copy_completed");
+									new Notice("Client link copied to clipboard");
+								} catch (error) {
+									this.plugin.logger.warn("client_invite.clipboard_copy_failed", {
+										error,
+									});
+									new Notice("Could not copy the client link");
 							}
 						}),
 				);
@@ -182,7 +199,13 @@ export class SyncSettingTab extends PluginSettingTab {
 	}
 
 	private async refreshClientSecret(): Promise<void> {
+		const logger = this.plugin.logger.child("settings_http");
 		try {
+			const startedAt = Date.now();
+			logger.info("client_secret_reset.started", {
+				serverUrl: this.plugin.settings.serverUrl,
+				clientName: this.plugin.settings.clientName,
+			});
 			const response = await requestUrl({
 				url: this.plugin.settings.serverUrl + '/reset-client-secret',
 				method: 'POST',
@@ -194,6 +217,10 @@ export class SyncSettingTab extends PluginSettingTab {
 				}),
 				throw: false,
 			});
+			logger.info("client_secret_reset.response", {
+				status: response.status,
+				durationMs: Date.now() - startedAt,
+			});
 			const raw = typeof response.json === 'string' ? response.json : response.text;
 			let message = deserialize(raw);
 			if(message.type === MessageType.AUTH_INIT){
@@ -201,16 +228,30 @@ export class SyncSettingTab extends PluginSettingTab {
 				// refresh setting pane
 				this.display();
 				await this.plugin.saveSettings();
+				logger.info("client_secret_reset.completed", {
+					clientName: message.client_name,
+				});
 			}else{
+				logger.warn("client_secret_reset.rejected", {
+					messageType: message.type,
+					status: response.status,
+				});
 				new Notice('Error refreshing client secret: ' + message.type);
 			}
 		} catch (error) {
+			logger.error("client_secret_reset.failed", { error });
 			new Notice('Error refreshing client secret: ' + String(error));
 		}
 	}
 
 	private async refreshClientName(newClientName: string): Promise<void> {
+		const logger = this.plugin.logger.child("settings_http");
 		try {
+			const startedAt = Date.now();
+			logger.info("client_name_reset.started", {
+				serverUrl: this.plugin.settings.serverUrl,
+				clientName: newClientName,
+			});
 			const response = await requestUrl({
 				url: this.plugin.settings.serverUrl + '/reset-client-name',
 				method: 'POST',
@@ -222,6 +263,10 @@ export class SyncSettingTab extends PluginSettingTab {
 				}),
 				throw: false,
 			});
+			logger.info("client_name_reset.response", {
+				status: response.status,
+				durationMs: Date.now() - startedAt,
+			});
 			const raw = typeof response.json === 'string' ? response.json : response.text;
 			let message = deserialize(raw);
 			if(message.type === MessageType.AUTH_INIT){
@@ -229,10 +274,18 @@ export class SyncSettingTab extends PluginSettingTab {
 				// refresh setting pane
 				this.display();
 				await this.plugin.saveSettings();
+				logger.info("client_name_reset.completed", {
+					clientName: message.client_name,
+				});
 			}else{
+				logger.warn("client_name_reset.rejected", {
+					messageType: message.type,
+					status: response.status,
+				});
 				new Notice('Error refreshing client name: ' + message.type);
 			}
 		} catch (error) {
+			logger.error("client_name_reset.failed", { error });
 			new Notice('Error refreshing client name: ' + String(error));
 		}
 	}

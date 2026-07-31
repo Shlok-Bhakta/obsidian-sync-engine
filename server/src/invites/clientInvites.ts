@@ -9,6 +9,7 @@ import {
 } from "../auth/auth";
 import { objectStore, type ObjectStore } from "../object/object_store";
 import type { ClientInvite } from "obsidian-sync-protocol";
+import { serverLogger, type Logger } from "../logger";
 
 export const CLIENT_INVITE_LIFETIME_MS = 5 * 60 * 1000;
 
@@ -33,8 +34,11 @@ function noStoreHeaders(): Record<string, string> {
 
 export async function cleanupExpiredClientInvites(
 	now = new Date(),
+	injectedLogger: Logger = serverLogger,
 ): Promise<number> {
-	return sql.begin(async (tx) => {
+	const logger = injectedLogger.child("client_invites");
+	logger.debug("cleanup.started", { now: now.toISOString() });
+	const count = await sql.begin(async (tx) => {
 		const expired = await tx<{ client_id: string }[]>`
 			DELETE FROM client_invites
 			WHERE expires_at <= ${now}
@@ -44,10 +48,20 @@ export async function cleanupExpiredClientInvites(
 			await tx`DELETE FROM clients WHERE id = ${invite.client_id}`;
 		}
 		return expired.length;
-	}) as Promise<number>;
+	}) as number;
+	if (count > 0) {
+		logger.info("cleanup.completed", { expiredInvites: count });
+	} else {
+		logger.debug("cleanup.completed", { expiredInvites: 0 });
+	}
+	return count;
 }
 
-async function inviteExists(token: string, now = new Date()): Promise<boolean> {
+async function inviteExists(
+	token: string,
+	now = new Date(),
+	logger: Logger = serverLogger,
+): Promise<boolean> {
 	const [row] = await sql<{ exists: boolean }[]>`
 		SELECT EXISTS (
 			SELECT 1 FROM client_invites
@@ -55,36 +69,51 @@ async function inviteExists(token: string, now = new Date()): Promise<boolean> {
 		) AS exists
 	`;
 	if (!row.exists) {
-		await cleanupExpiredClientInvites(now);
+		await cleanupExpiredClientInvites(now, logger);
 	}
+	logger.child("client_invites").debug("lookup.completed", {
+		exists: row.exists,
+	});
 	return row.exists;
 }
 
 async function consumeInvite(
 	token: string,
 	now = new Date(),
+	logger: Logger = serverLogger,
 ): Promise<Buffer | null> {
-	await cleanupExpiredClientInvites(now);
-	return sql.begin(async (tx) => {
+	const inviteLogger = logger.child("client_invites");
+	inviteLogger.info("consume.started");
+	await cleanupExpiredClientInvites(now, logger);
+	const archive = await sql.begin(async (tx) => {
 		const [invite] = await tx<InviteRow[]>`
 			DELETE FROM client_invites
 			WHERE token_hash = ${hashToken(token)} AND expires_at > ${now}
 			RETURNING archive, client_id
 		`;
 		return invite?.archive ?? null;
-	}) as Promise<Buffer | null>;
+	}) as Buffer | null;
+	inviteLogger.info("consume.completed", {
+		outcome: archive ? "consumed" : "unavailable",
+		bytes: archive?.byteLength,
+	});
+	return archive;
 }
 
 async function createInvite(options: {
 	store: ObjectStore;
 	serverUrl: string;
 	now?: Date;
+	logger?: Logger;
 }): Promise<{ token: string; expiresAt: Date }> {
+	const logger = (options.logger ?? serverLogger).child("client_invites");
+	const startedAt = Date.now();
 	const now = options.now ?? new Date();
-	await cleanupExpiredClientInvites(now);
+	logger.info("create.started", { serverUrl: options.serverUrl });
+	await cleanupExpiredClientInvites(now, logger);
 	const clientName = `client-${randomUUID()}`;
-	const clientSecret = await createClient(clientName);
-	const clientId = await getClientIdFromAuthorization(clientSecret);
+	const clientSecret = await createClient(clientName, logger);
+	const clientId = await getClientIdFromAuthorization(clientSecret, logger);
 	try {
 		const archive = await options.store.createClientArchive({
 			serverUrl: options.serverUrl,
@@ -101,13 +130,26 @@ async function createInvite(options: {
 			)
 		`;
 		const timer = setTimeout(() => {
-			void cleanupExpiredClientInvites().catch((error) => {
-				console.error("Could not clean up expired client invite", error);
+			void cleanupExpiredClientInvites(new Date(), logger).catch((error) => {
+				logger.error("cleanup.failed", { error });
 			});
 		}, CLIENT_INVITE_LIFETIME_MS);
 		timer.unref?.();
+		logger.info("create.completed", {
+			clientId,
+			clientName,
+			expiresAt: expiresAt.toISOString(),
+			archiveBytes: archive.byteLength,
+			durationMs: Date.now() - startedAt,
+		});
 		return { token, expiresAt };
 	} catch (error) {
+		logger.error("create.failed", {
+			clientId,
+			clientName,
+			error,
+			durationMs: Date.now() - startedAt,
+		});
 		await sql`DELETE FROM clients WHERE id = ${clientId}`.catch(() => undefined);
 		throw error;
 	}
@@ -146,25 +188,40 @@ export function registerClientInviteRoutes(
 	app: Hono,
 	store: ObjectStore = objectStore,
 	authorize: ClientAuthorizer = getClientIdFromAuthorization,
+	injectedLogger: Logger = serverLogger,
 ) {
+	const logger = injectedLogger.child("client_invite_routes");
 	return app
 		.post("/client-invites", async (c) => {
-			const authorized = await requireClientId(c, authorize);
-			if (authorized instanceof Response) return authorized;
+			const authorized = await requireClientId(c, authorize, logger);
+			if (authorized instanceof Response) {
+				logger.warn("create.rejected", { reason: "unauthorized" });
+				return authorized;
+			}
 			const requestUrl = new URL(c.req.url);
 			const serverUrl = requestUrl.origin;
-			const invite = await createInvite({ store, serverUrl });
+			logger.info("create.accepted", {
+				clientId: authorized,
+				serverUrl,
+			});
+			const invite = await createInvite({ store, serverUrl, logger });
 			const response: ClientInvite = {
 				url: `${serverUrl}/client-invites/${invite.token}`,
 				expiresAt: invite.expiresAt.toISOString(),
 			};
+			logger.info("create.completed", {
+				clientId: authorized,
+				expiresAt: response.expiresAt,
+			});
 			return c.json(response, 201);
 		})
 		.get("/client-invites/:token", async (c) => {
 			const token = c.req.param("token");
-			if (!(await inviteExists(token))) {
+			if (!(await inviteExists(token, new Date(), logger))) {
+				logger.warn("landing.unavailable");
 				return c.html("This client package has expired or was already used.", 410, noStoreHeaders());
 			}
+			logger.info("landing.served");
 			return c.html(landingPage(token), 200, {
 				...noStoreHeaders(),
 				"Content-Security-Policy":
@@ -172,14 +229,16 @@ export function registerClientInviteRoutes(
 			});
 		})
 		.post("/client-invites/:token/download", async (c) => {
-			const archive = await consumeInvite(c.req.param("token"));
+			const archive = await consumeInvite(c.req.param("token"), new Date(), logger);
 			if (!archive) {
+				logger.warn("download.unavailable");
 				return c.text("This client package has expired or was already used.", 410, noStoreHeaders());
 			}
 			const body = archive.buffer.slice(
 				archive.byteOffset,
 				archive.byteOffset + archive.byteLength,
 			) as ArrayBuffer;
+			logger.info("download.served", { bytes: archive.byteLength });
 			return new Response(body, {
 				status: 200,
 				headers: {

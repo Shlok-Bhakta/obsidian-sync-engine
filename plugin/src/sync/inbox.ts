@@ -2,6 +2,7 @@ import type { InboxOp } from "obsidian-sync-protocol";
 import type { SyncFs } from "./fs";
 import { readLines, writeLines } from "./jsonl";
 import { mutexFor } from "./mutex";
+import { NoopLogger, type Logger } from "../logger";
 
 export type { InboxOp } from "obsidian-sync-protocol";
 
@@ -9,12 +10,17 @@ export async function writeInbox(
 	fs: SyncFs,
 	path: string,
 	lines: InboxOp[],
+	logger: Logger = new NoopLogger(),
 ): Promise<void> {
-	await writeLines(fs, path, lines);
+	await writeLines(fs, path, lines, logger);
 }
 
-export async function readInbox(fs: SyncFs, path: string): Promise<InboxOp[]> {
-	return readLines<InboxOp>(fs, path);
+export async function readInbox(
+	fs: SyncFs,
+	path: string,
+	logger: Logger = new NoopLogger(),
+): Promise<InboxOp[]> {
+	return readLines<InboxOp>(fs, path, logger);
 }
 
 /**
@@ -28,13 +34,32 @@ export async function appendInbox(
 	fs: SyncFs,
 	path: string,
 	ops: InboxOp[],
+	injectedLogger: Logger = new NoopLogger(),
 ): Promise<void> {
+	const logger = injectedLogger.child("inbox");
 	if (ops.length === 0) {
+		logger.debug("append.skipped", {
+			inboxPath: path,
+			reason: "empty_batch",
+		});
 		return;
 	}
+	logger.debug("append.waiting_for_lock", {
+		inboxPath: path,
+		operationCount: ops.length,
+		firstRevision: ops[0]?.rev,
+		lastRevision: ops.at(-1)?.rev,
+	});
 	return mutexFor(path).run(async () => {
-		const existing = await readInbox(fs, path);
-		await writeInbox(fs, path, [...existing, ...ops]);
+		const existing = await readInbox(fs, path, logger);
+		await writeInbox(fs, path, [...existing, ...ops], logger);
+		logger.info("append.completed", {
+			inboxPath: path,
+			appendedOperations: ops.length,
+			totalOperations: existing.length + ops.length,
+			firstRevision: ops[0]?.rev,
+			lastRevision: ops.at(-1)?.rev,
+		});
 	});
 }
 
@@ -52,6 +77,7 @@ export type ApplyInboxOptions = {
 	shouldSkipApply?: (op: InboxOp) => boolean;
 	/** Leave this line and all later lines durable for a later tick. */
 	shouldDeferApply?: (op: InboxOp) => boolean;
+	logger?: Logger;
 };
 
 /**
@@ -76,27 +102,59 @@ export async function applyInbox(
 	inboxPath: string,
 	options: ApplyInboxOptions,
 ): Promise<void> {
+	const logger = (options.logger ?? new NoopLogger()).child("inbox");
+	logger.debug("apply.waiting_for_lock", { inboxPath });
 	return mutexFor(inboxPath).run(async () => {
-		let lines = [...(await readInbox(fs, inboxPath))].sort(
+		let lines = [...(await readInbox(fs, inboxPath, logger))].sort(
 			(a, b) => a.rev - b.rev,
 		);
 		let currentRevision = await options.getRevision();
+		logger.info("apply.started", {
+			inboxPath,
+			operationCount: lines.length,
+			currentRevision,
+		});
 
 		while (lines.length > 0) {
 			const line = lines[0]!;
+			logger.debug("apply.operation_evaluating", {
+				path: line.path,
+				operation: line.op,
+				revision: line.rev,
+				currentRevision,
+			});
 
 			if (line.rev <= currentRevision) {
 				lines = lines.slice(1);
-				await writeInbox(fs, inboxPath, lines);
+				await writeInbox(fs, inboxPath, lines, logger);
+				logger.info("apply.operation_dropped", {
+					path: line.path,
+					operation: line.op,
+					revision: line.rev,
+					reason: "already_applied",
+					remainingOperations: lines.length,
+				});
 				continue;
 			}
 
 			if (options.shouldDeferApply?.(line)) {
+				logger.info("apply.deferred", {
+					path: line.path,
+					operation: line.op,
+					revision: line.rev,
+					currentRevision,
+					remainingOperations: lines.length,
+				});
 				return;
 			}
 
 			if (options.shouldSkipApply?.(line)) {
 				// Leave the vault alone (pending local edit, or our own echo).
+				logger.info("apply.mutation_skipped", {
+					path: line.path,
+					operation: line.op,
+					revision: line.rev,
+				});
 			} else if (line.op === "put") {
 				await options.applyPut(line.path);
 			} else {
@@ -106,7 +164,17 @@ export async function applyInbox(
 			await options.setRevision(line.rev);
 			currentRevision = line.rev;
 			lines = lines.slice(1);
-			await writeInbox(fs, inboxPath, lines);
+			await writeInbox(fs, inboxPath, lines, logger);
+			logger.info("apply.operation_committed", {
+				path: line.path,
+				operation: line.op,
+				revision: line.rev,
+				remainingOperations: lines.length,
+			});
 		}
+		logger.info("apply.completed", {
+			inboxPath,
+			currentRevision,
+		});
 	});
 }

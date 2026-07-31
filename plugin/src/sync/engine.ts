@@ -8,6 +8,7 @@ import {
 	type OutboxOp,
 } from "./outbox";
 import { canonicalizeSyncPath } from "./paths";
+import { NoopLogger, type Logger } from "../logger";
 
 export type SyncTransport = {
 	upload(
@@ -44,6 +45,7 @@ export type SyncEngineOptions = {
 	onEnqueueFailure?: (error: Error, op: OutboxOp) => void;
 	/** Stops all persistence/network work while runtime configuration is stale. */
 	isSuspended?: () => boolean;
+	logger?: Logger;
 };
 
 export type PermanentSyncFailure = {
@@ -89,6 +91,7 @@ export class SyncEngine {
 	private readonly onPermanentFailure?: (failure: PermanentSyncFailure) => void;
 	private readonly onEnqueueFailure?: (error: Error, op: OutboxOp) => void;
 	private readonly isSuspended: () => boolean;
+	private readonly logger: Logger;
 
 	/**
 	 * Paths with a local change in the durable outbox (or a write in flight).
@@ -114,30 +117,57 @@ export class SyncEngine {
 			options.outboxPath.replace(/outbox\.jsonl$/, "dead-letter.jsonl");
 		this.getRevision = options.getRevision;
 		this.setRevision = options.setRevision;
-		this.debouncer = new Debouncer(options.debounceMs ?? DEFAULT_DEBOUNCE_MS);
 		this.onPermanentFailure = options.onPermanentFailure;
 		this.onEnqueueFailure = options.onEnqueueFailure;
 		this.isSuspended = options.isSuspended ?? (() => false);
+		this.logger = (options.logger ?? new NoopLogger()).child("engine");
+		this.debouncer = new Debouncer(
+			options.debounceMs ?? DEFAULT_DEBOUNCE_MS,
+			this.logger,
+		);
+		this.logger.info("created", {
+			outboxPath: this.outboxPath,
+			inboxPath: this.inboxPath,
+			deadLetterPath: this.deadLetterPath,
+			debounceMs: options.debounceMs ?? DEFAULT_DEBOUNCE_MS,
+		});
 	}
 
 	/** Load durable outbox paths into the conflict guard before the first pull. */
 	async hydrate(): Promise<void> {
-		const ops = await listOutbox(this.fs, this.outboxPath);
+		this.logger.debug("hydrate.started");
+		const ops = await listOutbox(this.fs, this.outboxPath, this.logger);
 		// Union with anything already marked pending (in-flight enqueue during startup).
 		for (const op of ops) {
 			this.pendingOutboxPaths.add(op.path);
 		}
 		this.hydrated = true;
+		this.logger.info("hydrate.completed", {
+			outboxOperations: ops.length,
+			pendingPaths: this.pendingOutboxPaths.size,
+		});
 	}
 
 	/** Enqueue a local write — durable immediately, network work debounced. */
 	enqueuePut(path: string): void {
-		void this.enqueueDurable(path, "put").catch(() => undefined);
+		void this.enqueueDurable(path, "put").catch((error) => {
+			this.logger.error("enqueue.fire_and_forget_failed", {
+				path,
+				operation: "put",
+				error,
+			});
+		});
 	}
 
 	/** Enqueue a local delete — durable immediately, network work debounced. */
 	enqueueDelete(path: string): void {
-		void this.enqueueDurable(path, "delete").catch(() => undefined);
+		void this.enqueueDurable(path, "delete").catch((error) => {
+			this.logger.error("enqueue.fire_and_forget_failed", {
+				path,
+				operation: "delete",
+				error,
+			});
+		});
 	}
 
 	/**
@@ -146,10 +176,20 @@ export class SyncEngine {
 	 */
 	async enqueueDurable(rawPath: string, op: "put" | "delete"): Promise<void> {
 		if (this.isSuspended()) {
+			this.logger.warn("enqueue.skipped", {
+				path: rawPath,
+				operation: op,
+				reason: "suspended",
+			});
 			throw new Error("Sync is suspended until Obsidian reloads");
 		}
 		const path = canonicalizeSyncPath(rawPath);
 		const baseRevision = op === "delete" ? await this.getRevision() : undefined;
+		this.logger.debug("enqueue.started", {
+			path,
+			operation: op,
+			baseRevision,
+		});
 		this.pendingOutboxPaths.add(path);
 		this.enqueueCounts.set(path, (this.enqueueCounts.get(path) ?? 0) + 1);
 		const intent: OutboxOp = {
@@ -158,7 +198,12 @@ export class SyncEngine {
 			ts: Date.now(),
 			baseRevision,
 		};
-		const persistence = enqueueOutbox(this.fs, this.outboxPath, intent).finally(async () => {
+		const persistence = enqueueOutbox(
+			this.fs,
+			this.outboxPath,
+			intent,
+			this.logger,
+		).finally(async () => {
 				const remaining = (this.enqueueCounts.get(path) ?? 1) - 1;
 				if (remaining > 0) this.enqueueCounts.set(path, remaining);
 				else this.enqueueCounts.delete(path);
@@ -169,12 +214,22 @@ export class SyncEngine {
 		try {
 			await persistence;
 			this.failedEnqueues.delete(path);
+			this.logger.info("enqueue.persisted", {
+				path,
+				operation: op,
+				pendingWrites: this.enqueueInFlight.size,
+			});
 		} catch (error) {
 			const enqueueError =
 				error instanceof Error ? error : new Error(String(error));
 			this.failedEnqueues.set(path, intent);
 			this.pendingOutboxPaths.add(path);
 			this.onEnqueueFailure?.(enqueueError, intent);
+			this.logger.error("enqueue.failed", {
+				path,
+				operation: op,
+				error: enqueueError,
+			});
 			this.scheduleNetworkTick();
 			throw enqueueError;
 		}
@@ -182,6 +237,7 @@ export class SyncEngine {
 	}
 
 	private scheduleNetworkTick(): void {
+		this.logger.debug("tick.scheduled");
 		this.debouncer.trigger("tick", () => this.tick().then(() => undefined));
 	}
 
@@ -190,6 +246,10 @@ export class SyncEngine {
 	 * Used before seed/unload so nothing sits only in memory.
 	 */
 	async flush(): Promise<void> {
+		this.logger.info("flush.started", {
+			pendingWrites: this.enqueueInFlight.size,
+			failedEnqueues: this.failedEnqueues.size,
+		});
 		await Promise.allSettled([...this.enqueueInFlight]);
 		await this.debouncer.flush();
 		if (this.tickInFlight) await this.tickInFlight;
@@ -197,10 +257,14 @@ export class SyncEngine {
 			await this.tick();
 		}
 		if (this.failedEnqueues.size > 0) {
+			this.logger.error("flush.failed", {
+				failedEnqueues: this.failedEnqueues.size,
+			});
 			throw new Error(
 				`${this.failedEnqueues.size} local operation(s) could not be persisted`,
 			);
 		}
+		this.logger.info("flush.completed");
 	}
 
 	/**
@@ -209,9 +273,14 @@ export class SyncEngine {
 	 * engine's server identity.
 	 */
 	async quiesce(): Promise<void> {
+		this.logger.info("quiesce.started", {
+			pendingWrites: this.enqueueInFlight.size,
+			tickInFlight: this.tickInFlight !== null,
+		});
 		this.debouncer.cancel("tick");
 		await Promise.allSettled([...this.enqueueInFlight]);
 		if (this.tickInFlight) await this.tickInFlight;
+		this.logger.info("quiesce.completed");
 	}
 
 	private async refreshPending(path: string): Promise<void> {
@@ -219,7 +288,11 @@ export class SyncEngine {
 			this.pendingOutboxPaths.add(path);
 			return;
 		}
-		const outboxOps = await listOutbox(this.fs, this.outboxPath);
+		const outboxOps = await listOutbox(
+			this.fs,
+			this.outboxPath,
+			this.logger,
+		);
 		if (outboxOps.some((op) => op.path === path)) {
 			this.pendingOutboxPaths.add(path);
 		} else {
@@ -229,7 +302,11 @@ export class SyncEngine {
 
 	private async rebuildPendingPaths(): Promise<void> {
 		this.pendingOutboxPaths.clear();
-		for (const op of await listOutbox(this.fs, this.outboxPath)) {
+		for (const op of await listOutbox(
+			this.fs,
+			this.outboxPath,
+			this.logger,
+		)) {
 			this.pendingOutboxPaths.add(op.path);
 		}
 		for (const path of this.enqueueCounts.keys()) {
@@ -242,8 +319,16 @@ export class SyncEngine {
 
 	private async retryFailedEnqueues(): Promise<void> {
 		for (const [path, op] of [...this.failedEnqueues]) {
-			await enqueueOutbox(this.fs, this.outboxPath, op);
+			this.logger.warn("enqueue.retrying", {
+				path,
+				operation: op.op,
+			});
+			await enqueueOutbox(this.fs, this.outboxPath, op, this.logger);
 			this.failedEnqueues.delete(path);
+			this.logger.info("enqueue.retry_succeeded", {
+				path,
+				operation: op.op,
+			});
 		}
 	}
 
@@ -253,9 +338,12 @@ export class SyncEngine {
 	): Promise<void> {
 		await this.ensureHydrated();
 		const files = await listFiles();
+		this.logger.info("seed.started", { fileCount: files.length });
 		for (const path of files) {
+			this.logger.debug("seed.file", { path });
 			await this.enqueueDurable(path, "put");
 		}
+		this.logger.info("seed.enqueued", { fileCount: files.length });
 	}
 
 	/**
@@ -264,8 +352,10 @@ export class SyncEngine {
 	 */
 	async tick(): Promise<SyncTickResult> {
 		if (this.tickInFlight) {
+			this.logger.debug("tick.joined_existing");
 			return this.tickInFlight;
 		}
+		this.logger.debug("tick.started");
 		this.tickInFlight = this.runTick().finally(() => {
 			this.tickInFlight = null;
 		});
@@ -279,18 +369,23 @@ export class SyncEngine {
 	}
 
 	private async runTick(): Promise<SyncTickResult> {
+		const startedAt = Date.now();
 		let pushed = 0;
 		let applied = 0;
 		let deadLettered = 0;
 		try {
 			if (this.isSuspended()) {
-				return {
+				const result: SyncTickResult = {
 					ok: false,
 					error: "Sync is suspended until Obsidian reloads",
 					pushed,
 					applied,
 					deadLettered,
 				};
+				this.logger.warn("tick.suspended", {
+					durationMs: Date.now() - startedAt,
+				});
+				return result;
 			}
 			await this.retryFailedEnqueues();
 			await this.ensureHydrated();
@@ -299,24 +394,56 @@ export class SyncEngine {
 				pushed += drainResult.pushed;
 				deadLettered += drainResult.deadLettered;
 				await Promise.all([...this.enqueueInFlight]);
-				if ((await listOutbox(this.fs, this.outboxPath)).length === 0) {
+				if (
+					(await listOutbox(
+						this.fs,
+						this.outboxPath,
+						this.logger,
+					)).length === 0
+				) {
 					break;
 				}
 			}
 			await this.rebuildPendingPaths();
 			applied = await this.applyRemoteInbox();
 			if (deadLettered > 0) {
-				return {
+				const result: SyncTickResult = {
 					ok: false,
 					error: `${deadLettered} operation(s) require attention`,
 					pushed,
 					applied,
 					deadLettered,
 				};
+				this.logger.warn("tick.completed_with_dead_letters", {
+					pushed,
+					applied,
+					deadLettered,
+					durationMs: Date.now() - startedAt,
+				});
+				return result;
 			}
-			return { ok: true, pushed, applied, deadLettered };
+			const result: SyncTickResult = {
+				ok: true,
+				pushed,
+				applied,
+				deadLettered,
+			};
+			this.logger.info("tick.completed", {
+				pushed,
+				applied,
+				deadLettered,
+				durationMs: Date.now() - startedAt,
+			});
+			return result;
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
+			this.logger.error("tick.failed", {
+				error,
+				pushed,
+				applied,
+				deadLettered,
+				durationMs: Date.now() - startedAt,
+			});
 			return { ok: false, error: message, pushed, applied, deadLettered };
 		}
 	}
@@ -326,13 +453,23 @@ export class SyncEngine {
 		deadLettered: number;
 	}> {
 		await Promise.all([...this.enqueueInFlight]);
+		this.logger.debug("outbox.drain_started");
 		const processedPaths = new Set<string>();
 		let pushed = 0;
 		let deadLettered = 0;
 
 		await drainOutbox(this.fs, this.outboxPath, async (op) => {
+			this.logger.debug("outbox.operation_started", {
+				path: op.path,
+				operation: op.op,
+				baseRevision: op.baseRevision,
+			});
 			if (op.op === "put" && !(await this.fs.exists(op.path))) {
 				processedPaths.add(op.path);
+				this.logger.warn("outbox.put_skipped", {
+					path: op.path,
+					reason: "local_file_missing",
+				});
 				return;
 			}
 
@@ -344,20 +481,35 @@ export class SyncEngine {
 				}
 				processedPaths.add(op.path);
 				pushed++;
+				this.logger.info("outbox.operation_pushed", {
+					path: op.path,
+					operation: op.op,
+				});
 			} catch (error) {
 				if (this.isPermanentFailure(error)) {
 					await this.deadLetter(op, error);
 					deadLettered++;
 					processedPaths.add(op.path);
+					this.logger.error("outbox.operation_dead_lettered", {
+						path: op.path,
+						operation: op.op,
+						error,
+					});
 					return;
 				}
+				this.logger.error("outbox.operation_failed", {
+					path: op.path,
+					operation: op.op,
+					error,
+				});
 				throw error;
 			}
-		});
+		}, this.logger);
 
 		for (const path of processedPaths) {
 			await this.refreshPending(path);
 		}
+		this.logger.debug("outbox.drain_completed", { pushed, deadLettered });
 		return { pushed, deadLettered };
 	}
 
@@ -394,7 +546,17 @@ export class SyncEngine {
 		this.assertActive();
 		const body = await this.fs.readBinary(path);
 		this.assertActive();
-		return this.transport.upload(path, body);
+		this.logger.debug("put.uploading", {
+			path,
+			bytes: body.byteLength,
+		});
+		const result = await this.transport.upload(path, body);
+		this.logger.info("put.uploaded", {
+			path,
+			bytes: body.byteLength,
+			revision: result.revision,
+		});
+		return result;
 	}
 
 	private async pushDelete(
@@ -402,37 +564,62 @@ export class SyncEngine {
 		baseRevision?: number,
 	): Promise<{ revision: number }> {
 		this.assertActive();
-		return this.transport.deleteRemote(path, baseRevision);
+		this.logger.debug("delete.uploading", { path, baseRevision });
+		const result = await this.transport.deleteRemote(path, baseRevision);
+		this.logger.info("delete.uploaded", {
+			path,
+			baseRevision,
+			revision: result.revision,
+		});
+		return result;
 	}
 
 	private async applyRemoteInbox(): Promise<number> {
 		this.assertActive();
 		const rev = await this.getRevision();
+		this.logger.debug("inbox.fetching", { revision: rev });
 		const ops = await this.transport.fetchInbox(rev);
+		this.logger.info("inbox.fetched", {
+			revision: rev,
+			operationCount: ops.length,
+		});
 		this.assertActive();
-		await appendInbox(this.fs, this.inboxPath, ops);
+		await appendInbox(this.fs, this.inboxPath, ops, this.logger);
 
 		let applied = 0;
 		await applyInbox(this.fs, this.inboxPath, {
 			applyPut: async (path) => {
 				this.assertActive();
+				this.logger.debug("inbox.put_applying", { path });
 				await this.applyRemotePut(path);
 				applied++;
+				this.logger.info("inbox.put_applied", { path });
 			},
 			applyDelete: async (path) => {
 				this.assertActive();
+				this.logger.debug("inbox.delete_applying", { path });
 				await this.applyRemoteDelete(path);
 				applied++;
+				this.logger.info("inbox.delete_applied", { path });
 			},
 			getRevision: () => this.getRevision(),
 			setRevision: (newRev) => {
 				this.assertActive();
 				return this.setRevision(newRev);
 			},
-			shouldDeferApply: (op) =>
-				[...this.pendingOutboxPaths].some((path) =>
+			shouldDeferApply: (op) => {
+				const deferred = [...this.pendingOutboxPaths].some((path) =>
 					pathsStructurallyConflict(path, op.path),
-				),
+				);
+				if (deferred) {
+					this.logger.debug("inbox.operation_deferred", {
+						path: op.path,
+						operation: op.op,
+					});
+				}
+				return deferred;
+			},
+			logger: this.logger,
 		});
 		return applied;
 	}
@@ -456,6 +643,10 @@ export class SyncEngine {
 				(error.name === "RemoteFileNotFoundError" ||
 					/\b404\b/.test(error.message))
 			) {
+				this.logger.warn("inbox.put_skipped", {
+					path,
+					reason: "remote_file_missing",
+				});
 				return;
 			}
 			throw error;

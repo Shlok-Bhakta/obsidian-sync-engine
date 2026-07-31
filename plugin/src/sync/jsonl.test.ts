@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { FakeLogger } from "../logger";
 import { MemorySyncFs } from "../test/sync";
 import { readLines, writeLines } from "./jsonl";
 
@@ -31,8 +32,9 @@ describe("jsonl", () => {
 
 	test("readLines quarantines a corrupt final line and keeps valid lines", async () => {
 		const fs = new MemorySyncFs();
+		const logger = new FakeLogger();
 		await fs.write("log.jsonl", '{"a":1}\n{"a":2}\n{"a":');
-		const lines = await readLines<{ a: number }>(fs, "log.jsonl");
+		const lines = await readLines<{ a: number }>(fs, "log.jsonl", logger);
 		expect(lines).toEqual([{ a: 1 }, { a: 2 }]);
 		expect(await fs.exists("log.jsonl.corrupt")).toBe(true);
 		expect(await fs.read("log.jsonl.corrupt")).toContain('{"a":');
@@ -40,6 +42,12 @@ describe("jsonl", () => {
 			{ a: 1 },
 			{ a: 2 },
 		]);
+		const corruption = logger.entries.find(
+			({ event }) => event === "read.corrupt_tail",
+		);
+		expect(corruption?.level).toBe("warn");
+		expect(corruption?.fields?.path).toBe("log.jsonl");
+		expect(corruption?.fields?.parsedLines).toBe(2);
 	});
 
 	test("readLines refuses to skip a corrupt middle line", async () => {

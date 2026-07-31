@@ -21,6 +21,7 @@ export default tseslint.config(
 		languageOptions: {
 			globals: {
 				...globals.browser,
+				__CLIENT_LOGGING_ENABLED__: 'readonly',
 			},
 			parserOptions: {
 				projectService: {

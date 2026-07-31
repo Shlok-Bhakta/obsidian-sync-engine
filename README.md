@@ -58,6 +58,27 @@ bun run dev
 cd plugin && npm ci && npm run build
 ```
 
+For a one-shot development build with inline source maps and client logging
+enabled, run:
+
+```sh
+cd plugin && npm run build:dev
+```
+
+Open **View → Toggle developer tools** in Obsidian to see logs prefixed with
+`[obsidian-sync:client]`. Production client builds inject a no-op logger. The
+server always emits structured JSON logs to stdout/stderr; logs include sync
+paths and operational metadata but omit credentials and file contents.
+
+For a vault seed, the useful client event sequence is:
+`auto_seed.decision` → `vault_scan.completed` / `vault_scan.file_included` →
+`seed.file` → `outbox:enqueue.appended` → `outbox.operation_pushed` →
+`http.request.completed` → `tick.completed`. The server side then records
+`upload.accepted` → `object_store:upload.started` →
+`object_store:upload.completed`, including the committed database revision.
+Skipped, deferred, rejected, corrupt, and retry paths emit an explicit
+`reason` field.
+
 Copy `main.js`, `manifest.json` (and `styles.css` if present) into
 `<Vault>/.obsidian/plugins/obsidian-sync-engine/`.
 

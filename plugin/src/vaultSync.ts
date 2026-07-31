@@ -71,6 +71,7 @@ function registerConfigAdapterSync(
 	fs: ObsidianFs,
 	engine: SyncEngine,
 ): void {
+	const logger = plugin.logger.child("config_events");
 	const adapter: DataAdapter = plugin.app.vault.adapter;
 	const configDir = normalizePath(plugin.app.vault.configDir);
 	const isConfigPath = (path: string) => {
@@ -82,24 +83,56 @@ function registerConfigAdapterSync(
 	};
 	const enqueuePut = (path: string) => {
 		const normalized = normalizePath(path);
-		if (
-			!isConfigPath(normalized) ||
-			fs.consumeInboundAdapterChange(normalized) ||
-			isSyncEngineOwnedPath(plugin, normalized)
-		) {
+		if (!isConfigPath(normalized)) {
 			return;
 		}
+		if (fs.consumeInboundAdapterChange(normalized)) {
+			logger.debug("change.skipped", {
+				path: normalized,
+				operation: "put",
+				reason: "inbound_change",
+			});
+			return;
+		}
+		if (isSyncEngineOwnedPath(plugin, normalized)) {
+			logger.debug("change.skipped", {
+				path: normalized,
+				operation: "put",
+				reason: "sync_owned_path",
+			});
+			return;
+		}
+		logger.info("change.enqueued", {
+			path: normalized,
+			operation: "put",
+		});
 		engine.enqueuePut(normalized);
 	};
 	const enqueueDelete = (path: string) => {
 		const normalized = normalizePath(path);
-		if (
-			!isConfigPath(normalized) ||
-			fs.consumeInboundAdapterChange(normalized) ||
-			isSyncEngineOwnedPath(plugin, normalized)
-		) {
+		if (!isConfigPath(normalized)) {
 			return;
 		}
+		if (fs.consumeInboundAdapterChange(normalized)) {
+			logger.debug("change.skipped", {
+				path: normalized,
+				operation: "delete",
+				reason: "inbound_change",
+			});
+			return;
+		}
+		if (isSyncEngineOwnedPath(plugin, normalized)) {
+			logger.debug("change.skipped", {
+				path: normalized,
+				operation: "delete",
+				reason: "sync_owned_path",
+			});
+			return;
+		}
+		logger.info("change.enqueued", {
+			path: normalized,
+			operation: "delete",
+		});
 		engine.enqueueDelete(normalized);
 	};
 
@@ -185,9 +218,11 @@ function registerConfigAdapterSync(
  * Called once from `onload`.
  */
 export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
+	const logger = plugin.logger.child("vault_sync");
 	const fs = new ObsidianFs(
 		plugin.app.vault.adapter,
 		plugin.app.vault,
+		logger,
 	);
 	const outboxPath = getOutboxPath(plugin);
 	const inboxPath = getInboxPath(plugin);
@@ -195,6 +230,13 @@ export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
 	const status: SyncStatus = { lastTickAt: null, lastError: null };
 	const runtimeIdentity = plugin.settings.serverIdentity;
 	const runtimeServerUrl = plugin.settings.serverUrl;
+	logger.info("registering", {
+		serverUrl: runtimeServerUrl,
+		serverIdentity: runtimeIdentity,
+		outboxPath,
+		inboxPath,
+		deadLetterPath,
+	});
 	const assertRuntimeIdentity = () => {
 		if (
 			plugin.isSyncSuspended() ||
@@ -209,11 +251,12 @@ export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
 			assertRuntimeIdentity();
 			return runtimeServerUrl;
 		},
-		getAuthorization: () => {
-			assertRuntimeIdentity();
-			return plugin.settings.clientSecret;
-		},
+			getAuthorization: () => {
+				assertRuntimeIdentity();
+				return plugin.settings.clientSecret;
+			},
 		request: requestUrl,
+		logger,
 	});
 
 	const engine = new SyncEngine({
@@ -234,13 +277,24 @@ export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
 		debounceMs: DEBOUNCE_MS,
 		onPermanentFailure: ({ op, error }) => {
 			status.lastError = `${op.path}: ${error}`;
+			logger.error("permanent_failure", {
+				path: op.path,
+				operation: op.op,
+				error,
+			});
 		},
 		onEnqueueFailure: (error, op) => {
 			status.lastError = `Could not persist ${op.path}: ${error.message}`;
+			logger.error("enqueue_failure", {
+				path: op.path,
+				operation: op.op,
+				error,
+			});
 		},
 		isSuspended: () =>
 			plugin.isSyncSuspended() ||
 			plugin.settings.serverIdentity !== runtimeIdentity,
+		logger,
 	});
 	registerConfigAdapterSync(plugin, fs, engine);
 
@@ -252,16 +306,44 @@ export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
 		file: TAbstractFile,
 		path: string,
 		event: "create" | "modify" | "delete" | "rename-delete",
-	) =>
-		!plugin.isSyncSuspended() &&
-		!fs.consumeInboundEvent(file, path, event) &&
-		!isSyncEngineOwnedPath(plugin, path);
+	) => {
+		if (plugin.isSyncSuspended()) {
+			logger.debug("vault_event.skipped", {
+				path,
+				event,
+				reason: "suspended",
+			});
+			return false;
+		}
+		if (fs.consumeInboundEvent(file, path, event)) {
+			logger.debug("vault_event.skipped", {
+				path,
+				event,
+				reason: "inbound_change",
+			});
+			return false;
+		}
+		if (isSyncEngineOwnedPath(plugin, path)) {
+			logger.debug("vault_event.skipped", {
+				path,
+				event,
+				reason: "sync_owned_path",
+			});
+			return false;
+		}
+		return true;
+	};
 
 	const enqueuePutIfLocal = (
 		file: TAbstractFile,
 		event: "create" | "modify",
 	) => {
 		if (isLocallyOriginated(file, file.path, event)) {
+			logger.info("vault_event.enqueued", {
+				path: file.path,
+				event,
+				operation: "put",
+			});
 			engine.enqueuePut(file.path);
 		}
 	};
@@ -270,7 +352,14 @@ export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
 		path: string,
 		event: "delete" | "rename-delete",
 	) => {
-		if (fs.consumeInboundEvent(file, path, event)) return;
+		if (fs.consumeInboundEvent(file, path, event)) {
+			logger.debug("vault_event.skipped", {
+				path,
+				event,
+				reason: "inbound_change",
+			});
+			return;
+		}
 		const current = plugin.app.vault.getAbstractFileByPath(path);
 		if (
 			file instanceof TFile &&
@@ -281,13 +370,31 @@ export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
 			// replacement already exists at the same path. The replacement is
 			// the desired final state; emitting this stale tombstone would
 			// erase it on every client.
+			logger.warn("vault_event.skipped", {
+				path,
+				event,
+				reason: "stale_delete",
+			});
 			return;
 		}
 		if (
 			!plugin.isSyncSuspended() &&
 			!isSyncEngineOwnedPath(plugin, path)
 		) {
+			logger.info("vault_event.enqueued", {
+				path,
+				event,
+				operation: "delete",
+			});
 			engine.enqueueDelete(path);
+		} else {
+			logger.debug("vault_event.skipped", {
+				path,
+				event,
+				reason: plugin.isSyncSuspended()
+					? "suspended"
+					: "sync_owned_path",
+			});
 		}
 	};
 
@@ -306,7 +413,13 @@ export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
 		acceptVaultEvents = false;
 	});
 	plugin.app.workspace.onLayoutReady(() => {
-		if (!acceptVaultEvents) return;
+		if (!acceptVaultEvents) {
+			logger.debug("vault_events.not_registered", {
+				reason: "plugin_unloaded",
+			});
+			return;
+		}
+		logger.info("vault_events.registered");
 		plugin.registerEvent(
 			plugin.app.vault.on('modify', (file: TAbstractFile) => {
 				if (file instanceof TFile) {
@@ -340,13 +453,15 @@ export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
 		);
 	});
 
-	void engine.hydrate();
+	void engine.hydrate().catch((error) => {
+		logger.error("hydrate.failed", { error });
+	});
 
 	plugin.register(() => {
 		void engine.flush().catch((error) => {
 			status.lastError =
 				error instanceof Error ? error.message : String(error);
-			console.error("Could not flush sync state during unload", error);
+			logger.error("unload_flush.failed", { error });
 		});
 	});
 
@@ -361,6 +476,13 @@ export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
 				} else {
 					status.lastError = result.error;
 				}
+				logger.debug("interval_tick.status_updated", {
+					ok: result.ok,
+					pushed: result.pushed,
+					applied: result.applied,
+					deadLettered: result.deadLettered,
+					lastError: status.lastError,
+				});
 			});
 		}, TICK_INTERVAL_MS),
 	);
@@ -373,10 +495,40 @@ export async function seedServerFromVault(
 	plugin: ObsidianSyncPlugin,
 	sync: VaultSync,
 ): Promise<SyncTickResult> {
-	const files = (await sync.fs.listAllFiles()).filter(
+	const logger = plugin.logger.child("seed");
+	logger.info("vault_scan.started");
+	const allFiles = await sync.fs.listAllFiles();
+	const files = allFiles.filter(
 		(path) => !isSyncEngineOwnedPath(plugin, path),
 	);
+	const includedPaths = new Set(files);
+	logger.info("vault_scan.completed", {
+		discoveredFiles: allFiles.length,
+		includedFiles: files.length,
+		excludedFiles: allFiles.length - files.length,
+	});
+	for (const path of files) {
+		logger.debug("vault_scan.file_included", { path });
+	}
+	for (const path of allFiles) {
+		if (!includedPaths.has(path)) {
+			logger.debug("vault_scan.file_excluded", {
+				path,
+				reason: "sync_owned_path",
+			});
+		}
+	}
 	await sync.engine.seedFromVault(() => files);
+	logger.info("flush.started", { fileCount: files.length });
 	await sync.engine.flush();
-	return sync.engine.tick();
+	logger.info("final_tick.started", { fileCount: files.length });
+	const result = await sync.engine.tick();
+	logger.info("final_tick.completed", {
+		ok: result.ok,
+		pushed: result.pushed,
+		applied: result.applied,
+		deadLettered: result.deadLettered,
+		...(result.ok ? {} : { error: result.error }),
+	});
+	return result;
 }

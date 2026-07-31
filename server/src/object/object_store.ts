@@ -17,6 +17,7 @@ import {
 	type UploadResponse,
 } from "obsidian-sync-protocol";
 import { canonicalizePath, InvalidPathError } from "./paths";
+import { serverLogger, type Logger } from "../logger";
 
 export { InvalidPathError };
 
@@ -123,15 +124,28 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
 // BYTEA column alongside their metadata, written in the same transaction so there is
 // no window where metadata and bytes can disagree (no dual-write race with disk).
 export class ObjectStore {
-    constructor(private readonly rootDirectory = DEFAULT_OBJECT_STORE_DIR) {}
+	private readonly logger: Logger;
+
+    constructor(
+		private readonly rootDirectory = DEFAULT_OBJECT_STORE_DIR,
+		logger: Logger = serverLogger,
+	) {
+		this.logger = logger.child("object_store");
+	}
 
     /**
      * All store methods take already-decoded paths. Callers (routes) are responsible for
      * decoding: query params are decoded once by the URL parser already, headers are not.
      */
     async upload(content: ObjectStoreUploadContent): Promise<ObjectStoreUploadResult> {
+		const startedAt = Date.now();
         const path = canonicalizePath(content.path);
         const buffer = await toBuffer(content.content);
+		this.logger.info("upload.started", {
+			path,
+			bytes: buffer.byteLength,
+			clientId: content.id,
+		});
 
         const [row] = (await sql.begin(async (tx) => {
             await tx`SELECT pg_advisory_xact_lock(hashtext(${REVISION_LOCK_KEY}))`;
@@ -143,6 +157,12 @@ export class ObjectStore {
 					OR position(${path + "/"} in file_path) = 1
 				  )
 			`;
+			if (conflicts.length > 0) {
+				this.logger.warn("upload.structural_conflicts", {
+					path,
+					conflictPaths: conflicts.map(({ file_path }) => file_path),
+				});
+			}
 			for (const conflict of conflicts) {
 				await tx`
 					UPDATE files
@@ -164,11 +184,17 @@ export class ObjectStore {
             `;
         })) as FileContentRow[];
 
-        return {
+        const result = {
             path,
             bytesWritten: buffer.byteLength,
             revision: Number(row.last_updated_revision),
         };
+		this.logger.info("upload.completed", {
+			...result,
+			clientId: content.id,
+			durationMs: Date.now() - startedAt,
+		});
+		return result;
     }
 
     /** Soft-deletes a file. Idempotent: unknown paths get a tombstone revision. */
@@ -177,7 +203,13 @@ export class ObjectStore {
         authorId: string,
         baseRevision?: number,
     ): Promise<{ revision: number }> {
+		const startedAt = Date.now();
         const canonicalPath = canonicalizePath(path);
+		this.logger.info("delete.started", {
+			path: canonicalPath,
+			clientId: authorId,
+			baseRevision,
+		});
 
         const [row] = (await sql.begin(async (tx) => {
             await tx`SELECT pg_advisory_xact_lock(hashtext(${REVISION_LOCK_KEY}))`;
@@ -242,28 +274,51 @@ export class ObjectStore {
                 RETURNING last_updated_revision
             `;
         })) as FileContentRow[];
-        return { revision: Number(row.last_updated_revision) };
+        const revision = Number(row.last_updated_revision);
+		this.logger.info("delete.completed", {
+			path: canonicalPath,
+			clientId: authorId,
+			baseRevision,
+			revision,
+			durationMs: Date.now() - startedAt,
+		});
+		return { revision };
     }
 
     /** Current global tip revision: highest revision stamped on any file (including deletes), or 0 if none exist. */
     async getTipRevision(): Promise<number> {
+		this.logger.debug("tip_revision.query_started");
         const [row] = await sql<{ tip: string | null }[]>`
             SELECT MAX(last_updated_revision) AS tip FROM files
         `;
-        return row?.tip ? Number(row.tip) : 0;
+        const revision = row?.tip ? Number(row.tip) : 0;
+		this.logger.debug("tip_revision.query_completed", { revision });
+		return revision;
     }
 
     /** Downloads a file's bytes. Returns null if the file doesn't exist, is soft-deleted, or has no content. */
     async download(path: string): Promise<ArrayBuffer | null> {
+		const startedAt = Date.now();
         const canonicalPath = canonicalizePath(path);
+		this.logger.debug("download.started", { path: canonicalPath });
 
         const [row] = await sql<{ file_is_deleted: boolean; content: Buffer | null }[]>`
             SELECT file_is_deleted, content FROM files WHERE file_path = ${canonicalPath}
         `;
         if (!row || row.file_is_deleted || row.content === null) {
+			this.logger.warn("download.not_found", {
+				path: canonicalPath,
+				durationMs: Date.now() - startedAt,
+			});
             return null;
         }
-        return toArrayBuffer(row.content);
+        const data = toArrayBuffer(row.content);
+		this.logger.info("download.completed", {
+			path: canonicalPath,
+			bytes: data.byteLength,
+			durationMs: Date.now() - startedAt,
+		});
+		return data;
     }
 
     /**
@@ -272,12 +327,17 @@ export class ObjectStore {
      * repeatedly — only fills missing BYTEA values and never bumps revisions.
      */
     async backfillContentFromLegacyDisk(): Promise<number> {
+		const startedAt = Date.now();
+		this.logger.info("legacy_backfill.started", {
+			rootDirectory: this.rootDirectory,
+		});
         const missing = await sql<{ file_path: string }[]>`
             SELECT file_path FROM files
             WHERE file_is_deleted = FALSE AND content IS NULL
         `;
         let filled = 0;
         for (const { file_path } of missing) {
+			this.logger.debug("legacy_backfill.file_started", { path: file_path });
             let diskPath: string;
             try {
                 diskPath = resolve(this.rootDirectory, file_path);
@@ -285,13 +345,25 @@ export class ObjectStore {
                     diskPath !== resolve(this.rootDirectory) &&
                     !diskPath.startsWith(resolve(this.rootDirectory) + "/")
                 ) {
+					this.logger.warn("legacy_backfill.file_skipped", {
+						path: file_path,
+						reason: "outside_root",
+					});
                     continue;
                 }
             } catch {
+				this.logger.warn("legacy_backfill.file_skipped", {
+					path: file_path,
+					reason: "invalid_path",
+				});
                 continue;
             }
             const file = Bun.file(diskPath);
             if (!(await file.exists())) {
+				this.logger.warn("legacy_backfill.file_skipped", {
+					path: file_path,
+					reason: "file_missing",
+				});
                 continue;
             }
             const bytes = Buffer.from(await file.arrayBuffer());
@@ -304,21 +376,35 @@ export class ObjectStore {
             `;
             if (Number(result.count ?? 0) > 0) {
                 filled++;
+				this.logger.info("legacy_backfill.file_completed", {
+					path: file_path,
+					bytes: bytes.byteLength,
+				});
             }
         }
+		this.logger.info("legacy_backfill.completed", {
+			missingRows: missing.length,
+			filled,
+			durationMs: Date.now() - startedAt,
+		});
         return filled;
     }
 
 	async assertContentComplete(): Promise<void> {
+		this.logger.debug("content_check.started");
 		const [{ count }] = await sql<{ count: string }[]>`
 			SELECT COUNT(*)::text AS count FROM files
 			WHERE file_is_deleted = FALSE AND content IS NULL
 		`;
 		if (Number(count) > 0) {
+			this.logger.error("content_check.failed", {
+				incompleteFiles: Number(count),
+			});
 			throw new Error(
 				`Object store is not ready: ${count} active file(s) have no content`,
 			);
 		}
+		this.logger.info("content_check.completed", { incompleteFiles: 0 });
 	}
 
     async createClientArchive(options: {
@@ -326,6 +412,11 @@ export class ObjectStore {
 		clientName: string;
 		clientSecret: string;
 	}): Promise<Uint8Array> {
+		const startedAt = Date.now();
+		this.logger.info("client_archive.started", {
+			serverUrl: options.serverUrl,
+			clientName: options.clientName,
+		});
 		await this.assertContentComplete();
 		const entries: Record<string, Uint8Array> = {};
 
@@ -336,6 +427,10 @@ export class ObjectStore {
 			SELECT file_path, content FROM files
 			WHERE file_is_deleted = FALSE AND content IS NOT NULL
 		`;
+		this.logger.info("client_archive.files_loaded", {
+			fileCount: files.length,
+			revision,
+		});
 		for (const file of files) {
 			if (file.file_path === CLIENT_DATA_PATH) continue;
 			const canonicalPath = canonicalizePath(file.file_path);
@@ -352,13 +447,21 @@ export class ObjectStore {
 		entries[CLIENT_DATA_PATH] = new TextEncoder().encode(
 			JSON.stringify(clientConfig, null, 2),
 		);
-		return zipSync(entries, { level: 6 });
+		const archive = zipSync(entries, { level: 6 });
+		this.logger.info("client_archive.completed", {
+			fileCount: files.length,
+			revision,
+			bytes: archive.byteLength,
+			durationMs: Date.now() - startedAt,
+		});
+		return archive;
     }
 
     async client_zip_create(
 		path: string,
 		serverUrl = "http://localhost:3000",
-	): Promise<void> {
+    ): Promise<void> {
+		this.logger.info("client_zip.started", { outputPath: path, serverUrl });
 		const clientName = `client-${crypto.randomUUID()}`;
 		const [client] = await sql<{ id: string; client_secret: string }[]>`
 			INSERT INTO clients (client_name)
@@ -372,7 +475,15 @@ export class ObjectStore {
 				clientSecret: client.client_secret,
 			});
 			await Bun.write(path, archive);
+			this.logger.info("client_zip.completed", {
+				outputPath: path,
+				bytes: archive.byteLength,
+			});
 		} catch (error) {
+			this.logger.error("client_zip.failed", {
+				outputPath: path,
+				error,
+			});
 			await sql`DELETE FROM clients WHERE id = ${client.id}`.catch(() => undefined);
 			throw error;
 		}
@@ -380,17 +491,25 @@ export class ObjectStore {
 
     // to create the client inbox
     async inbox(rev: number): Promise<ObjectStoreOutboxItem[]> {
+		const startedAt = Date.now();
+		this.logger.debug("inbox.started", { revision: rev });
         const result = await sql<{ file_path: string; last_updated_revision: string; file_is_deleted: boolean }[]>`
             SELECT file_path, last_updated_revision, file_is_deleted FROM files
             WHERE last_updated_revision > ${rev}
             ORDER BY last_updated_revision ASC
         `;
-        // console.log("result", result);
-        return result.map((r: { file_path: string; last_updated_revision: string; file_is_deleted: boolean }) => ({
+        const items = result.map((r: { file_path: string; last_updated_revision: string; file_is_deleted: boolean }) => ({
             path: r.file_path,
             lastUpdatedRevision: Number(r.last_updated_revision),
             isDeleted: r.file_is_deleted,
         }));
+		this.logger.info("inbox.completed", {
+			revision: rev,
+			operationCount: items.length,
+			tipRevision: items.at(-1)?.lastUpdatedRevision ?? rev,
+			durationMs: Date.now() - startedAt,
+		});
+		return items;
     }
 }
 
@@ -423,7 +542,9 @@ export function registerObjectStoreRoutes(
 	app: Hono,
 	store = objectStore,
 	authorize: ClientAuthorizer = getClientIdFromAuthorization,
+	injectedLogger: Logger = serverLogger,
 ) {
+	const logger = injectedLogger.child("object_routes");
     // Chain so Hono accumulates route types (needed by testClient inference).
     return app
         .post('/files', async (c) => {
@@ -431,41 +552,85 @@ export function registerObjectStoreRoutes(
 			try {
 				path = resolvePathFromRequest(c);
 			} catch (error) {
-				if (error instanceof InvalidPathError) return c.json({ error: "Invalid path" }, 400);
+				if (error instanceof InvalidPathError) {
+					logger.warn("upload.rejected", {
+						reason: "invalid_path",
+						error,
+					});
+					return c.json({ error: "Invalid path" }, 400);
+				}
 				throw error;
 			}
             if (!path) {
+				logger.warn("upload.rejected", { reason: "path_missing" });
                 return c.json({ error: "Request body is required" }, 400);
             }
-			const authorized = await requireClientId(c, authorize);
-			if (authorized instanceof Response) return authorized;
+			const authorized = await requireClientId(c, authorize, logger);
+			if (authorized instanceof Response) {
+				logger.warn("upload.rejected", {
+					path,
+					reason: "unauthorized",
+				});
+				return authorized;
+			}
             const clientId = authorized;
             try {
+				const body = await c.req.arrayBuffer();
+				logger.info("upload.accepted", {
+					path,
+					clientId,
+					bytes: body.byteLength,
+				});
                 const result = await store.upload({
                     path: path,
-                    content: await c.req.arrayBuffer(),
+                    content: body,
                     id: clientId
                 });
+				logger.info("upload.completed", {
+					path: result.path,
+					clientId,
+					bytes: result.bytesWritten,
+					revision: result.revision,
+				});
                 return c.json(result, 200);
             } catch (error) {
                 if (error instanceof InvalidPathError) {
+					logger.warn("upload.rejected", {
+						path,
+						clientId,
+						reason: "invalid_path",
+						error,
+					});
                     return c.json({ error: "Invalid path" }, 400);
                 }
+				logger.error("upload.failed", { path, clientId, error });
                 throw error;
             }
         })
         .get('/inbox', async (c) => {
-			const authorized = await requireClientId(c, authorize);
-			if (authorized instanceof Response) return authorized;
+			const authorized = await requireClientId(c, authorize, logger);
+			if (authorized instanceof Response) {
+				logger.warn("inbox.rejected", { reason: "unauthorized" });
+				return authorized;
+			}
 			const rawRev = c.req.query("rev");
 			const parsedRev =
 				rawRev === undefined || rawRev.trim() === ""
 					? { success: false as const }
 					: revisionSchema.safeParse(Number(rawRev));
 			if (!parsedRev.success) {
+				logger.warn("inbox.rejected", {
+					clientId: authorized,
+					reason: "invalid_revision",
+					rawRevision: rawRev,
+				});
 				return c.json({ error: "rev must be a safe nonnegative integer" }, 400);
 			}
             const rev = parsedRev.data;
+			logger.debug("inbox.accepted", {
+				clientId: authorized,
+				revision: rev,
+			});
             const inbox = await store.inbox(rev);
             const ops: InboxOp[] = inbox.map((item) => ({
                 rev: item.lastUpdatedRevision,
@@ -473,52 +638,106 @@ export function registerObjectStoreRoutes(
                 path: item.path,
             }));
             const body = serializeInboxNdjson(ops);
+			logger.info("inbox.completed", {
+				clientId: authorized,
+				revision: rev,
+				operationCount: ops.length,
+				bytes: body.length,
+			});
             return new Response(body, {
                 status: 200,
                 headers: { "Content-Type": "application/x-ndjson" },
             });
         })
         .get('/files', async (c) => {
-			const authorized = await requireClientId(c, authorize);
-			if (authorized instanceof Response) return authorized;
+			const authorized = await requireClientId(c, authorize, logger);
+			if (authorized instanceof Response) {
+				logger.warn("download.rejected", { reason: "unauthorized" });
+				return authorized;
+			}
 			let path: string | undefined;
 			try {
 				path = resolvePathFromRequest(c);
 			} catch (error) {
-				if (error instanceof InvalidPathError) return c.json({ error: "Invalid path" }, 400);
+				if (error instanceof InvalidPathError) {
+					logger.warn("download.rejected", {
+						clientId: authorized,
+						reason: "invalid_path",
+						error,
+					});
+					return c.json({ error: "Invalid path" }, 400);
+				}
 				throw error;
 			}
             if (!path) {
+				logger.warn("download.rejected", {
+					clientId: authorized,
+					reason: "path_missing",
+				});
                 return c.json({ error: "path is required" }, 400);
             }
 
             try {
                 const data = await store.download(path);
                 if (!data) {
+					logger.warn("download.not_found", {
+						path,
+						clientId: authorized,
+					});
                     return c.json({ error: "Not found" }, 404);
                 }
+				logger.info("download.completed", {
+					path,
+					clientId: authorized,
+					bytes: data.byteLength,
+				});
                 return new Response(data, {
                     status: 200,
                     headers: { "Content-Type": "application/octet-stream" },
                 });
             } catch (error) {
                 if (error instanceof InvalidPathError) {
+					logger.warn("download.rejected", {
+						path,
+						clientId: authorized,
+						reason: "invalid_path",
+						error,
+					});
                     return c.json({ error: "Invalid path" }, 400);
                 }
+				logger.error("download.failed", {
+					path,
+					clientId: authorized,
+					error,
+				});
                 throw error;
             }
         })
         .delete('/files', async (c) => {
-			const authorized = await requireClientId(c, authorize);
-			if (authorized instanceof Response) return authorized;
+			const authorized = await requireClientId(c, authorize, logger);
+			if (authorized instanceof Response) {
+				logger.warn("delete.rejected", { reason: "unauthorized" });
+				return authorized;
+			}
 			let path: string | undefined;
 			try {
 				path = resolvePathFromRequest(c);
 			} catch (error) {
-				if (error instanceof InvalidPathError) return c.json({ error: "Invalid path" }, 400);
+				if (error instanceof InvalidPathError) {
+					logger.warn("delete.rejected", {
+						clientId: authorized,
+						reason: "invalid_path",
+						error,
+					});
+					return c.json({ error: "Invalid path" }, 400);
+				}
 				throw error;
 			}
             if (!path) {
+				logger.warn("delete.rejected", {
+					clientId: authorized,
+					reason: "path_missing",
+				});
                 return c.json({ error: "path is required" }, 400);
             }
             try {
@@ -531,6 +750,12 @@ export function registerObjectStoreRoutes(
                             ? { success: false as const }
                             : revisionSchema.safeParse(Number(rawBaseRevision));
                 if (!parsedBaseRevision.success) {
+					logger.warn("delete.rejected", {
+						path,
+						clientId,
+						reason: "invalid_base_revision",
+						rawBaseRevision,
+					});
                     return c.json(
                         { error: "base revision must be a safe nonnegative integer" },
                         400,
@@ -545,14 +770,35 @@ export function registerObjectStoreRoutes(
 					path,
 					revision: result.revision,
 				};
+				logger.info("delete.completed", {
+					path,
+					clientId,
+					baseRevision: parsedBaseRevision.data,
+					revision: result.revision,
+				});
                 return c.json(response, 200);
             } catch (error) {
                 if (error instanceof InvalidPathError) {
+					logger.warn("delete.rejected", {
+						path,
+						clientId: authorized,
+						reason: "invalid_path",
+						error,
+					});
                     return c.json({ error: "Invalid path" }, 400);
                 }
                 if (error instanceof Error && error.message === "Invalid authorization") {
+					logger.warn("delete.rejected", {
+						path,
+						reason: "unauthorized",
+					});
                     return c.json({ error: "Unauthorized" }, 401);
                 }
+				logger.error("delete.failed", {
+					path,
+					clientId: authorized,
+					error,
+				});
                 throw error;
             }
         });

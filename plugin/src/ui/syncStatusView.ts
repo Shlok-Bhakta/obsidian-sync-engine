@@ -30,6 +30,7 @@ export class SyncStatusView extends ItemView {
 	}
 
 	async onOpen(): Promise<void> {
+		this.plugin.logger.info("sync_status.opened");
 		await this.render();
 		this.registerInterval(
 			window.setInterval(() => void this.render(), TICK_REFRESH_MS),
@@ -37,13 +38,24 @@ export class SyncStatusView extends ItemView {
 	}
 
 	async onClose(): Promise<void> {
+		this.plugin.logger.info("sync_status.closed");
 		this.contentEl.empty();
 	}
 
 	private async render(): Promise<void> {
-		const outboxOps = await listOutbox(this.sync.fs, this.sync.outboxPath).catch(
-			() => [],
-		);
+		const logger = this.plugin.logger.child("sync_status");
+		logger.debug("render.started");
+		const outboxOps = await listOutbox(
+			this.sync.fs,
+			this.sync.outboxPath,
+			logger,
+		).catch((error) => {
+			logger.error("outbox_read.failed", {
+				outboxPath: this.sync.outboxPath,
+				error,
+			});
+			return [];
+		});
 		const { status } = this.sync;
 
 		const container = this.contentEl;
@@ -68,5 +80,11 @@ export class SyncStatusView extends ItemView {
 		if (status.lastError) {
 			list.createEl('li', { text: `Last error: ${status.lastError}` });
 		}
+		logger.debug("render.completed", {
+			revision: this.plugin.settings.revision,
+			pendingOutboxItems: outboxOps.length,
+			lastTickAt: status.lastTickAt,
+			lastError: status.lastError,
+		});
 	}
 }
