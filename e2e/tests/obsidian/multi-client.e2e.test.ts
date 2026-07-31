@@ -71,7 +71,7 @@ describe("obsidian multi-client e2e", () => {
 		await clientA?.stop().catch(() => undefined);
 		await stack?.stopServer().catch(() => undefined);
 	}, 120_000);
-	test("E1: fresh server auth + seed uploads vault content", async () => {
+	test("E1: fresh server auth automatically seeds vault content", async () => {
 		expect(
 			await clientA.evalAsync<string>(
 				`Promise.resolve("async-bridge-ready")`,
@@ -93,8 +93,6 @@ describe("obsidian multi-client e2e", () => {
 		);
 		expect(settings.clientSecret).not.toBe("Made by server");
 		expect(settings.clientSecret.length).toBeGreaterThan(8);
-
-		await clientA.seed();
 
 		await waitFor(
 			async () => {

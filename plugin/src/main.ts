@@ -16,6 +16,7 @@ import {
 	seedServerFromVault,
 	type VaultSync,
 } from './vaultSync';
+import { seedVaultIfRevisionZero } from "./sync/autoSeed";
 import { migrateServerState } from "./sync/stateMigration";
 import {
 	requestClientInvite,
@@ -25,7 +26,6 @@ import {
 export default class ObsidianSyncPlugin extends Plugin {
 	settings!: ObsidianSyncSettings;
 	sync!: VaultSync;
-	private isSeeding = false;
 	private reloadRequired = false;
 
 	async onload() {
@@ -43,11 +43,6 @@ export default class ObsidianSyncPlugin extends Plugin {
 		});
 
 		this.addCommand({
-			id: 'seed-server-from-vault',
-			name: 'Seed server from this vault',
-			callback: () => void this.seedFromVault(),
-		});
-		this.addCommand({
 			id: 'open-sync-status',
 			name: 'Open sync status',
 			callback: () => void this.openSyncStatusView(),
@@ -57,8 +52,8 @@ export default class ObsidianSyncPlugin extends Plugin {
 		// Best-effort: obtain / verify credentials once the plugin is up so a
 		// fresh install does not sit on the placeholder secret forever.
 		if (this.settings.serverUrl && !this.settings.serverUrl.includes('...')) {
-			void this.authenticate().catch((error) => {
-				console.warn('Initial auth failed', error);
+			void this.initializeSync().catch((error) => {
+				console.warn('Initial sync failed', error);
 			});
 		}
 	}
@@ -141,6 +136,29 @@ export default class ObsidianSyncPlugin extends Plugin {
 		}
 	}
 
+	private async initializeSync(): Promise<void> {
+		await this.authenticate();
+		await seedVaultIfRevisionZero(
+			this.settings.revision,
+			async () => {
+				new Notice('Seeding server from this vault…');
+				try {
+					const result = await seedServerFromVault(this, this.sync);
+					if (!result.ok) {
+						throw new Error(result.error);
+					}
+					new Notice('Vault seeded');
+				} catch (error) {
+					console.error('Automatic vault seeding failed', error);
+					new Notice(
+						'Automatic seeding failed: ' + this.formatError(error),
+					);
+					throw error;
+				}
+			},
+		);
+	}
+
 	async createClientInvite(): Promise<ClientInvite> {
 		if (this.reloadRequired) {
 			throw new Error("Reload Obsidian before creating a client package");
@@ -151,31 +169,6 @@ export default class ObsidianSyncPlugin extends Plugin {
 			clientSecret: this.settings.clientSecret,
 			request: requestUrl,
 		});
-	}
-
-	/** Enqueues every file currently in the vault and pushes them out. Used for first-time bootstrap. */
-	async seedFromVault(): Promise<void> {
-		if (this.isSeeding) {
-			new Notice('Seeding is already running');
-			return;
-		}
-
-		this.isSeeding = true;
-		try {
-			new Notice('Seeding server from this vault…');
-			await ensureAuthenticated(this);
-			const result = await seedServerFromVault(this, this.sync);
-			if (!result.ok) {
-				throw new Error(result.error);
-			}
-			new Notice('Vault seeded');
-		} catch (error) {
-			console.error('Seeding server from vault failed', error);
-			new Notice('Seeding failed: ' + this.formatError(error));
-			throw error;
-		} finally {
-			this.isSeeding = false;
-		}
 	}
 
 	async openSyncStatusView(): Promise<void> {

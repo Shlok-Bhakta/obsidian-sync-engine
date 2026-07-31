@@ -471,10 +471,6 @@ export class ObsidianClient {
 		);
 	}
 
-	async seed(): Promise<void> {
-		await this.command("obsidian-sync-engine:seed-server-from-vault");
-	}
-
 	async createClientInvite(): Promise<ClientInvite> {
 		const invite = await this.evalAsync<unknown>(
 			`app.plugins.getPlugin("obsidian-sync-engine").createClientInvite()`,

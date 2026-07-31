@@ -33,7 +33,7 @@ cd e2e && bun test tests/obsidian
 
 | ID | Scenario |
 | --- | --- |
-| E1 | Fresh auth + vault seed |
+| E1 | Fresh auth + automatic vault seed at revision `0` |
 | E2 | Preview-safe, single-use client package as a second client without startup re-uploads |
 | E3 | Edit on A → appears on B |
 | E4 | Delete on A → gone on B |

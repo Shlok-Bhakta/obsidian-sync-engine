@@ -62,7 +62,7 @@ Copy `main.js`, `manifest.json` (and `styles.css` if present) into
 `<Vault>/.obsidian/plugins/obsidian-sync-engine/`.
 
 1. Set **Server URL** and **Client name**. The first client to reach an empty server is enrolled automatically.
-2. **Seed server** once to upload the vault.
+2. The first client automatically uploads its vault when its last synced revision is `0`.
 3. Select **Create client package** for another device. The settings page copies a five-minute link.
 4. Open the link, select **Download ZIP**, extract it as a vault, and open it in Obsidian.
 

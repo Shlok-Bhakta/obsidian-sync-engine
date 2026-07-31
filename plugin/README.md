@@ -28,7 +28,7 @@ Reload Obsidian and enable the plugin.
 ## Onboarding
 
 1. Set the server URL and client name. An empty server enrolls this first client automatically.
-2. Select **Seed server** once for a fresh server.
+2. A client whose last synced revision is `0` automatically uploads its vault.
 3. Select **Create client package** to add another device, then send it the copied five-minute link.
 4. On the other device, open the link and select **Download ZIP**. The download works once.
 
