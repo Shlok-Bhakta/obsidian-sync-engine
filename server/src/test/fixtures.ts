@@ -59,11 +59,15 @@ export async function createFileFixture(overrides: {
 	file_path: string;
 	author_id: string;
 	file_is_deleted?: boolean;
+	content?: string | Uint8Array;
 }): Promise<FileRow> {
 	const file_is_deleted = overrides.file_is_deleted ?? false;
+	const content = file_is_deleted
+		? null
+		: Buffer.from(overrides.content ?? "");
 	const [row] = await sql<FileRow[]>`
-		INSERT INTO files (file_path, author_id, file_is_deleted)
-		VALUES (${overrides.file_path}, ${overrides.author_id}, ${file_is_deleted})
+		INSERT INTO files (file_path, author_id, file_is_deleted, content)
+		VALUES (${overrides.file_path}, ${overrides.author_id}, ${file_is_deleted}, ${content})
 		RETURNING *
 	`;
 	return row;

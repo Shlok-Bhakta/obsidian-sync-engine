@@ -1,8 +1,6 @@
 import { describe, it, expect } from "bun:test";
 import { sql } from "bun";
 import { createClientFixture, createFileFixture } from "./fixtures";
-import { Glob } from "bun";
-import { DEFAULT_OBJECT_STORE_DIR } from "../object/object_store";
 
 describe("db fixtures", () => {
 	it("starts each test with empty tables", async () => {
@@ -33,11 +31,19 @@ describe("db fixtures", () => {
 		expect(file.file_is_deleted).toBe(false);
 	});
 
-	it("starts each test with an empty object store", async () => {
-		const glob = new Glob("**/*");
-		const hasFiles = !glob.scanSync({ cwd: DEFAULT_OBJECT_STORE_DIR }).next().done;
-		expect(hasFiles).toBe(false);
-	});
+	it("rejects active files without database content", async () => {
+		const client = await createClientFixture();
+		let error: unknown;
 
-	
+		try {
+			await sql`
+				INSERT INTO files (file_path, author_id, file_is_deleted, content)
+				VALUES ('missing.md', ${client.id}, FALSE, NULL)
+			`;
+		} catch (caught) {
+			error = caught;
+		}
+
+		expect(error).toBeInstanceOf(Error);
+	});
 });

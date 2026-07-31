@@ -17,8 +17,9 @@ CREATE TABLE files (
     file_path TEXT NOT NULL UNIQUE,
     last_updated_revision BIGINT NOT NULL DEFAULT NEXTVAL('global_revision'),
     file_is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
+    content BYTEA,
     author_id UUID NOT NULL REFERENCES clients(id),
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    CHECK (file_is_deleted OR content IS NOT NULL)
 );
-
