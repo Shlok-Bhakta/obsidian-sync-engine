@@ -11,6 +11,7 @@ node_modules
 # Don't include the compiled main.js file in the repo.
 # They should be uploaded to GitHub releases instead.
 main.js
+plugin/obsidian-sync-engine/
 
 # Exclude sourcemaps
 *.map
@@ -21,17 +22,12 @@ data.json
 # Exclude macOS Finder (System Explorer) View States
 .DS_Store
 
-# file to move stuff to the right dir automatically
-movestuff.sh
-
-# tunnel out my ports to test on multiple devices using cloudflare tunnels
-tunnel.sh
-
-# you can prolly guess what this is lmao
-# data dir for postgres so I can clear and regenerate easily cuz I dont like writing migrations :/
-db_data/*
-logfile
-mega-test-results/
-.real-e2e-cache/
-
 .env
+db_data
+
+logfile
+mprocs.log
+object-data
+
+# e2e runtime artifacts
+e2e/.run/

@@ -1,0 +1,604 @@
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { join } from "node:path";
+import { mkdir, rm, writeFile, readFile } from "node:fs/promises";
+import { $ } from "bun";
+import { ObsidianClient } from "../../src/obsidian-client";
+import { startStack, type Stack } from "../../src/stack";
+import {
+	assertClientPackagePreservesVault,
+	readServerSnapshot,
+	waitForStableConvergence,
+} from "../../src/convergence";
+import {
+	SAMPLE_CONTENT_PATHS,
+	installPlugin,
+	writeObsidianConfig,
+} from "../../src/fixtures";
+import { waitFor, waitForFile, sleep } from "../../src/wait";
+
+const RUN_ROOT = join(import.meta.dir, "../../.run");
+
+function decodeText(snapshot: { files: Record<string, string> }, path: string) {
+	const encoded = snapshot.files[path];
+	if (encoded === undefined) return undefined;
+	return Buffer.from(encoded, "base64").toString("utf8");
+}
+
+/**
+ * Full multi-client e2e against real Obsidian (linuxserver image) driven only
+ * via `obsidian-cli` — no Playwright / GUI automation.
+ */
+describe("obsidian multi-client e2e", () => {
+	let stack: Stack;
+	let clientA: ObsidianClient;
+	let clientB: ObsidianClient;
+	let clientC: ObsidianClient;
+	let clientD: ObsidianClient;
+
+	beforeAll(async () => {
+		await mkdir(RUN_ROOT, { recursive: true });
+		stack = await startStack({ wipe: true });
+
+		const stamp = Date.now();
+		const aConfig = join(RUN_ROOT, `client-a-${stamp}`);
+		const bConfig = join(RUN_ROOT, `client-b-${stamp}`);
+
+		clientA = new ObsidianClient({
+			name: "vault-a",
+			configHostDir: aConfig,
+			httpPort: 13100,
+			httpsPort: 13101,
+		});
+		clientB = new ObsidianClient({
+			name: "vault-b",
+			configHostDir: bConfig,
+			httpPort: 13200,
+			httpsPort: 13201,
+		});
+
+		await clientA.prepareFreshSampleVault();
+		await clientA.start();
+		await clientA.configurePlugin({
+			serverUrl: stack.serverUrl,
+			clientName: "e2e-client-a",
+		});
+	}, 300_000);
+
+	afterAll(async () => {
+		await clientD?.stop().catch(() => undefined);
+		await clientC?.stop().catch(() => undefined);
+		await clientB?.stop().catch(() => undefined);
+		await clientA?.stop().catch(() => undefined);
+		await stack?.stopServer().catch(() => undefined);
+	}, 120_000);
+	test("E1: fresh server auth automatically seeds vault content", async () => {
+		expect(
+			await clientA.evalAsync<string>(
+				`Promise.resolve("async-bridge-ready")`,
+			),
+		).toBe("async-bridge-ready");
+		await expect(
+			clientA.evalAsync(`Promise.reject(new Error("async-bridge-sentinel"))`),
+		).rejects.toThrow("async-bridge-sentinel");
+		await expect(clientA.eval("(() => {")).rejects.toThrow(
+			"Obsidian eval",
+		);
+
+		const settings = await waitFor(
+			async () => {
+				const current = await clientA.readSettings();
+				return current.clientSecret !== "Made by server" ? current : false;
+			},
+			{ timeoutMs: 30_000, label: "client A automatically claims server" },
+		);
+		expect(settings.clientSecret).not.toBe("Made by server");
+		expect(settings.clientSecret.length).toBeGreaterThan(8);
+
+		await waitFor(
+			async () => {
+				await clientA.forceTick();
+				const s = await clientA.readSettings();
+				const outbox = Bun.file(clientA.outboxPath());
+				const depth = (await outbox.exists())
+					? (await outbox.text()).split("\n").filter(Boolean).length
+					: 0;
+				return s.revision > 0 && depth === 0 ? s : false;
+			},
+			{
+				timeoutMs: 120_000,
+				intervalMs: 1000,
+				label: "client A outbox drained after seed",
+			},
+		);
+
+		const auth = (await clientA.readSettings()).clientSecret;
+		for (const path of SAMPLE_CONTENT_PATHS) {
+			const res = await fetch(
+				`${stack.serverUrlLocal}/files?path=${encodeURIComponent(path)}`,
+				{ headers: { Authorization: auth } },
+			);
+			expect(res.status).toBe(200);
+			expect((await res.arrayBuffer()).byteLength).toBeGreaterThan(0);
+		}
+		const snapshot = await readServerSnapshot(stack);
+		expect(
+			snapshot.files[".obsidian/plugins/obsidian-sync-engine/data.json"],
+		).toBeUndefined();
+	}, 180_000);
+
+	test("E2: a preview-safe one-time client link opens B at the current tip", async () => {
+		const serverBefore = await readServerSnapshot(stack);
+		const zipPath = join(RUN_ROOT, "client-package.zip");
+		const invite = await clientA.createClientInvite();
+		const invitePath = new URL(invite.url).pathname;
+		const localInviteUrl = `${stack.serverUrlLocal}${invitePath}`;
+		expect((await fetch(localInviteUrl)).status).toBe(200);
+		expect((await fetch(localInviteUrl)).status).toBe(200);
+		const res = await fetch(`${localInviteUrl}/download`, { method: "POST" });
+		expect(res.ok).toBe(true);
+		await writeFile(zipPath, Buffer.from(await res.arrayBuffer()));
+		expect(
+			(await fetch(`${localInviteUrl}/download`, { method: "POST" })).status,
+		).toBe(410);
+
+		await rm(clientB.vaultHostDir, { recursive: true, force: true });
+		await mkdir(clientB.vaultHostDir, { recursive: true });
+		await mkdir(clientB.configHostDir, { recursive: true });
+		await $`unzip -qo ${zipPath} -d ${clientB.vaultHostDir}`;
+
+		await writeObsidianConfig(
+			clientB.configHostDir,
+			clientB.vaultContainerPath,
+			clientB.name,
+		);
+
+		const bootData = JSON.parse(
+			await readFile(clientB.pluginDataPath(), "utf8"),
+		) as { revision: number; clientSecret: string; clientName: string };
+		expect(bootData.revision).toBeGreaterThan(0);
+		expect(bootData.clientSecret).toBeTruthy();
+
+		await clientB.start();
+		await assertClientPackagePreservesVault(clientB, stack, serverBefore);
+		const after = await clientB.readSettings();
+		expect(after.revision).toBeGreaterThanOrEqual(serverBefore.revision);
+		for (const path of SAMPLE_CONTENT_PATHS) {
+			expect(await Bun.file(clientB.vaultPath(path)).exists()).toBe(true);
+		}
+	}, 180_000);
+
+	test("E3: edit on A appears on B within poll window", async () => {
+		await clientA.createNote("SharedNote", "# Shared\\nfrom A");
+		await sleep(1200);
+		await clientA.forceTick();
+		await clientA.forceTick();
+
+		await waitFor(
+			async () => {
+				await clientB.forceTick();
+				const file = Bun.file(clientB.vaultPath("SharedNote.md"));
+				if (!(await file.exists())) return false;
+				const text = await file.text();
+				return text.includes("from A") ? text : false;
+			},
+			{ timeoutMs: 60_000, intervalMs: 1000, label: "SharedNote.md on B" },
+		);
+	}, 120_000);
+
+	test("E3b: Obsidian configuration syncs without overwriting client credentials", async () => {
+		const beforeA = await clientA.readSettings();
+		const beforeB = await clientB.readSettings();
+		expect(beforeA.clientSecret).not.toBe(beforeB.clientSecret);
+
+		await clientA.evalAsync(
+			`app.vault.adapter.write(".obsidian/e2e-config.json", JSON.stringify({ from: "A" }))`,
+			{ label: "write Obsidian config on A" },
+		);
+		await sleep(1200);
+		await clientA.forceTick();
+		await clientA.forceTick();
+		await waitFor(
+			async () => {
+				await clientB.forceTick();
+				const file = Bun.file(clientB.vaultPath(".obsidian/e2e-config.json"));
+				return (await file.exists()) && (await file.text()).includes('"from":"A"');
+			},
+			{ timeoutMs: 60_000, label: "Obsidian config reaches B" },
+		);
+
+		expect((await clientA.readSettings()).clientSecret).toBe(
+			beforeA.clientSecret,
+		);
+		expect((await clientB.readSettings()).clientSecret).toBe(
+			beforeB.clientSecret,
+		);
+	}, 120_000);
+
+	test("E4: delete on A removes file on B", async () => {
+		await clientA.createNote("ToDelete", "temporary");
+		await sleep(1200);
+		await clientA.forceTick();
+		await clientA.forceTick();
+		await waitFor(
+			async () => {
+				await clientB.forceTick();
+				return (await Bun.file(clientB.vaultPath("ToDelete.md")).exists())
+					? true
+					: false;
+			},
+			{ timeoutMs: 60_000, intervalMs: 1000, label: "ToDelete.md on B" },
+		);
+
+		await clientA.deleteNote("ToDelete.md");
+		await sleep(1200);
+		await clientA.forceTick();
+		await clientA.forceTick();
+
+		await waitFor(
+			async () => {
+				await clientB.forceTick();
+				return !(await Bun.file(clientB.vaultPath("ToDelete.md")).exists());
+			},
+			{ timeoutMs: 60_000, label: "ToDelete.md gone on B" },
+		);
+	}, 120_000);
+
+	test("E5: self-echo does not duplicate content on A", async () => {
+		await clientA.appendNote("Welcome.md", "\\n<!-- e5 -->");
+		await sleep(1200);
+		await clientA.forceTick();
+		await clientA.forceTick();
+		await sleep(2000);
+		await clientA.forceTick();
+
+		const after = await Bun.file(clientA.vaultPath("Welcome.md")).text();
+		expect(after).toContain("<!-- e5 -->");
+		expect(after.split("<!-- e5 -->").length - 1).toBe(1);
+		await waitFor(
+			async () => {
+				await clientB.forceTick();
+				const remote = await Bun.file(clientB.vaultPath("Welcome.md")).text();
+				return remote.includes("<!-- e5 -->");
+			},
+			{ timeoutMs: 60_000, label: "self-echo edit converged to B" },
+		);
+	}, 90_000);
+
+	test("E6: offline edits drain after reconnect", async () => {
+		await stack.stopServer();
+
+		await clientA.createNote("OfflineNote", "written while offline");
+		await sleep(1500);
+
+		stack = await startStack({ wipe: false, reuse: stack });
+
+		const s = await clientA.readSettings();
+		await clientA.configurePlugin({
+			serverUrl: stack.serverUrl,
+			clientName: s.clientName,
+			clientSecret: s.clientSecret,
+			revision: s.revision,
+		});
+
+		await sleep(1200);
+		await clientA.forceTick();
+		await clientA.forceTick();
+
+		await waitFor(
+			async () => {
+				await clientB.forceTick();
+				return Bun.file(clientB.vaultPath("OfflineNote.md")).exists();
+			},
+			{
+				timeoutMs: 90_000,
+				label: "OfflineNote.md synced to B after reconnect",
+			},
+		);
+	}, 180_000);
+
+	test("E7: binary + html + nested paths round-trip to B", async () => {
+		for (const path of SAMPLE_CONTENT_PATHS) {
+			const aBytes = await Bun.file(clientA.vaultPath(path)).arrayBuffer();
+			const bBytes = await Bun.file(clientB.vaultPath(path)).arrayBuffer();
+			expect(new Uint8Array(bBytes)).toEqual(new Uint8Array(aBytes));
+		}
+	}, 30_000);
+
+	test("E8: rapid put then delete does not permanently stall B", async () => {
+		await clientA.createNote("RaceFile", "will delete soon");
+		await sleep(200);
+		await clientA.deleteNote("RaceFile.md");
+		await sleep(1200);
+		await clientA.forceTick();
+		await clientA.forceTick();
+
+		const revBefore = (await clientB.readSettings()).revision;
+		await waitFor(
+			async () => {
+				await clientB.forceTick();
+				const s = await clientB.readSettings();
+				const missing = !(await Bun.file(
+					clientB.vaultPath("RaceFile.md"),
+				).exists());
+				return missing && s.revision >= revBefore ? s : false;
+			},
+			{ timeoutMs: 90_000, label: "B advances past race put/delete" },
+		);
+
+		expect(await Bun.file(clientB.vaultPath("RaceFile.md")).exists()).toBe(
+			false,
+		);
+	}, 120_000);
+
+	test("E9: remote directory and file shape transitions converge", async () => {
+		const auth = (await clientA.readSettings()).clientSecret;
+		const upload = async (path: string, body: string) => {
+			const response = await fetch(`${stack.serverUrlLocal}/files`, {
+				method: "POST",
+				headers: {
+					Authorization: auth,
+					"X-Obsidian-Path": encodeURIComponent(path),
+				},
+				body,
+			});
+			expect(response.status).toBe(200);
+		};
+
+		await upload("shape/child.md", "nested");
+		await waitFor(
+			async () => {
+				await clientB.forceTick();
+				return Bun.file(clientB.vaultPath("shape/child.md")).exists();
+			},
+			{ timeoutMs: 60_000, label: "nested shape reaches B" },
+		);
+
+		await upload("shape", "now a file");
+		await waitFor(
+			async () => {
+				await clientB.forceTick();
+				const file = Bun.file(clientB.vaultPath("shape"));
+				return (await file.exists()) && (await file.text()) === "now a file";
+			},
+			{ timeoutMs: 60_000, label: "directory becomes file on B" },
+		);
+		expect(await Bun.file(clientB.vaultPath("shape/child.md")).exists()).toBe(
+			false,
+		);
+
+		await upload("shape/child.md", "nested again");
+		await waitFor(
+			async () => {
+				await clientB.forceTick();
+				const child = Bun.file(clientB.vaultPath("shape/child.md"));
+				return (await child.exists()) && (await child.text()) === "nested again";
+			},
+			{ timeoutMs: 60_000, label: "file becomes directory on B" },
+		);
+	}, 180_000);
+
+	test("E10: a causal subtree delete preserves only concurrent members", async () => {
+		const auth = (await clientA.readSettings()).clientSecret;
+		const upload = async (path: string, body: string): Promise<number> => {
+			const response = await fetch(`${stack.serverUrlLocal}/files`, {
+				method: "POST",
+				headers: {
+					Authorization: auth,
+					"X-Obsidian-Path": encodeURIComponent(path),
+				},
+				body,
+			});
+			expect(response.status).toBe(200);
+			const result = (await response.json()) as { revision: number };
+			return result.revision;
+		};
+
+		const baseRevision = await upload("causal/old.md", "observed");
+		await upload("causal/new.md", "concurrent");
+		const deleted = await fetch(
+			`${stack.serverUrlLocal}/files?path=${encodeURIComponent("causal")}`,
+			{
+				method: "DELETE",
+				headers: {
+					Authorization: auth,
+					"X-Obsidian-Base-Revision": String(baseRevision),
+				},
+			},
+		);
+		expect(deleted.status).toBe(200);
+
+		for (const client of [clientA, clientB]) {
+			await waitFor(
+				async () => {
+					await client.forceTick();
+					const oldExists = await Bun.file(
+						client.vaultPath("causal/old.md"),
+					).exists();
+					const newer = Bun.file(client.vaultPath("causal/new.md"));
+					return (
+						!oldExists &&
+						(await newer.exists()) &&
+						(await newer.text()) === "concurrent"
+					);
+				},
+				{
+					timeoutMs: 60_000,
+					label: `causal subtree delete converges on ${client.name}`,
+				},
+			);
+		}
+	}, 120_000);
+
+	test("E11: four independently packaged clients survive adversarial edits and converge", async () => {
+		const stamp = Date.now();
+		clientC = new ObsidianClient({
+			name: "vault-c",
+			configHostDir: join(RUN_ROOT, `client-c-${stamp}`),
+			httpPort: 13300,
+			httpsPort: 13301,
+		});
+		clientD = new ObsidianClient({
+			name: "vault-d",
+			configHostDir: join(RUN_ROOT, `client-d-${stamp}`),
+			httpPort: 13400,
+			httpsPort: 13401,
+		});
+
+		const startIndependentClient = async (
+			client: ObsidianClient,
+			archiveName: string,
+		) => {
+			const before = await readServerSnapshot(stack);
+			const invite = await clientA.createClientInvite();
+			const invitePath = new URL(invite.url).pathname;
+			const response = await fetch(
+				`${stack.serverUrlLocal}${invitePath}/download`,
+				{ method: "POST" },
+			);
+			expect(response.status).toBe(200);
+			const zipPath = join(RUN_ROOT, archiveName);
+			await writeFile(zipPath, Buffer.from(await response.arrayBuffer()));
+			await rm(client.vaultHostDir, { recursive: true, force: true });
+			await mkdir(client.vaultHostDir, { recursive: true });
+			await mkdir(client.configHostDir, { recursive: true });
+			await $`unzip -qo ${zipPath} -d ${client.vaultHostDir}`;
+			await writeObsidianConfig(
+				client.configHostDir,
+				client.vaultContainerPath,
+				client.name,
+			);
+			await client.start();
+			await assertClientPackagePreservesVault(client, stack, before);
+		};
+
+		await waitForStableConvergence([clientA, clientB], stack, {
+			label: "A and B settle before adding packaged clients",
+		});
+		await startIndependentClient(clientC, `client-c-${stamp}.zip`);
+		await startIndependentClient(clientD, `client-d-${stamp}.zip`);
+
+		const clients = [clientA, clientB, clientC, clientD] as const;
+		await waitForStableConvergence(clients, stack, {
+			label: "all four packaged clients agree",
+		});
+		const credentials = await Promise.all(
+			clients.map(async (client) => (await client.readSettings()).clientSecret),
+		);
+		expect(new Set(credentials).size).toBe(clients.length);
+
+		// Rapid independent typing: each renderer performs its own ordered
+		// appends while all four clients mutate concurrently.
+		await Promise.all(
+			clients.map(async (client, clientIndex) => {
+				const path = `spam/client-${clientIndex}.md`;
+				await client.writeNote(path, `seed-${clientIndex}\n`);
+				for (let edit = 0; edit < 8; edit++) {
+					await client.appendNote(path, `asdf-${edit}-${clientIndex}\n`);
+				}
+			}),
+		);
+		const spam = await waitForStableConvergence(clients, stack, {
+			label: "four-way rapid append spam",
+		});
+		for (let clientIndex = 0; clientIndex < clients.length; clientIndex++) {
+			const expected =
+				`seed-${clientIndex}\n` +
+				Array.from(
+					{ length: 8 },
+					(_, edit) => `asdf-${edit}-${clientIndex}\n`,
+				).join("");
+			expect(decodeText(spam.server, `spam/client-${clientIndex}.md`)).toBe(
+				expected,
+			);
+		}
+
+		// The server chooses a serialized last writer. The contract is
+		// convergence, not which concurrently scheduled writer wins.
+		const conflictCandidates = clients.map(
+			(_, clientIndex) => `writer=${clientIndex};${"asdf".repeat(12)}`,
+		);
+		await Promise.all(
+			clients.map((client, clientIndex) =>
+				client.writeNote(
+					"conflict/shared.md",
+					conflictCandidates[clientIndex]!,
+				),
+			),
+		);
+		const conflict = await waitForStableConvergence(clients, stack, {
+			label: "same-path conflict convergence",
+		});
+		expect(conflictCandidates).toContain(
+			decodeText(conflict.server, "conflict/shared.md"),
+		);
+
+		await clientA.writeNote("race/recreate.md", "original");
+		await clientC.writeNote("race/rename-source.md", "rename-body");
+		await waitForStableConvergence(clients, stack, {
+			label: "race fixtures reach every client",
+		});
+		await Promise.all([
+			clientA.deleteNote("race/recreate.md"),
+			clientB.writeNote("race/recreate.md", "recreated-by-b"),
+			clientC.renameNote("race/rename-source.md", "race/rename-dest.md"),
+			clientD.writeNote("race/independent-d.md", "independent"),
+		]);
+		const transitions = await waitForStableConvergence(clients, stack, {
+			label: "delete recreate and rename-like transitions",
+		});
+		expect(transitions.server.files["race/rename-source.md"]).toBeUndefined();
+		expect(decodeText(transitions.server, "race/rename-dest.md")).toBe(
+			"rename-body",
+		);
+		expect(decodeText(transitions.server, "race/independent-d.md")).toBe(
+			"independent",
+		);
+		expect(decodeText(transitions.server, "race/recreate.md")).toBe(
+			"recreated-by-b",
+		);
+
+		await clientA.writeNote("nasty-folder/old-one.md", "old");
+		await clientA.writeNote("nasty-folder/deep/old-two.md", "old");
+		await waitForStableConvergence(clients, stack, {
+			label: "causal subtree baseline",
+		});
+
+		// Keep A causally stale without disabling its Vault listeners. B pushes
+		// a newer descendant, then A performs a real recursive Vault deletion;
+		// the child-file events must land durably before network ticks resume.
+		await clientA.pauseNetworkTicks();
+		try {
+			await clientB.writeNote("nasty-folder/new-from-b.md", "must-survive");
+			await waitFor(
+				async () => {
+					await clientB.forceTick();
+					const current = await readServerSnapshot(stack);
+					return current.files["nasty-folder/new-from-b.md"] ? current : false;
+				},
+				{ timeoutMs: 60_000, label: "newer descendant reaches server" },
+			);
+			await clientA.deleteNote("nasty-folder");
+			await waitFor(
+				async () => {
+					const diagnostics = await clientA.diagnostics();
+					return diagnostics.outboxDepth >= 2 ? diagnostics : false;
+				},
+				{
+					timeoutMs: 30_000,
+					label: "recursive Vault deletion reaches A durable outbox",
+				},
+			);
+		} finally {
+			await clientA.resumeNetworkTicks();
+		}
+
+		const final = await waitForStableConvergence(clients, stack, {
+			timeoutMs: 150_000,
+			stableRounds: 5,
+			label: "four-client causal subtree convergence",
+		});
+		expect(final.server.files["nasty-folder/old-one.md"]).toBeUndefined();
+		expect(final.server.files["nasty-folder/deep/old-two.md"]).toBeUndefined();
+		expect(final.server.files["nasty-folder/new-from-b.md"]).toBeTruthy();
+	}, 360_000);
+});

@@ -1,11 +1,9 @@
 {
 	"id": "obsidian-sync-engine",
-	"name": "Sync Files",
+	"name": "Obsidian Sync Engine",
 	"version": "1.0.0",
-	"minAppVersion": "0.15.0",
-	"description": "Sync files with realtime functionality",
-	"author": "Obsidian",
-	"authorUrl": "https://github.com/Shlok-Bhakta/obsidian-sync-engine",
-	"fundingUrl": "https://github.com/Shlok-Bhakta/obsidian-sync-engine",
+	"minAppVersion": "1.7.2",
+	"description": "Self-hosted sync engine for your Obsidian vault.",
+	"author": "Shlok Bhakta",
 	"isDesktopOnly": false
 }

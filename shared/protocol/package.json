@@ -1,0 +1,21 @@
+{
+  "name": "obsidian-sync-protocol",
+  "type": "module",
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "bunx tsc --noEmit"
+  },
+  "main": "./index.ts",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "zod": "^4.4.3"
+  }
+}

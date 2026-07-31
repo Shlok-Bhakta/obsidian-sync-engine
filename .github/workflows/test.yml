@@ -1,0 +1,130 @@
+name: Tests
+
+on:
+  push:
+    branches: [diy-object-store]
+  pull_request:
+    branches: ['**']
+
+jobs:
+  plugin-unit:
+    name: Plugin unit (bun)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: plugin
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22.x
+          cache: npm
+          cache-dependency-path: |
+            plugin/package-lock.json
+            shared/protocol/package-lock.json
+      - name: Install protocol deps
+        working-directory: shared/protocol
+        run: npm ci
+      - name: Test shared protocol
+        working-directory: shared/protocol
+        run: npm test
+      - run: npm ci
+      - run: bun test src
+
+  server-unit:
+    name: Server unit (bun + postgres)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_DB: test_db
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5434:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d test_db"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5434/test_db
+      OBJECT_STORE_DIR: /tmp/ci-object-store
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Install protocol deps
+        working-directory: shared/protocol
+        run: |
+          npm ci
+          # bun resolves the file: protocol package from server/
+      - name: Build client-package plugin artifacts
+        working-directory: plugin
+        run: |
+          npm ci
+          npm run build
+      - run: bun install
+      - run: bun test
+
+  obsidian-e2e:
+    name: Obsidian e2e (CLI + docker)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_DB: test_db
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5434:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d test_db"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      CONTAINER_BIN: docker
+      E2E_SKIP_COMPOSE: "1"
+      E2E_DATABASE_URL: postgres://postgres:postgres@localhost:5434/test_db
+      E2E_HOST_GATEWAY: host.docker.internal
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22.x
+          cache: npm
+          cache-dependency-path: |
+            plugin/package-lock.json
+            shared/protocol/package-lock.json
+      - name: Install protocol + plugin deps
+        run: |
+          npm ci --prefix shared/protocol
+          npm ci --prefix plugin
+          bun install --cwd server
+          bun install --cwd e2e
+      - name: Pull Obsidian image
+        run: docker pull lscr.io/linuxserver/obsidian:latest
+      - name: Run Obsidian e2e
+        working-directory: e2e
+        run: bun test tests/obsidian
+      - name: Upload e2e artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-run-logs
+          path: e2e/.run/
+          if-no-files-found: ignore

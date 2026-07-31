@@ -1,0 +1,71 @@
+name: Release Obsidian plugin
+
+on:
+    push:
+        tags:
+            - '*'
+
+jobs:
+    build:
+        runs-on: ubuntu-latest
+        permissions:
+            contents: write
+            id-token: write
+            attestations: write
+        defaults:
+            run:
+                working-directory: plugin
+        steps:
+            - uses: actions/checkout@v6
+
+            - name: Use Node.js
+              uses: actions/setup-node@v6
+              with:
+                  node-version: 24
+                  cache: 'npm'
+                  cache-dependency-path: |
+                      plugin/package-lock.json
+                      shared/protocol/package-lock.json
+
+            - name: Install protocol deps
+              working-directory: shared/protocol
+              run: npm ci
+
+            - name: Build plugin
+              run: |
+                  npm ci
+                  npm run build
+
+            - name: Check for optional styles
+              id: styles
+              run: |
+                  [ -f styles.css ] && echo "exists=true" >> "$GITHUB_OUTPUT" || echo "exists=false" >> "$GITHUB_OUTPUT"
+
+            - name: Validate release tag and required artifacts
+              run: |
+                  tag="${GITHUB_REF#refs/tags/}"
+                  version="$(node -p "require('./manifest.json').version")"
+                  test "$tag" = "$version" || {
+                    echo "Tag $tag must match manifest version $version" >&2
+                    exit 1
+                  }
+                  test -s main.js
+                  test -s manifest.json
+
+            - name: Attest build provenance
+              uses: actions/attest@v4
+              with:
+                  subject-path: |
+                      plugin/main.js
+                      ${{ steps.styles.outputs.exists == 'true' && 'plugin/styles.css' || '' }}
+
+            - name: Create release
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                  tag="${GITHUB_REF#refs/tags/}"
+
+                  gh release create "$tag" \
+                    --title="$tag" \
+                    --draft \
+                    main.js manifest.json ${{ steps.styles.outputs.exists == 'true' && 'styles.css' || '' }}

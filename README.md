@@ -1,90 +1,114 @@
-# Obsidian Sample Plugin
+# Obsidian Sync Engine
 
-This is a sample plugin for Obsidian (https://obsidian.md).
+Self-hosted sync for Obsidian vaults. The MVP transport is **HTTP polling**.
 
-This project uses TypeScript to provide type checking and documentation.
-The repo depends on the latest plugin API (obsidian.d.ts) in TypeScript Definition format, which contains TSDoc comments describing what it does.
+## What syncs
 
-This sample plugin demonstrates some of the basic functionality the plugin API can do.
-- Adds a ribbon icon, which shows a Notice when clicked.
-- Adds a command "Open modal (simple)" which opens a Modal.
-- Adds a plugin setting tab to the settings page.
-- Registers a global click event and output 'click' to the console.
-- Registers a global interval which logs 'setInterval' to the console.
+- Vault notes, attachments, and `.obsidian` configuration
+- This plugin's per-client `data.json` and durable sync journals stay local
 
-## First time developing plugins?
+## What does not sync (MVP)
 
-Quick starting guide for new plugin devs:
+- Live WebSocket push (deferred)
 
-- Check if [someone already developed a plugin for what you want](https://obsidian.md/plugins)! There might be an existing plugin similar enough that you can partner up with.
-- Make a copy of this repo as a template with the "Use this template" button (login to GitHub if you don't see it).
-- Clone your repo to a local development folder. For convenience, you can place this folder in your `.obsidian/plugins/your-plugin-name` folder.
-- Install NodeJS, then run `npm i` in the command line under your repo folder.
-- Run `npm run dev` to compile your plugin from `main.ts` to `main.js`.
-- Make changes to `main.ts` (or create new `.ts` files). Those changes should be automatically compiled into `main.js`.
-- Reload Obsidian to load the new version of your plugin.
-- Enable plugin in settings window.
-- For updates to the Obsidian API run `npm update` in the command line under your repo folder.
+## Limits
 
-## Releasing new releases
+- Max upload body: **10 MiB** (server `maxRequestBodySize`)
+- Oversized or permanently rejected files are **dead-lettered** so they do not block other paths
+- Paths must be vault-relative and canonical (no `..`, absolute paths, or backslashes)
 
-- Update your `manifest.json` with your new version number, such as `1.0.1`, and the minimum Obsidian version required for your latest release.
-- Update your `versions.json` file with `"new-plugin-version": "minimum-obsidian-version"` so older versions of Obsidian can download an older version of your plugin that's compatible.
-- Create new GitHub release using your new version number as the "Tag version". Use the exact version number, don't include a prefix `v`. See here for an example: https://github.com/obsidianmd/obsidian-sample-plugin/releases
-- Upload the files `manifest.json`, `main.js`, `styles.css` as binary attachments. Note: The manifest.json file must be in two places, first the root path of your repository and also in the release.
-- Publish the release.
+## Upgrading from the filesystem object store
 
-> You can simplify the version bump process by running `npm version patch`, `npm version minor` or `npm version major` after updating `minAppVersion` manually in `manifest.json`.
-> The command will bump version in `manifest.json` and `package.json`, and add the entry for the new version to `versions.json`
+Primary file bytes now live in Postgres (`BYTEA`). On startup the server copies
+any still-missing bytes from `OBJECT_STORE_DIR` into NULL `content` rows **before
+accepting requests**. Point `OBJECT_STORE_DIR` at your previous object-data
+directory when upgrading an existing deployment, then restart once.
 
-## Adding your plugin to the community plugin list
+## Conflict / convergence policy
 
-- Check the [plugin guidelines](https://docs.obsidian.md/Plugins/Releasing/Plugin+guidelines).
-- Publish an initial version.
-- Make sure you have a `README.md` file in the root of your repo.
-- Make a pull request at https://github.com/obsidianmd/obsidian-releases to add your plugin.
+- Local edits are written to a durable outbox **immediately**, then drained over the network
+- Pending local paths are not overwritten by inbound pulls
+- Server revisions are assigned under a Postgres advisory lock with file bytes stored as `BYTEA` in the same transaction
+- Deletes are idempotent (unknown paths become tombstones)
 
-## How to use
+## Setup
 
-- Clone this repo.
-- Make sure your NodeJS is at least v16 (`node --version`).
-- `npm i` or `yarn` to install dependencies.
-- `npm run dev` to start compilation in watch mode.
+### Database (Podman)
 
-## Manually installing the plugin
-
-- Copy over `main.js`, `styles.css`, `manifest.json` to your vault `VaultFolder/.obsidian/plugins/your-plugin-id/`.
-
-## Improve code quality with eslint
-- [ESLint](https://eslint.org/) is a tool that analyzes your code to quickly find problems. You can run ESLint against your plugin to find common bugs and ways to improve your code. 
-- This project already has eslint preconfigured, you can invoke a check by running`npm run lint`
-- Together with a custom eslint [plugin](https://github.com/obsidianmd/eslint-plugin) for Obsidan specific code guidelines.
-- A GitHub action is preconfigured to automatically lint every commit on all branches.
-
-## Funding URL
-
-You can include funding URLs where people who use your plugin can financially support it.
-
-The simple way is to set the `fundingUrl` field to your link in your `manifest.json` file:
-
-```json
-{
-    "fundingUrl": "https://buymeacoffee.com"
-}
+```sh
+./db_setup.sh
+# or: podman compose up -d
+# dev:  postgres://postgres:postgres@localhost:5433/dev_db
+# test: postgres://postgres:postgres@localhost:5434/test_db
 ```
 
-If you have multiple URLs, you can also do:
+### Server
 
-```json
-{
-    "fundingUrl": {
-        "Buy Me a Coffee": "https://buymeacoffee.com",
-        "GitHub Sponsor": "https://github.com/sponsors",
-        "Patreon": "https://www.patreon.com/"
-    }
-}
+```sh
+cd shared/protocol && npm ci
+cd ../../plugin && npm ci && npm run build
+cd ../server && bun install
+export DATABASE_URL=postgres://postgres:postgres@localhost:5433/dev_db
+bun run dev
 ```
 
-## API Documentation
+### Plugin
 
-See https://docs.obsidian.md
+```sh
+cd plugin && npm ci && npm run build
+```
+
+For a one-shot development build with inline source maps and client logging
+enabled, run:
+
+```sh
+cd plugin && npm run build:dev
+```
+
+Open **View → Toggle developer tools** in Obsidian to see logs prefixed with
+`[obsidian-sync:client]`. Production client builds inject a no-op logger. The
+server always emits structured JSON logs to stdout/stderr; logs include sync
+paths and operational metadata but omit credentials and file contents.
+
+For a vault seed, the useful client event sequence is:
+`auto_seed.decision` → `vault_scan.completed` / `vault_scan.file_included` →
+`seed.file` → `outbox:enqueue.appended` → `outbox.operation_pushed` →
+`http.request.completed` → `tick.completed`. The server side then records
+`upload.accepted` → `object_store:upload.started` →
+`object_store:upload.completed`, including the committed database revision.
+Skipped, deferred, rejected, corrupt, and retry paths emit an explicit
+`reason` field.
+
+Copy `main.js`, `manifest.json` (and `styles.css` if present) into
+`<Vault>/.obsidian/plugins/obsidian-sync-engine/`.
+
+1. Set **Server URL** and **Client name**. The first client to reach an empty server is enrolled automatically.
+2. The first client automatically uploads its vault when its last synced revision is `0`.
+3. Select **Create client package** for another device. The settings page copies a five-minute link.
+4. Open the link, select **Download ZIP**, extract it as a vault, and open it in Obsidian.
+
+The landing page can be previewed safely. Its download button works once; a
+successful or interrupted download consumes the package.
+
+## Privacy
+
+- The sync server stores vault file bytes and paths in PostgreSQL
+- Client secrets authenticate every file/inbox request; treat them like passwords
+- Client-package links are temporary bearer credentials; send them only to the intended device
+
+## Recovery
+
+- Outbox/inbox live next to the plugin as JSONL; a corrupt JSONL tail is moved to `*.corrupt` and valid lines kept
+- Permanent upload failures land in `dead-letter.jsonl`
+- Sync status view shows the last tick error when a tick fails
+
+## Tests / CI
+
+```sh
+cd plugin && bun test src/sync
+DATABASE_URL=postgres://postgres:postgres@localhost:5434/test_db \
+  OBJECT_STORE_DIR=/tmp/object-store \
+  bun test --cwd server
+```
+
+GitHub Actions runs plugin unit tests, server unit tests (Postgres service), lint, and Obsidian e2e.

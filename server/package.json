@@ -1,16 +1,13 @@
 {
   "name": "server",
   "scripts": {
-    "dev": "SYNC_LOG_LEVEL=debug bun run --hot src/index.ts",
-    "test": "bun test",
-    "test:unit": "bun test src/yjs src/sqlUtils",
-    "test:integration": "bun test src/sync/engine.integration.test.ts",
-    "test:integration:docker": "bash ./test_integration_docker.sh"
+    "dev": "bun run --hot src/index.ts",
+    "test": "bun test"
   },
   "dependencies": {
-    "hono": "^4.12.15",
-    "yjs": "^13.6.30",
-    "zod": "^3.24.2"
+    "fflate": "^0.8.3",
+    "hono": "^4.12.27",
+    "obsidian-sync-protocol": "file:../shared/protocol"
   },
   "devDependencies": {
     "@types/bun": "latest"

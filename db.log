@@ -1,2 +1,0 @@
-2026-05-14 19:40:43.270 CDT [505999] FATAL:  lock file "postmaster.pid" already exists
-2026-05-14 19:40:43.270 CDT [505999] HINT:  Is another postmaster (PID 500942) running in data directory "/home/shlok/Documents/Programming/sandbox/obsidian-sync-engine/db_data"?

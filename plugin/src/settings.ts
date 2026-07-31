@@ -1,266 +1,294 @@
-import {App, Notice, PluginSettingTab, Setting} from "obsidian";
-import SyncEngine from "./main";
+import { App, Notice, PluginSettingTab, Setting, requestUrl } from 'obsidian';
+import ObsidianSyncPlugin from './main';
+import { deserialize, MessageType, serialize } from 'obsidian-sync-protocol';
+import type { ClientConfig } from "obsidian-sync-protocol";
+import { serverIdentityFor } from "./sync/serverIdentity";
+import type { ClientInvite } from "./clientInvites";
 
-export interface SyncEngineSettings {
-	backendUrl: string;
-	clientId: string;
-	clientKey: string;
-	clientName: string;
-	lastPulledRevision: string;
+export {
+	normalizeServerUrl,
+	legacyServerIdentityFor,
+	resetServerCredentials,
+	serverIdentityFor,
+	transitionServerSettings,
+} from "./sync/serverIdentity";
+
+export interface ObsidianSyncSettings extends ClientConfig {
+	serverIdentity: string;
 }
 
-export const DEFAULT_SETTINGS: SyncEngineSettings = {
-	backendUrl: 'http://localhost:3000',
-	clientId: '',
-	clientKey: 'To Be Generated',
-	clientName: 'Obsidian',
-	lastPulledRevision: '0',
-}
+export const DEFAULT_SETTINGS: ObsidianSyncSettings = {
+	serverUrl: 'https://...',
+	clientName: 'Main computer',
+	clientSecret: 'Made by server',
+	revision: 0,
+	serverIdentity: serverIdentityFor("https://..."),
+};
 
-export class SyncEngineSettingTab extends PluginSettingTab {
-	plugin: SyncEngine;
-	private pendingSettings: SyncEngineSettings;
-	private hasUnsavedChanges = false;
-	private unsubscribeBootstrapStatus: (() => void) | null = null;
+const isHttpUrl = (value: string): boolean => {
+	try {
+		return new URL(value.trim()).protocol === 'http:';
+	} catch {
+		return value.trim().toLowerCase().startsWith('http://');
+	}
+};
 
-	constructor(app: App, plugin: SyncEngine) {
+export class SyncSettingTab extends PluginSettingTab {
+	plugin: ObsidianSyncPlugin;
+	private clientInvite: ClientInvite | null = null;
+
+	constructor(app: App, plugin: ObsidianSyncPlugin) {
 		super(app, plugin);
 		this.plugin = plugin;
-		this.pendingSettings = {...plugin.settings};
-
-		this.plugin.registerDomEvent(window, "beforeunload", (event: BeforeUnloadEvent) => {
-			if (this.hasUnsavedChanges) {
-				event.preventDefault();
-			}
-		});
 	}
 
 	display(): void {
-		const {containerEl} = this;
+		const { containerEl } = this;
 
-		this.unsubscribeBootstrapStatus?.();
-		this.unsubscribeBootstrapStatus = null;
 		containerEl.empty();
+		new Setting(containerEl)
+		.setName("Client name")
+		.setDesc("Name that this client is registered as")	
+		.addButton((button) =>
+			button
+				.setIcon('upload')
+				.setTooltip('Refresh client name on server')
+				.setCta()
+				.setClass('obsidian-sync-client-secret-refresh')
+				.onClick(() => this.refreshClientName(this.plugin.settings.clientName)),
+		)
+		.addText((text) =>
+			text
+				.setPlaceholder('Main computer')
+				.setValue(this.plugin.settings.clientName)
+				.onChange(async (value) => {
+					this.plugin.logger.info("settings.client_name_changed", {
+						clientName: value,
+					});
+					this.plugin.settings.clientName = value;
+					await this.plugin.saveSettings();
+				}),
+		);
+		const serverUrlDesc = activeDocument.createDocumentFragment();
+		serverUrlDesc.appendText("Enter the URL of the server to connect to");
+		const serverUrlWarning = serverUrlDesc.createDiv({
+			cls: 'obsidian-sync-server-url-warning',
+			text: 'Warning: use HTTPS instead of regular HTTP for your server URL.',
+		});
 
-		if (!this.hasUnsavedChanges) {
-			this.pendingSettings = {...this.plugin.settings};
-		}
+		const serverUrlSetting = new Setting(containerEl)
+			.setName("Server URL")
+			.setDesc(serverUrlDesc)
+			.addText((text) =>
+				text
+					.setPlaceholder('HTTPS://...')
+					.setValue(this.plugin.settings.serverUrl)
+					.onChange(async (value) => {
+						await this.plugin.changeServerUrl(value);
+						updateServerUrlWarning(value);
+					}),
+			);
 
-		let saveButtonEl: HTMLButtonElement | null = null;
-		let backendUrlWarningEl: HTMLElement | null = null;
-
-		const refresh = () => {
-			// clientId and lastPulledRevision are server/sync-managed; exclude from dirty check
-			// so background sync cannot make the tab look dirty or roll back on save.
-			this.hasUnsavedChanges =
-				this.pendingSettings.backendUrl !== this.plugin.settings.backendUrl ||
-				this.pendingSettings.clientKey !== this.plugin.settings.clientKey ||
-				this.pendingSettings.clientName !== this.plugin.settings.clientName;
-
-			if (saveButtonEl) {
-				saveButtonEl.setText(this.hasUnsavedChanges ? "Save settings" : "Saved");
-				saveButtonEl.toggleClass("mod-warning", this.hasUnsavedChanges);
-				saveButtonEl.toggleClass("mod-cta", !this.hasUnsavedChanges);
-			}
-
-			if (backendUrlWarningEl) {
-				backendUrlWarningEl.toggle(!this.pendingSettings.backendUrl.trim().toLowerCase().startsWith("https://"));
-			}
+		const updateServerUrlWarning = (value: string) => {
+			const showWarning = isHttpUrl(value);
+			serverUrlSetting.settingEl.toggleClass(
+				'obsidian-sync-server-url-setting--warning',
+				showWarning,
+			);
+			serverUrlWarning.toggle(showWarning);
 		};
 
-		const backendUrlSetting = new Setting(containerEl)
-			.setName('Backend URL')
-			.setDesc('The URL of the server that will be used to sync the files')
-			.addText(text => text
-				.setPlaceholder(DEFAULT_SETTINGS.backendUrl)
-				.setValue(this.pendingSettings.backendUrl)
-					.onChange((value) => {
-						this.pendingSettings.backendUrl = value;
-						refresh();
-					}));
-
-		backendUrlWarningEl = backendUrlSetting.descEl.createEl("div", {
-			text: "This connection is not encrypted. Use a trusted vpn or private network, because data may be unencrypted and easy to intercept.",
-		});
-		backendUrlWarningEl.setCssStyles({
-			color: "var(--text-warning)",
-			marginTop: "6px",
-		});
-		
-		new Setting(containerEl)
-			.setName("Client name")
-			.setDesc("This name identifies this device to the sync server.")
-			.addText(text => text
-				.setPlaceholder(DEFAULT_SETTINGS.clientName)
-				.setValue(this.pendingSettings.clientName)
-				.onChange((value) => {
-					this.pendingSettings.clientName = value;
-					refresh();
-				}));
+		updateServerUrlWarning(this.plugin.settings.serverUrl);
 
 		new Setting(containerEl)
-			.setName("Client ID")
-			.setDesc("Stable identity for this vault on the sync server.")
-			.addText(text => text
-				.setValue(this.plugin.settings.clientId)
-				.setDisabled(true));
-
-		new Setting(containerEl)
-			.setName("Last pulled revision")
-			.setDesc("Last server revision applied locally.")
-			.addText(text => text
-				.setValue(this.plugin.settings.lastPulledRevision)
-				.setDisabled(true));
-
-		new Setting(containerEl)
-			.setName("Client key")
-			.setDesc("This is the key used to secure the connection.")
-			.addText(text => text
-				.setPlaceholder(DEFAULT_SETTINGS.clientKey)
-				.setValue(this.pendingSettings.clientKey)
-				.onChange((value) => {
-					this.pendingSettings.clientKey = value;
-					refresh();
-				}));
-
-		new Setting(containerEl)
-			.addButton(button => {
-				saveButtonEl = button.buttonEl;
-				button
-					.setButtonText(this.hasUnsavedChanges ? "Save settings" : "Saved")
-					.setTooltip("Save settings")
-					.onClick(async () => {
-						if (!this.hasUnsavedChanges) {
-							return;
-						}
-
-						this.plugin.settings = {
-							...this.pendingSettings,
-							clientId: this.plugin.settings.clientId,
-							lastPulledRevision: this.plugin.settings.lastPulledRevision,
-						};
-						await this.plugin.saveSettings();
-						this.plugin.updateSyncSettings();
-
-						this.pendingSettings = {...this.plugin.settings};
-						this.hasUnsavedChanges = false;
-						refresh();
+		.setName("Client secret")
+		.setDesc("Issued automatically by the server. Do not share it.")
+		.addButton((button) =>
+			button
+				.setIcon('refresh-cw')
+				.setTooltip('Refresh client secret')
+				.setCta()
+				.setClass('obsidian-sync-client-secret-refresh')
+				.onClick(() => this.refreshClientSecret()),
+		)
+		.addText((text) =>
+			text
+				.setPlaceholder('Made by server')
+				.setValue(this.plugin.settings.clientSecret)
+				.onChange(async (value) => {
+					this.plugin.logger.warn("settings.client_secret_changed_manually", {
+						valuePresent: value.length > 0,
 					});
-			});
+					this.plugin.settings.clientSecret = value;
+					await this.plugin.saveSettings();
+				}),
+		);
 
-		const bootstrapStatusEl = containerEl.createEl("div");
-		bootstrapStatusEl.setCssStyles({
-			marginTop: "12px",
-			color: "var(--text-muted)",
-		});
-
-		const renderBootstrapStatus = () => {
-			const status = this.plugin.bootstrapStatus;
-			bootstrapStatusEl.empty();
-			if (!status) {
-				return;
-			}
-			if (status.status === "building" || status.status === "uploading") {
-				const panel = bootstrapStatusEl.createDiv({ cls: "sync-engine-bootstrap-status" });
-				panel.createDiv({
-					cls: "sync-engine-bootstrap-status__phase",
-					text: status.phase ?? status.message ?? (status.status === "building" ? "Building bootstrap snapshot" : "Uploading bootstrap snapshot"),
-				});
-				const total = status.progressTotal ?? 0;
-				const current = status.progressCurrent ?? 0;
-				const percent = total > 0 ? Math.min(100, Math.floor((current / total) * 100)) : 0;
-				const progress = panel.createDiv({ cls: "sync-engine-bootstrap-progress" });
-				progress.createDiv({
-					cls: "sync-engine-bootstrap-progress__bar",
-					attr: { style: `width: ${percent}%` },
-				});
-				panel.createDiv({
-					cls: "sync-engine-bootstrap-status__meta",
-					text: total > 0 ? `${current}/${total} files - ${percent}%` : "Preparing...",
-				});
-			} else if (status.status === "ready" && status.downloadUrl) {
-				const seconds = Math.max(0, Math.ceil((status.remainingMs ?? 0) / 1000));
-				const panel = bootstrapStatusEl.createDiv({ cls: "sync-engine-bootstrap-link" });
-				panel.createDiv({
-					cls: "sync-engine-bootstrap-link__meta",
-					text: `Vault link ready. Expires in ${seconds}s.`,
-				});
-				const row = panel.createDiv({ cls: "sync-engine-bootstrap-link__row" });
-				const input = row.createEl("input", {
-					type: "text",
-					value: status.downloadUrl,
-				});
-				input.readOnly = true;
-				input.addEventListener("focus", () => input.select());
-				const copyButton = row.createEl("button", {
-					cls: "mod-cta",
-					text: "Copy",
-				});
-				copyButton.addEventListener("click", async () => {
+		new Setting(containerEl)
+		.setName("Add another client")
+		.setDesc("Create a one-time vault package. Its link expires in five minutes.")
+		.addButton((button) =>
+			button
+				.setButtonText("Create client package")
+				.setCta()
+				.onClick(async () => {
+					button.setDisabled(true);
 					try {
-						await navigator.clipboard.writeText(status.downloadUrl!);
-						new Notice("Vault link copied");
-					} catch (error) {
-						input.select();
-						new Notice("Could not copy automatically. Link selected.");
+						this.clientInvite = await this.plugin.createClientInvite();
+						this.display();
+							try {
+								await navigator.clipboard.writeText(this.clientInvite.url);
+								this.plugin.logger.info("client_invite.clipboard_copy_completed");
+								new Notice("Client link copied to clipboard");
+							} catch (error) {
+								this.plugin.logger.warn("client_invite.clipboard_copy_failed", {
+									error,
+								});
+								new Notice("Client package created. Copy its link below.");
+							}
+						} catch (error) {
+							this.plugin.logger.error("client_invite.create_failed", {
+								error,
+							});
+						new Notice(
+							"Could not create client package: " +
+								(error instanceof Error ? error.message : String(error)),
+						);
+						button.setDisabled(false);
 					}
-				});
-				panel.createEl("a", {
-					cls: "sync-engine-bootstrap-link__open",
-					text: "Open download page",
-					href: status.downloadUrl,
-				});
-			} else if (status.status === "downloaded") {
-				bootstrapStatusEl.createDiv({
-					cls: "sync-engine-bootstrap-status sync-engine-bootstrap-status--success",
-					text: "Vault link downloaded.",
-				});
-			} else if (status.status === "complete") {
-				bootstrapStatusEl.createDiv({
-					cls: "sync-engine-bootstrap-status sync-engine-bootstrap-status--success",
-					text: status.message ?? "Bootstrap upload complete.",
-				});
-			} else if (status.status === "expired") {
-				bootstrapStatusEl.createDiv({
-					cls: "sync-engine-bootstrap-status",
-					text: "Vault link expired.",
-				});
-			} else if (status.status === "failed") {
-				bootstrapStatusEl.createDiv({
-					cls: "sync-engine-bootstrap-status sync-engine-bootstrap-status--error",
-					text: `Vault link failed: ${status.message ?? "Unknown error"}`,
-				});
-			}
-		};
+				}),
+		);
+
+		if (this.clientInvite) {
+			new Setting(containerEl)
+				.setName("New client link")
+				.setDesc("Send this link to the other device. The zip can be downloaded once.")
+				.addText((text) =>
+					text
+						.setValue(this.clientInvite?.url ?? "")
+						.setDisabled(true),
+				)
+				.addButton((button) =>
+					button
+						.setButtonText("Copy")
+						.onClick(async () => {
+							if (!this.clientInvite) return;
+								try {
+									await navigator.clipboard.writeText(this.clientInvite.url);
+									this.plugin.logger.info("client_invite.clipboard_copy_completed");
+									new Notice("Client link copied to clipboard");
+								} catch (error) {
+									this.plugin.logger.warn("client_invite.clipboard_copy_failed", {
+										error,
+									});
+									new Notice("Could not copy the client link");
+							}
+						}),
+				);
+		}
 
 		new Setting(containerEl)
-			.setName("Bootstrap vault")
-			.setDesc("Generate a one-time zip link for setting up another device.")
-			.addButton(button => {
-				button
-					.setButtonText("Generate vault link")
-					.setTooltip("Generate vault link")
-					.onClick(async () => {
-						try {
-							await this.plugin.generateVaultLink();
-						} catch (error) {
-							const message = error instanceof Error ? error.message : String(error);
-							new Notice(`Vault link failed: ${message}`);
-						}
-					});
+		.setName("Last synced revision")
+		.setDesc("Last synced revision of the client")
+		.addText((text) =>
+			text
+				.setPlaceholder('0')
+				.setValue(this.plugin.settings.revision.toString())
+				.setDisabled(true)
+		);
+	}
+
+	private async refreshClientSecret(): Promise<void> {
+		const logger = this.plugin.logger.child("settings_http");
+		try {
+			const startedAt = Date.now();
+			logger.info("client_secret_reset.started", {
+				serverUrl: this.plugin.settings.serverUrl,
+				clientName: this.plugin.settings.clientName,
 			});
-		this.unsubscribeBootstrapStatus = this.plugin.subscribeBootstrapStatus(renderBootstrapStatus);
-		renderBootstrapStatus();
-
-		refresh();
-	}
-
-	hide(): void {
-		this.unsubscribeBootstrapStatus?.();
-		this.unsubscribeBootstrapStatus = null;
-		if (this.hasUnsavedChanges) {
-			new Notice("Make sure to save");
+			const response = await requestUrl({
+				url: this.plugin.settings.serverUrl + '/reset-client-secret',
+				method: 'POST',
+				contentType: 'application/json',
+				body: serialize({
+					type: MessageType.AUTH_ACK,
+					client_name: this.plugin.settings.clientName,
+					token: this.plugin.settings.clientSecret
+				}),
+				throw: false,
+			});
+			logger.info("client_secret_reset.response", {
+				status: response.status,
+				durationMs: Date.now() - startedAt,
+			});
+			const raw = typeof response.json === 'string' ? response.json : response.text;
+			let message = deserialize(raw);
+			if(message.type === MessageType.AUTH_INIT){
+				this.plugin.settings.clientSecret = message.token;
+				// refresh setting pane
+				this.display();
+				await this.plugin.saveSettings();
+				logger.info("client_secret_reset.completed", {
+					clientName: message.client_name,
+				});
+			}else{
+				logger.warn("client_secret_reset.rejected", {
+					messageType: message.type,
+					status: response.status,
+				});
+				new Notice('Error refreshing client secret: ' + message.type);
+			}
+		} catch (error) {
+			logger.error("client_secret_reset.failed", { error });
+			new Notice('Error refreshing client secret: ' + String(error));
 		}
-		super.hide();
 	}
+
+	private async refreshClientName(newClientName: string): Promise<void> {
+		const logger = this.plugin.logger.child("settings_http");
+		try {
+			const startedAt = Date.now();
+			logger.info("client_name_reset.started", {
+				serverUrl: this.plugin.settings.serverUrl,
+				clientName: newClientName,
+			});
+			const response = await requestUrl({
+				url: this.plugin.settings.serverUrl + '/reset-client-name',
+				method: 'POST',
+				contentType: 'application/json',
+				body: serialize({
+					type: MessageType.RESET_CLIENT_NAME,
+					new_client_name: newClientName,
+					token: this.plugin.settings.clientSecret
+				}),
+				throw: false,
+			});
+			logger.info("client_name_reset.response", {
+				status: response.status,
+				durationMs: Date.now() - startedAt,
+			});
+			const raw = typeof response.json === 'string' ? response.json : response.text;
+			let message = deserialize(raw);
+			if(message.type === MessageType.AUTH_INIT){
+				this.plugin.settings.clientName = message.client_name;
+				// refresh setting pane
+				this.display();
+				await this.plugin.saveSettings();
+				logger.info("client_name_reset.completed", {
+					clientName: message.client_name,
+				});
+			}else{
+				logger.warn("client_name_reset.rejected", {
+					messageType: message.type,
+					status: response.status,
+				});
+				new Notice('Error refreshing client name: ' + message.type);
+			}
+		} catch (error) {
+			logger.error("client_name_reset.failed", { error });
+			new Notice('Error refreshing client name: ' + String(error));
+		}
+	}
+
+
 }

@@ -1,42 +1,47 @@
 import tseslint from 'typescript-eslint';
-import obsidianmd from "eslint-plugin-obsidianmd";
-import globals from "globals";
-import { globalIgnores } from "eslint/config";
+import obsidianmd from 'eslint-plugin-obsidianmd';
+import globals from 'globals';
+import { globalIgnores } from 'eslint/config';
 
 export default tseslint.config(
+	globalIgnores([
+		'node_modules',
+		'dist',
+		'obsidian-sync-engine',
+		'esbuild.config.mjs',
+		'package-plugin.mjs',
+		'version-bump.mjs',
+		'versions.json',
+		'main.js',
+		'package.json',
+		'package-lock.json',
+		'tsconfig.json',
+	]),
 	{
 		languageOptions: {
 			globals: {
 				...globals.browser,
+				__CLIENT_LOGGING_ENABLED__: 'readonly',
 			},
 			parserOptions: {
 				projectService: {
-					allowDefaultProject: [
-						'eslint.config.js',
-						'manifest.json',
-						'vitest.config.ts',
-					]
+					allowDefaultProject: ['eslint.config.mts', 'manifest.json'],
 				},
 				tsconfigRootDir: import.meta.dirname,
-				extraFileExtensions: ['.json']
+				extraFileExtensions: ['.json'],
 			},
 		},
 	},
 	...obsidianmd.configs.recommended,
 	{
-		files: ["src/**/*.ts"],
+		// src/sync is intentionally pure/host-agnostic (no Obsidian imports) so
+		// it can run under `bun test` outside the Obsidian renderer, where
+		// `window` doesn't exist. The window-timer rules assume a browser
+		// global that isn't available there, so they don't apply here.
+		files: ['src/sync/**/*.ts'],
 		rules: {
-			// @codemirror/* is provided by Obsidian at runtime (esbuild externals).
-			"import/no-extraneous-dependencies": "off",
+			'obsidianmd/prefer-window-timers': 'off',
+			'obsidianmd/no-global-this': 'off',
 		},
 	},
-	globalIgnores([
-		"node_modules",
-		"dist",
-		"esbuild.config.mjs",
-		"eslint.config.js",
-		"version-bump.mjs",
-		"versions.json",
-		"main.js",
-	]),
 );

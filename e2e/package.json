@@ -1,0 +1,15 @@
+{
+  "name": "obsidian-sync-e2e",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "bun test",
+    "test:obsidian": "bun test tests/obsidian"
+  },
+  "dependencies": {
+    "obsidian-sync-protocol": "file:../shared/protocol"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}
