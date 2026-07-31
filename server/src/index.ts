@@ -8,6 +8,7 @@ import {
 } from "./invites/clientInvites";
 import { MAX_REQUEST_BODY_SIZE } from "./config";
 import { serverLogger } from "./logger";
+import { registerHealthRoute } from "./health";
 
 const startupLogger = serverLogger.child("startup");
 startupLogger.info("server.starting", {
@@ -75,9 +76,10 @@ app.onError((error, c) => {
 });
 
 app.get('/', (c) => {
-  serverLogger.child("health").debug("health.requested");
   return c.text('Hello Hono!')
 })
+
+registerHealthRoute(app, undefined, serverLogger);
 
 registerAuthRoutes(app, serverLogger);
 registerObjectStoreRoutes(app, objectStore, undefined, serverLogger);

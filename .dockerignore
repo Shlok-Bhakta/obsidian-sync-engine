@@ -1,0 +1,12 @@
+*
+!Dockerfile
+!plugin/
+!plugin/**
+!server/
+!server/**
+!shared/
+!shared/protocol/
+!shared/protocol/**
+**/node_modules
+plugin/main.js
+plugin/obsidian-sync-engine

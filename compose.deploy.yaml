@@ -1,0 +1,36 @@
+services:
+  server:
+    image: ghcr.io/shlok-bhakta/obsidian-sync-engine:latest
+    pull_policy: always
+    restart: unless-stopped
+    depends_on:
+      database:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://obsidian:obsidian-password@database:5432/obsidian
+    ports:
+      # Change 3000 on the left to use a different host port.
+      - "3000:3000"
+    healthcheck:
+      test: ["CMD", "bun", "-e", "const response = await fetch('http://127.0.0.1:3000/health'); if (!response.ok) process.exit(1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  database:
+    image: docker.io/library/postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: obsidian
+      POSTGRES_USER: obsidian
+      POSTGRES_PASSWORD: obsidian-password
+    volumes:
+      # Change ./data/postgres to store database files somewhere else on the host.
+      - ./data/postgres:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U obsidian -d obsidian"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s

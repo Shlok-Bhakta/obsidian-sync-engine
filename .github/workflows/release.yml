@@ -1,71 +1,136 @@
-name: Release Obsidian plugin
+name: Release plugin and server
 
 on:
-    push:
-        tags:
-            - '*'
+  push:
+    tags:
+      - '*'
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-    build:
-        runs-on: ubuntu-latest
-        permissions:
-            contents: write
-            id-token: write
-            attestations: write
-        defaults:
-            run:
-                working-directory: plugin
-        steps:
-            - uses: actions/checkout@v6
+  plugin-release:
+    name: Publish plugin release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    defaults:
+      run:
+        working-directory: plugin
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-            - name: Use Node.js
-              uses: actions/setup-node@v6
-              with:
-                  node-version: 24
-                  cache: 'npm'
-                  cache-dependency-path: |
-                      plugin/package-lock.json
-                      shared/protocol/package-lock.json
+      - name: Use Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            plugin/package-lock.json
+            shared/protocol/package-lock.json
 
-            - name: Install protocol deps
-              working-directory: shared/protocol
-              run: npm ci
+      - name: Install protocol dependencies
+        working-directory: shared/protocol
+        run: npm ci
 
-            - name: Build plugin
-              run: |
-                  npm ci
-                  npm run build
+      - name: Build plugin
+        run: |
+          npm ci
+          npm run build
 
-            - name: Check for optional styles
-              id: styles
-              run: |
-                  [ -f styles.css ] && echo "exists=true" >> "$GITHUB_OUTPUT" || echo "exists=false" >> "$GITHUB_OUTPUT"
+      - name: Validate tag and package plugin
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          version="$(node -p "require('./manifest.json').version")"
+          test "$tag" = "$version" || {
+            echo "Tag $tag must match manifest version $version" >&2
+            exit 1
+          }
+          test -s main.js
+          test -s manifest.json
+          test -s styles.css
+          zip -r obsidian-sync-engine.zip obsidian-sync-engine
 
-            - name: Validate release tag and required artifacts
-              run: |
-                  tag="${GITHUB_REF#refs/tags/}"
-                  version="$(node -p "require('./manifest.json').version")"
-                  test "$tag" = "$version" || {
-                    echo "Tag $tag must match manifest version $version" >&2
-                    exit 1
-                  }
-                  test -s main.js
-                  test -s manifest.json
+      - name: Attest plugin artifacts
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
+        with:
+          subject-path: |
+            plugin/main.js
+            plugin/manifest.json
+            plugin/styles.css
+            plugin/obsidian-sync-engine.zip
 
-            - name: Attest build provenance
-              uses: actions/attest@v4
-              with:
-                  subject-path: |
-                      plugin/main.js
-                      ${{ steps.styles.outputs.exists == 'true' && 'plugin/styles.css' || '' }}
+      - name: Create release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          gh release create "$tag" \
+            --verify-tag \
+            --title "$tag" \
+            --generate-notes \
+            main.js manifest.json styles.css obsidian-sync-engine.zip
 
-            - name: Create release
-              env:
-                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-              run: |
-                  tag="${GITHUB_REF#refs/tags/}"
+  server-image:
+    name: Publish server image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-                  gh release create "$tag" \
-                    --title="$tag" \
-                    --draft \
-                    main.js manifest.json ${{ steps.styles.outputs.exists == 'true' && 'styles.css' || '' }}
+      - name: Set image name
+        id: image
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate release tag
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          version="$(jq -r .version plugin/manifest.json)"
+          test "$tag" = "$version" || {
+            echo "Tag $tag must match manifest version $version" >&2
+            exit 1
+          }
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - name: Extract image metadata
+        id: metadata
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
+        with:
+          images: ${{ steps.image.outputs.image }}
+          tags: |
+            type=ref,event=tag
+            type=raw,value=latest
+
+      - name: Build and push server image
+        id: push
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          cache-from: type=gha,scope=server-image
+          cache-to: type=gha,mode=max,scope=server-image
+
+      - name: Attest server image
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
+        with:
+          subject-name: ${{ steps.image.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
