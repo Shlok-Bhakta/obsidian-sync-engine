@@ -67,7 +67,14 @@ export type PermanentSyncFailure = {
 /** Discriminated result so callers never treat a failed tick as success. */
 export type SyncTickResult =
 	| { ok: true; pushed: number; applied: number; deadLettered: number }
-	| { ok: false; error: string; pushed: number; applied: number; deadLettered: number };
+	| {
+		ok: false;
+		failureKind: "error" | "dead-letter";
+		error: string;
+		pushed: number;
+		applied: number;
+		deadLettered: number;
+	};
 
 const DEFAULT_DEBOUNCE_MS = 1000;
 
@@ -406,6 +413,7 @@ export class SyncEngine {
 			if (this.isSuspended()) {
 				const result: SyncTickResult = {
 					ok: false,
+					failureKind: "error",
 					error: "Sync is suspended while the connection is changing",
 					pushed,
 					applied,
@@ -438,6 +446,7 @@ export class SyncEngine {
 			if (deadLettered > 0) {
 				const result: SyncTickResult = {
 					ok: false,
+					failureKind: "dead-letter",
 					error: `${deadLettered} operation(s) require attention`,
 					pushed,
 					applied,
@@ -473,7 +482,14 @@ export class SyncEngine {
 				deadLettered,
 				durationMs: Date.now() - startedAt,
 			});
-			return { ok: false, error: message, pushed, applied, deadLettered };
+			return {
+				ok: false,
+				failureKind: "error",
+				error: message,
+				pushed,
+				applied,
+				deadLettered,
+			};
 		}
 	}
 

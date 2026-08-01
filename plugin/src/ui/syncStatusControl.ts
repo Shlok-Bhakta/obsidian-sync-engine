@@ -70,9 +70,12 @@ export class SyncStatusControl {
 		}
 
 		const action = "Activate to sync now.";
+		const errorDescription = state.lastError
+			? ` Sync error: ${state.lastError}.`
+			: "";
 		this.button.setAttribute(
 			"aria-label",
-			`Outbox queue: ${state.outboxDepth}. Inbox queue: ${state.inboxDepth}. ${action}`,
+			`Outbox queue: ${state.outboxDepth}. Inbox queue: ${state.inboxDepth}.${errorDescription} ${action}`,
 		);
 		this.button.title = state.lastError
 			? `${state.lastError}\nCheck the console for details.`

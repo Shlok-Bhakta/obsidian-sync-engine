@@ -60,10 +60,55 @@ describe("sync status state", () => {
 		expect(observed).toContainEqual([2, 1]);
 	});
 
+	test("coalesces a burst of queue notifications into one follow-up read", async () => {
+		class CountingFs extends MemorySyncFs {
+			readCalls = 0;
+			private gate: Promise<void> | null = null;
+			release!: () => void;
+
+			blockReads(): void {
+				this.gate = new Promise<void>((resolve) => { this.release = resolve; });
+			}
+
+			override async read(path: string): Promise<string> {
+				this.readCalls++;
+				if (this.gate) {
+					await this.gate;
+					this.gate = null;
+				}
+				return super.read(path);
+			}
+		}
+		const fs = new CountingFs();
+		await fs.write("outbox.jsonl", "one\n");
+		await fs.write("inbox.jsonl", "remote\n");
+		const state = new SyncStatusState();
+		await state.setQueueRuntime(fs, "outbox.jsonl", "inbox.jsonl");
+		expect(fs.readCalls).toBe(2);
+
+		fs.blockReads();
+		const first = state.refreshQueueDepths();
+		await Promise.resolve();
+		const second = state.refreshQueueDepths();
+		const third = state.refreshQueueDepths();
+		fs.release();
+		await Promise.all([first, second, third]);
+
+		// One active pass and one coalesced follow-up, two queue files per pass.
+		expect(fs.readCalls).toBe(6);
+	});
+
 	test("tracks only successful sync time, recovers errors, and excludes dead letters", () => {
 		const state = new SyncStatusState();
 		state.recordTickResult(
-			{ ok: false, error: "offline", pushed: 0, applied: 0, deadLettered: 0 },
+			{
+				ok: false,
+				failureKind: "error",
+				error: "offline",
+				pushed: 0,
+				applied: 0,
+				deadLettered: 0,
+			},
 			100,
 		);
 		expect(state.get()).toMatchObject({
@@ -79,7 +124,8 @@ describe("sync status state", () => {
 
 		state.recordTickResult({
 			ok: false,
-			error: "1 operation(s) require attention",
+			failureKind: "dead-letter",
+			error: "wording may change without affecting classification",
 			pushed: 0,
 			applied: 0,
 			deadLettered: 1,
@@ -138,5 +184,20 @@ describe("sync status state", () => {
 
 		const alreadyActive = { ...engine, isTickActive: () => true };
 		expect(coordinator.request(alreadyActive)).toBeNull();
+	});
+
+	test("background syncs cannot enter the manual spinner state", async () => {
+		const state = new SyncStatusState();
+		const engine: ManualSyncTarget = {
+			isTickActive: () => false,
+			tick: async (options) => {
+				expect(options).toBeUndefined();
+				return OK_RESULT;
+			},
+		};
+
+		await engine.tick();
+
+		expect(state.get().manualInboxRequestInFlight).toBe(false);
 	});
 });

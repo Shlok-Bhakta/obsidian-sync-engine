@@ -639,20 +639,6 @@ describe("SyncEngine", () => {
 		expect(engine.isTickActive()).toBe(false);
 	});
 
-	test("background ticks do not invoke manual inbox callbacks", async () => {
-		const phases: string[] = [];
-		const engine = new SyncEngine({
-			fs: new MemoryVaultFs(),
-			transport: new FakeTransport(),
-			outboxPath: OUTBOX,
-			inboxPath: INBOX,
-			getRevision: () => 0,
-			setRevision: () => {},
-		});
-		await engine.tick();
-		expect(phases).toEqual([]);
-	});
-
 	test("dead-lettering a permanent 413 failure does not block later outbox ops", async () => {
 		const fs = new MemoryVaultFs();
 		await fs.write("big.md", "too big");

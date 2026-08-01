@@ -97,6 +97,8 @@ export class SyncStatusState {
 	private runtime: QueueRuntime | null = null;
 	private generation = 0;
 	private refreshTail: Promise<void> = Promise.resolve();
+	private refreshRunning = false;
+	private refreshRequested = false;
 
 	get(): Readonly<SyncControlSnapshot> {
 		return this.snapshot;
@@ -121,21 +123,18 @@ export class SyncStatusState {
 	}
 
 	refreshQueueDepths(): Promise<void> {
-		const runtime = this.runtime;
-		if (!runtime) return Promise.resolve();
-		this.refreshTail = this.refreshTail.catch(() => undefined).then(async () => {
-			const [outboxDepth, inboxDepth] = await Promise.all([
-				this.readDepth(runtime.fs, runtime.outboxPath),
-				this.readDepth(runtime.fs, runtime.inboxPath),
-			]);
-			if (this.runtime?.generation !== runtime.generation) return;
-			this.update({ outboxDepth, inboxDepth });
+		if (!this.runtime) return Promise.resolve();
+		this.refreshRequested = true;
+		if (this.refreshRunning) return this.refreshTail;
+		this.refreshRunning = true;
+		this.refreshTail = this.runRefreshLoop().finally(() => {
+			this.refreshRunning = false;
 		});
 		return this.refreshTail;
 	}
 
 	recordTickResult(result: SyncTickResult, completedAt = Date.now()): void {
-		if (result.ok || isDeadLetterOnlyResult(result)) {
+		if (result.ok || result.failureKind === "dead-letter") {
 			this.update({ lastSuccessfulSyncAt: completedAt, lastError: null });
 			return;
 		}
@@ -161,6 +160,31 @@ export class SyncStatusState {
 	private async readDepth(fs: SyncFs, path: string): Promise<number> {
 		if (!(await fs.exists(path))) return 0;
 		return countRawJsonlRows(await fs.read(path));
+	}
+
+	private async runRefreshLoop(): Promise<void> {
+		let firstError: unknown;
+		do {
+			this.refreshRequested = false;
+			const runtime = this.runtime;
+			if (!runtime) continue;
+			try {
+				const [outboxDepth, inboxDepth] = await Promise.all([
+					this.readDepth(runtime.fs, runtime.outboxPath),
+					this.readDepth(runtime.fs, runtime.inboxPath),
+				]);
+				if (this.runtime?.generation === runtime.generation) {
+					this.update({ outboxDepth, inboxDepth });
+				}
+			} catch (error) {
+				firstError ??= error;
+			}
+		} while (this.refreshRequested);
+		if (firstError !== undefined) {
+			throw firstError instanceof Error
+				? firstError
+				: new Error(safeErrorSummary(firstError));
+		}
 	}
 
 	private update(change: Partial<SyncControlSnapshot>): void {
@@ -197,12 +221,4 @@ export class ManualSyncCoordinator {
 			this.requestInFlight = false;
 		});
 	}
-}
-
-function isDeadLetterOnlyResult(result: SyncTickResult): boolean {
-	return (
-		!result.ok &&
-		result.deadLettered > 0 &&
-		result.error === `${result.deadLettered} operation(s) require attention`
-	);
 }
