@@ -42,6 +42,7 @@ export default class ObsidianSyncPlugin extends Plugin {
 		(state: ServerConnectionState) => void
 	>();
 	private serverActivationTail: Promise<void> = Promise.resolve();
+	private initialSeedStarted = false;
 
 	async onload() {
 		this.logger.info("plugin.loading", {
@@ -63,6 +64,11 @@ export default class ObsidianSyncPlugin extends Plugin {
 			authenticate: (serverUrl) => this.authenticateServerCandidate(serverUrl),
 			activate: (connection, isCurrent) =>
 				this.activateServerConnection(connection, isCurrent),
+			onConnectionEstablished: () => {
+				void this.seedVaultAfterConnection().catch((error) => {
+					this.logger.warn("auto_seed.connection_callback_failed", { error });
+				});
+			},
 			onConnected: () => new Notice("Connected to sync server"),
 			onStateChanged: (state) => {
 				this.logger.debug("settings.server_connection_state_changed", state);
@@ -97,7 +103,10 @@ export default class ObsidianSyncPlugin extends Plugin {
 			this.logger.info("plugin.initial_sync_scheduled", {
 				revision: this.settings.revision,
 			});
-			void this.initializeSync().catch((error) => {
+			void this.connectionCoordinator.update(
+				this.settings.serverUrl,
+				{ announce: false },
+			).catch((error) => {
 				this.logger.warn("plugin.initial_sync_failed", { error });
 			});
 		} else {
@@ -292,11 +301,14 @@ export default class ObsidianSyncPlugin extends Plugin {
 		}
 	}
 
-	private async initializeSync(): Promise<void> {
-		await this.authenticate();
+	private async seedVaultAfterConnection(): Promise<void> {
 		this.logger.info("auto_seed.evaluating", {
 			revision: this.settings.revision,
 		});
+		if (this.settings.revision === 0) {
+			if (this.initialSeedStarted) return;
+			this.initialSeedStarted = true;
+		}
 		const seeded = await seedVaultIfRevisionZero(
 			this.settings.revision,
 			async () => {

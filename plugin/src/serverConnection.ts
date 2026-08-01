@@ -29,8 +29,13 @@ type ServerConnectionCoordinatorOptions = {
 		connection: AuthenticatedServerConnection,
 		isCurrent: () => boolean,
 	) => Promise<boolean>;
+	onConnectionEstablished?: (serverUrl: string) => void;
 	onConnected: (serverUrl: string) => void;
 	onStateChanged?: (state: ServerConnectionState) => void;
+};
+
+type ServerConnectionUpdateOptions = {
+	announce?: boolean;
 };
 
 /**
@@ -70,7 +75,10 @@ export class ServerConnectionCoordinator {
 		this.setState(normalized, "failed");
 	}
 
-	async update(serverUrl: string): Promise<void> {
+	async update(
+		serverUrl: string,
+		options: ServerConnectionUpdateOptions = {},
+	): Promise<void> {
 		const normalized = normalizeServerUrl(serverUrl);
 		const attempt = ++this.attempt;
 		const isCurrent = () => attempt === this.attempt;
@@ -99,7 +107,10 @@ export class ServerConnectionCoordinator {
 			const activated = await this.options.activate(connection, isCurrent);
 			if (!activated || !isCurrent()) return;
 			this.setState(normalized, "connected");
-			this.options.onConnected(normalized);
+			this.options.onConnectionEstablished?.(normalized);
+			if (options.announce !== false) {
+				this.options.onConnected(normalized);
+			}
 		} catch {
 			if (isCurrent()) this.setState(normalized, "failed");
 		}
