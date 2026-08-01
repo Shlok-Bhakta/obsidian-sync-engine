@@ -1,6 +1,19 @@
 import { requestUrl } from 'obsidian';
 import { deserialize, MessageType, serialize } from 'obsidian-sync-protocol';
+import type { HttpRequestFn } from "./http";
+import type { Logger } from "./logger";
 import type ObsidianSyncPlugin from './main';
+
+export type ClientAuthentication = {
+	serverUrl: string;
+	clientName: string;
+	clientSecret: string;
+};
+
+type AuthenticateClientOptions = ClientAuthentication & {
+	request: HttpRequestFn;
+	logger: Logger;
+};
 
 /**
  * HTTP handshake that replaces the old websocket-only first-client auth.
@@ -9,26 +22,45 @@ import type ObsidianSyncPlugin from './main';
  */
 export async function ensureAuthenticated(plugin: ObsidianSyncPlugin): Promise<void> {
 	if (plugin.isSyncSuspended()) {
-		throw new Error("Reload Obsidian before reconnecting to the new server");
+		throw new Error("The sync connection is changing");
 	}
-	const logger = plugin.logger.child("auth_http");
+	const authentication = await authenticateClient({
+		serverUrl: plugin.settings.serverUrl,
+		clientName: plugin.settings.clientName,
+		clientSecret: plugin.settings.clientSecret,
+		request: requestUrl,
+		logger: plugin.logger,
+	});
+	const changed =
+		plugin.settings.clientSecret !== authentication.clientSecret ||
+		plugin.settings.clientName !== authentication.clientName;
+	plugin.settings.clientSecret = authentication.clientSecret;
+	plugin.settings.clientName = authentication.clientName;
+	if (changed) await plugin.saveSettings();
+}
+
+/** Runs the existing HTTP auth flow without mutating live plugin settings. */
+export async function authenticateClient(
+	options: AuthenticateClientOptions,
+): Promise<ClientAuthentication> {
+	const logger = options.logger.child("auth_http");
 	const startedAt = Date.now();
 	logger.debug("request.started", {
 		method: "POST",
 		route: "/auth",
-		serverUrl: plugin.settings.serverUrl,
-		clientName: plugin.settings.clientName,
+		serverUrl: options.serverUrl,
+		clientName: options.clientName,
 	});
 	let response;
 	try {
-		response = await requestUrl({
-			url: `${plugin.settings.serverUrl}/auth`,
+		response = await options.request({
+			url: `${options.serverUrl}/auth`,
 			method: 'POST',
 			contentType: 'application/json',
 			body: serialize({
 				type: MessageType.AUTH_ACK,
-				client_name: plugin.settings.clientName,
-				token: plugin.settings.clientSecret,
+				client_name: options.clientName,
+				token: options.clientSecret,
 			}),
 			throw: false,
 		});
@@ -66,22 +98,27 @@ export async function ensureAuthenticated(plugin: ObsidianSyncPlugin): Promise<v
 		logger.info("client.enrolled", {
 			clientName: message.client_name,
 		});
-		plugin.settings.clientSecret = message.token;
-		plugin.settings.clientName = message.client_name;
-		await plugin.saveSettings();
-		return;
+		return {
+			serverUrl: options.serverUrl,
+			clientName: message.client_name,
+			clientSecret: message.token,
+		};
 	}
 
 	if (message.type === MessageType.AUTH_SUCCESS) {
 		logger.info("client.verified", {
-			clientName: plugin.settings.clientName,
+			clientName: options.clientName,
 		});
-		return;
+		return {
+			serverUrl: options.serverUrl,
+			clientName: options.clientName,
+			clientSecret: options.clientSecret,
+		};
 	}
 
 	if (message.type === MessageType.AUTH_FAILED) {
 		logger.warn("client.rejected", {
-			clientName: plugin.settings.clientName,
+			clientName: options.clientName,
 			reason: message.reason,
 		});
 		throw new Error(`Auth failed: ${message.reason}`);

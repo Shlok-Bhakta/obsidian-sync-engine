@@ -1,5 +1,5 @@
 import { Notice, Plugin, requestUrl, type WorkspaceLeaf } from 'obsidian';
-import { ensureAuthenticated } from './auth';
+import { authenticateClient, ensureAuthenticated } from './auth';
 import {
 	DEFAULT_SETTINGS,
 	ObsidianSyncSettings,
@@ -13,6 +13,7 @@ import {
 import { SyncStatusView, SYNC_STATUS_VIEW_TYPE } from './ui/syncStatusView';
 import {
 	registerVaultSync,
+	replaceVaultSyncRuntime,
 	seedServerFromVault,
 	type VaultSync,
 } from './vaultSync';
@@ -23,12 +24,24 @@ import {
 	type ClientInvite,
 } from "./clientInvites";
 import { createClientLogger, type Logger } from "./logger";
+import {
+	checkServerHealth,
+	ServerConnectionCoordinator,
+	type AuthenticatedServerConnection,
+	type ServerConnectionState,
+} from "./serverConnection";
 
 export default class ObsidianSyncPlugin extends Plugin {
 	settings!: ObsidianSyncSettings;
 	sync!: VaultSync;
 	readonly logger: Logger = createClientLogger(__CLIENT_LOGGING_ENABLED__);
-	private reloadRequired = false;
+	private connectionCoordinator!: ServerConnectionCoordinator;
+	private connectionChangesInProgress = 0;
+	private connectedServerUrl: string | null = null;
+	private readonly connectionStateListeners = new Set<
+		(state: ServerConnectionState) => void
+	>();
+	private serverActivationTail: Promise<void> = Promise.resolve();
 
 	async onload() {
 		this.logger.info("plugin.loading", {
@@ -38,6 +51,24 @@ export default class ObsidianSyncPlugin extends Plugin {
 		await this.loadSettings();
 
 		this.sync = registerVaultSync(this);
+		this.connectionCoordinator = new ServerConnectionCoordinator({
+			checkHealth: (serverUrl) =>
+				checkServerHealth({
+					serverUrl,
+					request: requestUrl,
+					logger: this.logger,
+				}),
+			isConnected: (serverUrl) =>
+				this.connectedServerUrl === serverUrl && !this.isSyncSuspended(),
+			authenticate: (serverUrl) => this.authenticateServerCandidate(serverUrl),
+			activate: (connection, isCurrent) =>
+				this.activateServerConnection(connection, isCurrent),
+			onConnected: () => new Notice("Connected to sync server"),
+			onStateChanged: (state) => {
+				this.logger.debug("settings.server_connection_state_changed", state);
+				for (const listener of this.connectionStateListeners) listener(state);
+			},
+		});
 		this.logger.info("plugin.sync_registered", {
 			serverUrl: this.settings.serverUrl,
 			serverIdentity: this.settings.serverIdentity,
@@ -147,37 +178,27 @@ export default class ObsidianSyncPlugin extends Plugin {
 	}
 
 	async changeServerUrl(value: string): Promise<void> {
-		const serverUrl = normalizeServerUrl(value);
-		if (serverUrl !== this.settings.serverUrl) {
-			this.logger.info("settings.server_change_started", {
-				previousServerUrl: this.settings.serverUrl,
-				nextServerUrl: serverUrl,
-			});
-			// Gate new work first, then wait for any old-server Vault mutation
-			// to finish before committing the new identity and credentials.
-			this.reloadRequired = true;
-			await this.sync.engine.quiesce();
-			transitionServerSettings(
-				this.settings,
-				serverUrl,
-				DEFAULT_SETTINGS.clientSecret,
-			);
-			new Notice("Server changed. Reload Obsidian to reconnect; sync state is isolated per server.");
-			this.logger.info("settings.server_change_completed", {
-				serverUrl,
-				serverIdentity: this.settings.serverIdentity,
-			});
-		}
-		await this.saveSettings();
+		await this.connectionCoordinator.update(value);
+	}
+
+	getServerConnectionState(): ServerConnectionState {
+		return this.connectionCoordinator.getState();
+	}
+
+	onServerConnectionStateChanged(
+		listener: (state: ServerConnectionState) => void,
+	): () => void {
+		this.connectionStateListeners.add(listener);
+		return () => this.connectionStateListeners.delete(listener);
 	}
 
 	isSyncSuspended(): boolean {
-		return this.reloadRequired;
+		return this.connectionChangesInProgress > 0;
 	}
 
 	async authenticate(): Promise<void> {
-		if (this.reloadRequired) {
-			throw new Error("Reload Obsidian before reconnecting to the new server");
+		if (this.isSyncSuspended()) {
+			throw new Error("The sync connection is changing");
 		}
 		try {
 			this.logger.info("auth.started", {
@@ -189,15 +210,85 @@ export default class ObsidianSyncPlugin extends Plugin {
 				serverUrl: this.settings.serverUrl,
 				clientName: this.settings.clientName,
 			});
-			new Notice('Authenticated with sync server');
+			this.connectedServerUrl = this.settings.serverUrl;
+			this.connectionCoordinator.markConnected(this.settings.serverUrl);
 		} catch (error) {
 			this.logger.error("auth.failed", {
 				serverUrl: this.settings.serverUrl,
 				clientName: this.settings.clientName,
 				error,
 			});
-			new Notice('Authentication failed: ' + this.formatError(error));
+			this.connectionCoordinator.markFailed(this.settings.serverUrl);
 			throw error;
+		}
+	}
+
+	private authenticateServerCandidate(
+		serverUrl: string,
+	): Promise<AuthenticatedServerConnection> {
+		const currentServerUrl = normalizeServerUrl(this.settings.serverUrl);
+		return authenticateClient({
+			serverUrl,
+			clientName: this.settings.clientName,
+			clientSecret:
+				serverUrl === currentServerUrl
+					? this.settings.clientSecret
+					: DEFAULT_SETTINGS.clientSecret,
+			request: requestUrl,
+			logger: this.logger,
+		});
+	}
+
+	private activateServerConnection(
+		connection: AuthenticatedServerConnection,
+		isCurrent: () => boolean,
+	): Promise<boolean> {
+		const activation = this.serverActivationTail.then(() =>
+			this.performServerActivation(connection, isCurrent),
+		);
+		this.serverActivationTail = activation.then(
+			() => undefined,
+			() => undefined,
+		);
+		return activation;
+	}
+
+	private async performServerActivation(
+		connection: AuthenticatedServerConnection,
+		isCurrent: () => boolean,
+	): Promise<boolean> {
+		if (!isCurrent()) return false;
+		this.connectionChangesInProgress++;
+		try {
+			this.logger.info("settings.server_change_started", {
+				previousServerUrl: this.settings.serverUrl,
+				nextServerUrl: connection.serverUrl,
+			});
+			await this.sync.engine.quiesce();
+			if (!isCurrent()) return false;
+
+			transitionServerSettings(
+				this.settings,
+				connection.serverUrl,
+				DEFAULT_SETTINGS.clientSecret,
+			);
+			this.settings.clientName = connection.clientName;
+			this.settings.clientSecret = connection.clientSecret;
+			this.connectedServerUrl = connection.serverUrl;
+
+			// Both calls synchronously capture the new configuration before either
+			// yields, so a later field change cannot make this response commit stale
+			// settings or install a stale runtime.
+			const runtimeReady = replaceVaultSyncRuntime(this, this.sync);
+			const settingsSaved = this.saveSettings();
+			await Promise.all([runtimeReady, settingsSaved]);
+			this.logger.info("settings.server_change_completed", {
+				serverUrl: connection.serverUrl,
+				serverIdentity: this.settings.serverIdentity,
+			});
+			return true;
+		} finally {
+			this.connectionChangesInProgress--;
 		}
 	}
 
@@ -247,8 +338,8 @@ export default class ObsidianSyncPlugin extends Plugin {
 	}
 
 	async createClientInvite(): Promise<ClientInvite> {
-		if (this.reloadRequired) {
-			throw new Error("Reload Obsidian before creating a client package");
+		if (this.isSyncSuspended()) {
+			throw new Error("The sync connection is changing");
 		}
 		await ensureAuthenticated(this);
 		this.logger.info("client_invite.request_started");
