@@ -35,6 +35,7 @@ export async function appendInbox(
 	path: string,
 	ops: InboxOp[],
 	injectedLogger: Logger = new NoopLogger(),
+	onQueueChanged?: () => void,
 ): Promise<void> {
 	const logger = injectedLogger.child("inbox");
 	if (ops.length === 0) {
@@ -53,6 +54,7 @@ export async function appendInbox(
 	return mutexFor(path).run(async () => {
 		const existing = await readInbox(fs, path, logger);
 		await writeInbox(fs, path, [...existing, ...ops], logger);
+		onQueueChanged?.();
 		logger.info("append.completed", {
 			inboxPath: path,
 			appendedOperations: ops.length,
@@ -78,6 +80,7 @@ export type ApplyInboxOptions = {
 	/** Leave this line and all later lines durable for a later tick. */
 	shouldDeferApply?: (op: InboxOp) => boolean;
 	logger?: Logger;
+	onQueueChanged?: () => void;
 };
 
 /**
@@ -127,6 +130,7 @@ export async function applyInbox(
 			if (line.rev <= currentRevision) {
 				lines = lines.slice(1);
 				await writeInbox(fs, inboxPath, lines, logger);
+				options.onQueueChanged?.();
 				logger.info("apply.operation_dropped", {
 					path: line.path,
 					operation: line.op,
@@ -165,6 +169,7 @@ export async function applyInbox(
 			currentRevision = line.rev;
 			lines = lines.slice(1);
 			await writeInbox(fs, inboxPath, lines, logger);
+			options.onQueueChanged?.();
 			logger.info("apply.operation_committed", {
 				path: line.path,
 				operation: line.op,

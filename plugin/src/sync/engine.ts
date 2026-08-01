@@ -43,9 +43,19 @@ export type SyncEngineOptions = {
 	/** Optional hook invoked when a permanent outbox failure is dead-lettered. */
 	onPermanentFailure?: (failure: PermanentSyncFailure) => void;
 	onEnqueueFailure?: (error: Error, op: OutboxOp) => void;
+	/** Called after either durable queue file changes. */
+	onQueueChanged?: () => void;
+	/** Called once when a sync round finishes, including failed rounds. */
+	onTickCompleted?: (result: SyncTickResult) => void;
 	/** Stops all persistence/network work while runtime configuration is stale. */
 	isSuspended?: () => boolean;
 	logger?: Logger;
+};
+
+export type SyncTickOptions = {
+	/** Manual-sync UI hook: only wraps the server inbox request, not application. */
+	onInboxRequestStarted?: () => void;
+	onInboxRequestFinished?: () => void;
 };
 
 export type PermanentSyncFailure = {
@@ -90,6 +100,8 @@ export class SyncEngine {
 	private readonly debouncer: Debouncer<"tick">;
 	private readonly onPermanentFailure?: (failure: PermanentSyncFailure) => void;
 	private readonly onEnqueueFailure?: (error: Error, op: OutboxOp) => void;
+	private readonly onQueueChanged?: () => void;
+	private readonly onTickCompleted?: (result: SyncTickResult) => void;
 	private readonly isSuspended: () => boolean;
 	private readonly logger: Logger;
 
@@ -119,6 +131,8 @@ export class SyncEngine {
 		this.setRevision = options.setRevision;
 		this.onPermanentFailure = options.onPermanentFailure;
 		this.onEnqueueFailure = options.onEnqueueFailure;
+		this.onQueueChanged = options.onQueueChanged;
+		this.onTickCompleted = options.onTickCompleted;
 		this.isSuspended = options.isSuspended ?? (() => false);
 		this.logger = (options.logger ?? new NoopLogger()).child("engine");
 		this.debouncer = new Debouncer(
@@ -213,6 +227,7 @@ export class SyncEngine {
 		this.enqueueInFlight.add(persistence);
 		try {
 			await persistence;
+			this.notifyQueueChanged();
 			this.failedEnqueues.delete(path);
 			this.logger.info("enqueue.persisted", {
 				path,
@@ -324,6 +339,7 @@ export class SyncEngine {
 				operation: op.op,
 			});
 			await enqueueOutbox(this.fs, this.outboxPath, op, this.logger);
+			this.notifyQueueChanged();
 			this.failedEnqueues.delete(path);
 			this.logger.info("enqueue.retry_succeeded", {
 				path,
@@ -350,16 +366,29 @@ export class SyncEngine {
 	 * One sync round: drain the outbox out, then pull and apply the inbox.
 	 * Concurrent callers share the same in-flight promise (single-flight).
 	 */
-	async tick(): Promise<SyncTickResult> {
+	async tick(options: SyncTickOptions = {}): Promise<SyncTickResult> {
 		if (this.tickInFlight) {
 			this.logger.debug("tick.joined_existing");
 			return this.tickInFlight;
 		}
 		this.logger.debug("tick.started");
-		this.tickInFlight = this.runTick().finally(() => {
-			this.tickInFlight = null;
-		});
+		this.tickInFlight = this.runTick(options)
+			.then((result) => {
+				try {
+					this.onTickCompleted?.(result);
+				} catch (error) {
+					this.logger.warn("tick.completion_callback_failed", { error });
+				}
+				return result;
+			})
+			.finally(() => {
+				this.tickInFlight = null;
+			});
 		return this.tickInFlight;
+	}
+
+	isTickActive(): boolean {
+		return this.tickInFlight !== null;
 	}
 
 	private async ensureHydrated(): Promise<void> {
@@ -368,7 +397,7 @@ export class SyncEngine {
 		}
 	}
 
-	private async runTick(): Promise<SyncTickResult> {
+	private async runTick(options: SyncTickOptions): Promise<SyncTickResult> {
 		const startedAt = Date.now();
 		let pushed = 0;
 		let applied = 0;
@@ -405,7 +434,7 @@ export class SyncEngine {
 				}
 			}
 			await this.rebuildPendingPaths();
-			applied = await this.applyRemoteInbox();
+			applied = await this.applyRemoteInbox(options);
 			if (deadLettered > 0) {
 				const result: SyncTickResult = {
 					ok: false,
@@ -504,7 +533,7 @@ export class SyncEngine {
 				});
 				throw error;
 			}
-		}, this.logger);
+		}, this.logger, () => this.notifyQueueChanged());
 
 		for (const path of processedPaths) {
 			await this.refreshPending(path);
@@ -574,17 +603,29 @@ export class SyncEngine {
 		return result;
 	}
 
-	private async applyRemoteInbox(): Promise<number> {
+	private async applyRemoteInbox(options: SyncTickOptions): Promise<number> {
 		this.assertActive();
 		const rev = await this.getRevision();
 		this.logger.debug("inbox.fetching", { revision: rev });
-		const ops = await this.transport.fetchInbox(rev);
+		this.notifyTickPhase(options.onInboxRequestStarted, "started");
+		let ops: InboxOp[];
+		try {
+			ops = await this.transport.fetchInbox(rev);
+		} finally {
+			this.notifyTickPhase(options.onInboxRequestFinished, "finished");
+		}
 		this.logger.info("inbox.fetched", {
 			revision: rev,
 			operationCount: ops.length,
 		});
 		this.assertActive();
-		await appendInbox(this.fs, this.inboxPath, ops, this.logger);
+		await appendInbox(
+			this.fs,
+			this.inboxPath,
+			ops,
+			this.logger,
+			() => this.notifyQueueChanged(),
+		);
 
 		let applied = 0;
 		await applyInbox(this.fs, this.inboxPath, {
@@ -620,8 +661,28 @@ export class SyncEngine {
 				return deferred;
 			},
 			logger: this.logger,
+			onQueueChanged: () => this.notifyQueueChanged(),
 		});
 		return applied;
+	}
+
+	private notifyQueueChanged(): void {
+		try {
+			this.onQueueChanged?.();
+		} catch (error) {
+			this.logger.warn("queue.change_callback_failed", { error });
+		}
+	}
+
+	private notifyTickPhase(
+		callback: (() => void) | undefined,
+		phase: "started" | "finished",
+	): void {
+		try {
+			callback?.();
+		} catch (error) {
+			this.logger.warn("tick.phase_callback_failed", { phase, error });
+		}
 	}
 
 	private assertActive(): void {

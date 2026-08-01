@@ -11,21 +11,18 @@ import { ObsidianFs } from './sync/obsidianFs';
 import { isStaleFileDeletion } from "./sync/vaultEvents";
 import { isSyncExcludedPath } from "./sync/excludedPaths";
 import type { DataAdapter, DataWriteOptions } from "obsidian";
+import { SyncStatusState } from "./ui/syncStatusState";
 
 const TICK_INTERVAL_MS = 3000;
 const DEBOUNCE_MS = 1000;
-
-export type SyncStatus = {
-	lastTickAt: number | null;
-	lastError: string | null;
-};
 
 export type VaultSync = {
 	engine: SyncEngine;
 	fs: ObsidianFs;
 	outboxPath: string;
+	inboxPath: string;
 	deadLetterPath: string;
-	status: SyncStatus;
+	status: SyncStatusState;
 };
 
 /** Directory the plugin's own files (main.js, data.json, ...) live in. */
@@ -214,13 +211,13 @@ function registerConfigAdapterSync(
 
 type VaultSyncRuntime = Pick<
 	VaultSync,
-	"engine" | "outboxPath" | "deadLetterPath"
+	"engine" | "outboxPath" | "inboxPath" | "deadLetterPath"
 >;
 
 function createVaultSyncRuntime(
 	plugin: ObsidianSyncPlugin,
 	fs: ObsidianFs,
-	status: SyncStatus,
+	status: SyncStatusState,
 ): VaultSyncRuntime {
 	const logger = plugin.logger.child("vault_sync");
 	const outboxPath = getOutboxPath(plugin);
@@ -274,7 +271,6 @@ function createVaultSyncRuntime(
 		},
 		debounceMs: DEBOUNCE_MS,
 		onPermanentFailure: ({ op, error }) => {
-			status.lastError = `${op.path}: ${error}`;
 			logger.error("permanent_failure", {
 				path: op.path,
 				operation: op.op,
@@ -282,20 +278,26 @@ function createVaultSyncRuntime(
 			});
 		},
 		onEnqueueFailure: (error, op) => {
-			status.lastError = `Could not persist ${op.path}: ${error.message}`;
+			status.recordError(`Could not persist ${op.path}: ${error.message}`);
 			logger.error("enqueue_failure", {
 				path: op.path,
 				operation: op.op,
 				error,
 			});
 		},
+		onQueueChanged: () => {
+			void status.refreshQueueDepths().catch((error) => {
+				logger.warn("queue_depth_refresh.failed", { error });
+			});
+		},
+		onTickCompleted: (result) => status.recordTickResult(result),
 		isSuspended: () =>
 			plugin.isSyncSuspended() ||
 			plugin.settings.serverIdentity !== runtimeIdentity,
 		logger,
 	});
 
-	return { engine, outboxPath, deadLetterPath };
+	return { engine, outboxPath, inboxPath, deadLetterPath };
 }
 
 /**
@@ -310,9 +312,12 @@ export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
 		plugin.app.vault,
 		logger,
 	);
-	const status: SyncStatus = { lastTickAt: null, lastError: null };
+	const status = new SyncStatusState();
 	const runtime = createVaultSyncRuntime(plugin, fs, status);
 	const sync: VaultSync = { fs, status, ...runtime };
+	void status.setQueueRuntime(fs, runtime.outboxPath, runtime.inboxPath).catch((error) => {
+		logger.warn("queue_depth_initialization.failed", { error });
+	});
 	logger.info("registering", {
 		serverUrl: plugin.settings.serverUrl,
 		serverIdentity: plugin.settings.serverIdentity,
@@ -482,29 +487,20 @@ export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
 
 	plugin.register(() => {
 		void sync.engine.flush().catch((error) => {
-			status.lastError =
-				error instanceof Error ? error.message : String(error);
+			status.recordError(error);
 			logger.error("unload_flush.failed", { error });
 		});
 	});
 
 	plugin.registerInterval(
 		window.setInterval(() => {
-			void sync.engine.tick().then(async (result) => {
-				status.lastTickAt = Date.now();
-				if (result.ok) {
-					status.lastError = (await fs.exists(sync.deadLetterPath))
-						? "Some files require attention; see the dead-letter journal"
-						: null;
-				} else {
-					status.lastError = result.error;
-				}
+			void sync.engine.tick().then((result) => {
 				logger.debug("interval_tick.status_updated", {
 					ok: result.ok,
 					pushed: result.pushed,
 					applied: result.applied,
 					deadLettered: result.deadLettered,
-					lastError: status.lastError,
+					lastError: status.get().lastError,
 				});
 			});
 		}, TICK_INTERVAL_MS),
@@ -521,9 +517,10 @@ export async function replaceVaultSyncRuntime(
 	const runtime = createVaultSyncRuntime(plugin, sync.fs, sync.status);
 	sync.engine = runtime.engine;
 	sync.outboxPath = runtime.outboxPath;
+	sync.inboxPath = runtime.inboxPath;
 	sync.deadLetterPath = runtime.deadLetterPath;
-	sync.status.lastTickAt = null;
-	sync.status.lastError = null;
+	sync.status.resetForRuntimeChange();
+	await sync.status.setQueueRuntime(sync.fs, runtime.outboxPath, runtime.inboxPath);
 	await sync.engine.hydrate();
 	plugin.logger.info("vault_sync.runtime_replaced", {
 		serverUrl: plugin.settings.serverUrl,
