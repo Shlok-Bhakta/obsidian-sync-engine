@@ -1,0 +1,4 @@
+interface:
+  display_name: "Record Obsidian App Demos"
+  short_description: "Record and publish cursor-free Obsidian demos"
+  default_prompt: "Use $record-obsidian-demo to record, verify, upload to Planista, and clean up a cursor-free demo."

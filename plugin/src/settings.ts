@@ -1,9 +1,20 @@
-import { App, Notice, PluginSettingTab, Setting, requestUrl } from 'obsidian';
+import {
+	App,
+	Notice,
+	PluginSettingTab,
+	Setting,
+	requestUrl,
+	type TextComponent,
+} from 'obsidian';
 import ObsidianSyncPlugin from './main';
 import { deserialize, MessageType, serialize } from 'obsidian-sync-protocol';
 import type { ClientConfig } from "obsidian-sync-protocol";
-import { serverIdentityFor } from "./sync/serverIdentity";
+import {
+	normalizeServerUrl,
+	serverIdentityFor,
+} from "./sync/serverIdentity";
 import type { ClientInvite } from "./clientInvites";
+import type { ServerConnectionState } from "./serverConnection";
 
 export {
 	normalizeServerUrl,
@@ -36,10 +47,19 @@ const isHttpUrl = (value: string): boolean => {
 export class SyncSettingTab extends PluginSettingTab {
 	plugin: ObsidianSyncPlugin;
 	private clientInvite: ClientInvite | null = null;
+	private clientNameInput: TextComponent | null = null;
+	private clientSecretInput: TextComponent | null = null;
+	private serverUrlInput: TextComponent | null = null;
+	private serverStatusIndicator: HTMLElement | null = null;
 
 	constructor(app: App, plugin: ObsidianSyncPlugin) {
 		super(app, plugin);
 		this.plugin = plugin;
+		this.plugin.register(
+			this.plugin.onServerConnectionStateChanged((state) => {
+				this.refreshConnectionControls(state);
+			}),
+		);
 	}
 
 	display(): void {
@@ -58,7 +78,7 @@ export class SyncSettingTab extends PluginSettingTab {
 				.onClick(() => this.refreshClientName(this.plugin.settings.clientName)),
 		)
 		.addText((text) =>
-			text
+			(this.clientNameInput = text)
 				.setPlaceholder('Main computer')
 				.setValue(this.plugin.settings.clientName)
 				.onChange(async (value) => {
@@ -80,14 +100,33 @@ export class SyncSettingTab extends PluginSettingTab {
 			.setName("Server URL")
 			.setDesc(serverUrlDesc)
 			.addText((text) =>
-				text
+				(this.serverUrlInput = text)
 					.setPlaceholder('HTTPS://...')
 					.setValue(this.plugin.settings.serverUrl)
 					.onChange(async (value) => {
-						await this.plugin.changeServerUrl(value);
 						updateServerUrlWarning(value);
+						const connection = this.plugin.changeServerUrl(value);
+						this.updateConnectionIndicator(value);
+						await connection;
+						const currentValue = this.serverUrlInput?.getValue() ?? value;
+						this.updateConnectionIndicator(currentValue);
+						const state = this.plugin.getServerConnectionState();
+						if (
+							state.status === "connected" &&
+							state.serverUrl === normalizeServerUrl(currentValue)
+						) {
+							this.clientNameInput?.setValue(
+								this.plugin.settings.clientName,
+							);
+							this.clientSecretInput?.setValue(
+								this.plugin.settings.clientSecret,
+							);
+						}
 					}),
 			);
+		this.serverStatusIndicator = serverUrlSetting.controlEl.createSpan({
+			cls: "obsidian-sync-connection-status",
+		});
 
 		const updateServerUrlWarning = (value: string) => {
 			const showWarning = isHttpUrl(value);
@@ -99,6 +138,7 @@ export class SyncSettingTab extends PluginSettingTab {
 		};
 
 		updateServerUrlWarning(this.plugin.settings.serverUrl);
+		this.updateConnectionIndicator(this.plugin.settings.serverUrl);
 
 		new Setting(containerEl)
 		.setName("Client secret")
@@ -112,7 +152,7 @@ export class SyncSettingTab extends PluginSettingTab {
 				.onClick(() => this.refreshClientSecret()),
 		)
 		.addText((text) =>
-			text
+			(this.clientSecretInput = text)
 				.setPlaceholder('Made by server')
 				.setValue(this.plugin.settings.clientSecret)
 				.onChange(async (value) => {
@@ -196,6 +236,38 @@ export class SyncSettingTab extends PluginSettingTab {
 				.setValue(this.plugin.settings.revision.toString())
 				.setDisabled(true)
 		);
+	}
+
+	private updateConnectionIndicator(value: string): void {
+		if (!this.serverStatusIndicator) return;
+		const state = this.plugin.getServerConnectionState();
+		const status =
+			state.serverUrl === normalizeServerUrl(value)
+				? state.status
+				: "unknown";
+		const tooltip = {
+			unknown: "Connection not checked",
+			checking: "Checking sync server connection",
+			connected: "Connected to sync server",
+			failed: "Could not connect to sync server",
+		}[status];
+		this.serverStatusIndicator.className =
+			`obsidian-sync-connection-status obsidian-sync-connection-status--${status}`;
+		this.serverStatusIndicator.title = tooltip;
+		this.serverStatusIndicator.setAttribute("aria-label", tooltip);
+	}
+
+	private refreshConnectionControls(state: ServerConnectionState): void {
+		const currentValue = this.serverUrlInput?.getValue();
+		if (currentValue === undefined) return;
+		this.updateConnectionIndicator(currentValue);
+		if (
+			state.status === "connected" &&
+			state.serverUrl === normalizeServerUrl(currentValue)
+		) {
+			this.clientNameInput?.setValue(this.plugin.settings.clientName);
+			this.clientSecretInput?.setValue(this.plugin.settings.clientSecret);
+		}
 	}
 
 	private async refreshClientSecret(): Promise<void> {

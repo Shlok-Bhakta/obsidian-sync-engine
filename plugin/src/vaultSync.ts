@@ -69,7 +69,7 @@ function isSyncEngineOwnedPath(plugin: ObsidianSyncPlugin, path: string): boolea
 function registerConfigAdapterSync(
 	plugin: ObsidianSyncPlugin,
 	fs: ObsidianFs,
-	engine: SyncEngine,
+	getEngine: () => SyncEngine,
 ): void {
 	const logger = plugin.logger.child("config_events");
 	const adapter: DataAdapter = plugin.app.vault.adapter;
@@ -106,7 +106,7 @@ function registerConfigAdapterSync(
 			path: normalized,
 			operation: "put",
 		});
-		engine.enqueuePut(normalized);
+		getEngine().enqueuePut(normalized);
 	};
 	const enqueueDelete = (path: string) => {
 		const normalized = normalizePath(path);
@@ -133,7 +133,7 @@ function registerConfigAdapterSync(
 			path: normalized,
 			operation: "delete",
 		});
-		engine.enqueueDelete(normalized);
+		getEngine().enqueueDelete(normalized);
 	};
 
 	const write = adapter.write.bind(adapter);
@@ -212,25 +212,23 @@ function registerConfigAdapterSync(
 	});
 }
 
-/**
- * Builds the SyncEngine for this plugin instance and wires it up to vault
- * events (note modify/create, delete, rename) and a periodic tick.
- * Called once from `onload`.
- */
-export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
+type VaultSyncRuntime = Pick<
+	VaultSync,
+	"engine" | "outboxPath" | "deadLetterPath"
+>;
+
+function createVaultSyncRuntime(
+	plugin: ObsidianSyncPlugin,
+	fs: ObsidianFs,
+	status: SyncStatus,
+): VaultSyncRuntime {
 	const logger = plugin.logger.child("vault_sync");
-	const fs = new ObsidianFs(
-		plugin.app.vault.adapter,
-		plugin.app.vault,
-		logger,
-	);
 	const outboxPath = getOutboxPath(plugin);
 	const inboxPath = getInboxPath(plugin);
 	const deadLetterPath = getDeadLetterPath(plugin);
-	const status: SyncStatus = { lastTickAt: null, lastError: null };
 	const runtimeIdentity = plugin.settings.serverIdentity;
 	const runtimeServerUrl = plugin.settings.serverUrl;
-	logger.info("registering", {
+	logger.info("runtime.created", {
 		serverUrl: runtimeServerUrl,
 		serverIdentity: runtimeIdentity,
 		outboxPath,
@@ -242,7 +240,7 @@ export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
 			plugin.isSyncSuspended() ||
 			plugin.settings.serverIdentity !== runtimeIdentity
 		) {
-			throw new Error("Sync runtime belongs to a different server; reload Obsidian");
+			throw new Error("The sync runtime is no longer active");
 		}
 	};
 
@@ -251,10 +249,10 @@ export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
 			assertRuntimeIdentity();
 			return runtimeServerUrl;
 		},
-			getAuthorization: () => {
-				assertRuntimeIdentity();
-				return plugin.settings.clientSecret;
-			},
+		getAuthorization: () => {
+			assertRuntimeIdentity();
+			return plugin.settings.clientSecret;
+		},
 		request: requestUrl,
 		logger,
 	});
@@ -296,7 +294,32 @@ export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
 			plugin.settings.serverIdentity !== runtimeIdentity,
 		logger,
 	});
-	registerConfigAdapterSync(plugin, fs, engine);
+
+	return { engine, outboxPath, deadLetterPath };
+}
+
+/**
+ * Builds the SyncEngine for this plugin instance and wires it up to vault
+ * events (note modify/create, delete, rename) and a periodic tick.
+ * Called once from `onload`.
+ */
+export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
+	const logger = plugin.logger.child("vault_sync");
+	const fs = new ObsidianFs(
+		plugin.app.vault.adapter,
+		plugin.app.vault,
+		logger,
+	);
+	const status: SyncStatus = { lastTickAt: null, lastError: null };
+	const runtime = createVaultSyncRuntime(plugin, fs, status);
+	const sync: VaultSync = { fs, status, ...runtime };
+	logger.info("registering", {
+		serverUrl: plugin.settings.serverUrl,
+		serverIdentity: plugin.settings.serverIdentity,
+		outboxPath: sync.outboxPath,
+		deadLetterPath: sync.deadLetterPath,
+	});
+	registerConfigAdapterSync(plugin, fs, () => sync.engine);
 
 	// Suppressed whenever the write/delete originated from *this* fs instance
 	// (e.g. the engine applying a remote put/delete) rather than from the
@@ -344,7 +367,7 @@ export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
 				event,
 				operation: "put",
 			});
-			engine.enqueuePut(file.path);
+			sync.engine.enqueuePut(file.path);
 		}
 	};
 	const enqueueDeleteIfLocal = (
@@ -386,7 +409,7 @@ export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
 				event,
 				operation: "delete",
 			});
-			engine.enqueueDelete(path);
+			sync.engine.enqueueDelete(path);
 		} else {
 			logger.debug("vault_event.skipped", {
 				path,
@@ -453,12 +476,12 @@ export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
 		);
 	});
 
-	void engine.hydrate().catch((error) => {
+	void sync.engine.hydrate().catch((error) => {
 		logger.error("hydrate.failed", { error });
 	});
 
 	plugin.register(() => {
-		void engine.flush().catch((error) => {
+		void sync.engine.flush().catch((error) => {
 			status.lastError =
 				error instanceof Error ? error.message : String(error);
 			logger.error("unload_flush.failed", { error });
@@ -467,10 +490,10 @@ export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
 
 	plugin.registerInterval(
 		window.setInterval(() => {
-			void engine.tick().then(async (result) => {
+			void sync.engine.tick().then(async (result) => {
 				status.lastTickAt = Date.now();
 				if (result.ok) {
-					status.lastError = (await fs.exists(deadLetterPath))
+					status.lastError = (await fs.exists(sync.deadLetterPath))
 						? "Some files require attention; see the dead-letter journal"
 						: null;
 				} else {
@@ -487,7 +510,27 @@ export function registerVaultSync(plugin: ObsidianSyncPlugin): VaultSync {
 		}, TICK_INTERVAL_MS),
 	);
 
-	return { engine, fs, outboxPath, deadLetterPath, status };
+	return sync;
+}
+
+/** Replace only the server-specific runtime while keeping one listener set. */
+export async function replaceVaultSyncRuntime(
+	plugin: ObsidianSyncPlugin,
+	sync: VaultSync,
+): Promise<void> {
+	const runtime = createVaultSyncRuntime(plugin, sync.fs, sync.status);
+	sync.engine = runtime.engine;
+	sync.outboxPath = runtime.outboxPath;
+	sync.deadLetterPath = runtime.deadLetterPath;
+	sync.status.lastTickAt = null;
+	sync.status.lastError = null;
+	await sync.engine.hydrate();
+	plugin.logger.info("vault_sync.runtime_replaced", {
+		serverUrl: plugin.settings.serverUrl,
+		serverIdentity: plugin.settings.serverIdentity,
+		outboxPath: sync.outboxPath,
+		deadLetterPath: sync.deadLetterPath,
+	});
 }
 
 /** Enqueues every current vault file (minus the engine's own bookkeeping files) and pushes them out. */

@@ -181,7 +181,7 @@ export class SyncEngine {
 				operation: op,
 				reason: "suspended",
 			});
-			throw new Error("Sync is suspended until Obsidian reloads");
+			throw new Error("Sync is suspended while the connection is changing");
 		}
 		const path = canonicalizeSyncPath(rawPath);
 		const baseRevision = op === "delete" ? await this.getRevision() : undefined;
@@ -377,7 +377,7 @@ export class SyncEngine {
 			if (this.isSuspended()) {
 				const result: SyncTickResult = {
 					ok: false,
-					error: "Sync is suspended until Obsidian reloads",
+					error: "Sync is suspended while the connection is changing",
 					pushed,
 					applied,
 					deadLettered,

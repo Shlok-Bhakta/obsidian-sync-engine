@@ -20,3 +20,29 @@
 	padding: 0 8px;
 	width: var(--input-height);
 }
+
+.obsidian-sync-connection-status {
+	background: currentColor;
+	border-radius: 50%;
+	display: inline-block;
+	flex: 0 0 auto;
+	height: 8px;
+	margin-left: 8px;
+	width: 8px;
+}
+
+.obsidian-sync-connection-status--unknown {
+	color: var(--text-muted);
+}
+
+.obsidian-sync-connection-status--checking {
+	color: var(--interactive-accent);
+}
+
+.obsidian-sync-connection-status--connected {
+	color: var(--text-success);
+}
+
+.obsidian-sync-connection-status--failed {
+	color: var(--text-error);
+}
