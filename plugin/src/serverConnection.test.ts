@@ -83,6 +83,56 @@ describe("server connection coordinator", () => {
 		});
 	});
 
+	test("signals establishment only after health, authentication, and activation", async () => {
+		const events: string[] = [];
+		const coordinator = new ServerConnectionCoordinator({
+			checkHealth: async () => {
+				events.push("health");
+				return true;
+			},
+			isConnected: () => false,
+			authenticate: async (serverUrl) => {
+				events.push("authenticate");
+				return connection(serverUrl);
+			},
+			activate: async () => {
+				events.push("activate");
+				return true;
+			},
+			onConnectionEstablished: () => events.push("established"),
+			onConnected: () => events.push("notice"),
+		});
+
+		await coordinator.update("https://sync.example");
+
+		expect(events).toEqual([
+			"health",
+			"authenticate",
+			"activate",
+			"established",
+			"notice",
+		]);
+	});
+
+	test("configured startup establishes silently after the handshake", async () => {
+		const events: string[] = [];
+		const coordinator = new ServerConnectionCoordinator({
+			checkHealth: async () => true,
+			isConnected: () => false,
+			authenticate: async (serverUrl) => connection(serverUrl),
+			activate: async () => true,
+			onConnectionEstablished: (serverUrl) => events.push(serverUrl),
+			onConnected: () => events.push("notice"),
+		});
+
+		await coordinator.update(
+			"https://configured.example",
+			{ announce: false },
+		);
+
+		expect(events).toEqual(["https://configured.example"]);
+	});
+
 	test("ignores a stale health response from an earlier keystroke", async () => {
 		const firstHealth = deferred<boolean>();
 		const authenticated: string[] = [];
@@ -141,6 +191,7 @@ describe("server connection coordinator", () => {
 
 	test("reports health and authentication failures without success notices", async () => {
 		const notices: string[] = [];
+		const established: string[] = [];
 		let healthSucceeds = false;
 		const coordinator = new ServerConnectionCoordinator({
 			checkHealth: async () => healthSucceeds,
@@ -149,6 +200,7 @@ describe("server connection coordinator", () => {
 				throw new Error("rejected");
 			},
 			activate: async () => true,
+			onConnectionEstablished: (serverUrl) => established.push(serverUrl),
 			onConnected: (serverUrl) => notices.push(serverUrl),
 		});
 
@@ -159,6 +211,7 @@ describe("server connection coordinator", () => {
 		await coordinator.update("https://unpaired.example");
 		expect(coordinator.getState().status).toBe("failed");
 		expect(notices).toEqual([]);
+		expect(established).toEqual([]);
 	});
 
 	test("marking a configured startup connection never shows a notice", () => {
