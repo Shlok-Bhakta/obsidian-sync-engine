@@ -1,4 +1,4 @@
-import { Platform, setIcon } from "obsidian";
+import { Platform, setIcon, setTooltip } from "obsidian";
 import type ObsidianSyncPlugin from "../main";
 import type { SyncEngine } from "../sync/engine";
 import type { VaultSync } from "../vaultSync";
@@ -12,6 +12,7 @@ const RELATIVE_TIME_REFRESH_MS = 10_000;
 
 export class SyncStatusControl {
 	private readonly button: HTMLButtonElement;
+	private readonly accessibleLabel: HTMLSpanElement;
 	private readonly unsubscribe: () => void;
 	private readonly manualSync: ManualSyncCoordinator;
 
@@ -21,10 +22,15 @@ export class SyncStatusControl {
 		container: HTMLElement,
 	) {
 		container.addClass("obsidian-sync-status-control-container");
+		this.accessibleLabel = container.createSpan({
+			cls: "obsidian-sync-status-control__accessible-label",
+		});
+		this.accessibleLabel.id = "obsidian-sync-status-control-label";
 		this.button = container.createEl("button", {
-			cls: "obsidian-sync-status-control",
+			cls: "clickable-icon obsidian-sync-status-control",
 			type: "button",
 		});
+		this.button.setAttribute("aria-labelledby", this.accessibleLabel.id);
 		this.manualSync = new ManualSyncCoordinator(sync.status);
 		this.unsubscribe = sync.status.subscribe((state) => this.render(state));
 		plugin.registerDomEvent(this.button, "click", () => {
@@ -73,13 +79,12 @@ export class SyncStatusControl {
 		const errorDescription = state.lastError
 			? ` Sync error: ${state.lastError}.`
 			: "";
-		this.button.setAttribute(
-			"aria-label",
-			`Outbox queue: ${state.outboxDepth}. Inbox queue: ${state.inboxDepth}.${errorDescription} ${action}`,
-		);
-		this.button.title = state.lastError
+		this.accessibleLabel.textContent =
+			`Outbox queue: ${state.outboxDepth}. Inbox queue: ${state.inboxDepth}.${errorDescription} ${action}`;
+		const tooltip = state.lastError
 			? `${state.lastError}\nCheck the console for details.`
 			: `Revision: ${this.plugin.settings.revision}\nSynced: ${formatShortRelativeTime(state.lastSuccessfulSyncAt)}`;
+		setTooltip(this.button, tooltip, { placement: "top" });
 	}
 
 	private renderCount(icon: string, count: number): void {
