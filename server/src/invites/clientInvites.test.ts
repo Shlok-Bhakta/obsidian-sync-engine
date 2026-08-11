@@ -178,6 +178,17 @@ describe("client invite packages", () => {
 		expect(availableStatus.status).toBe("available");
 		expect(availableStatus.remainingSeconds).toBeGreaterThanOrEqual(299);
 		expect(availableStatus.remainingSeconds).toBeLessThanOrEqual(300);
+		const otherClientStatus = clientInviteStatusSchema.parse(
+			await (await requestInviteStatus(
+				app,
+				ready.invite.url,
+				other.client_secret,
+			)).json(),
+		);
+		expect(otherClientStatus).toEqual({
+			status: "unavailable",
+			remainingSeconds: 0,
+		});
 		const download = await app.request(`${ready.invite.url}/download`, {
 			method: "POST",
 		});

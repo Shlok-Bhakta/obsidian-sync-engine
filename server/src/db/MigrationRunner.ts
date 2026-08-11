@@ -1,5 +1,6 @@
 import { sql } from "bun";
 import migration0001 from "./migrations/0001_init.sql" with { type: "file" };
+import migration0002 from "./migrations/0002_client_invite_owner.sql" with { type: "file" };
 import { serverLogger, type Logger } from "../logger";
 
 type Migration = {
@@ -12,6 +13,10 @@ const migrationsManifest: Migration[] = [
         name: "0001_init",
         sql: migration0001,
     },
+	{
+		name: "0002_client_invite_owner",
+		sql: migration0002,
+	},
 ]
 
 

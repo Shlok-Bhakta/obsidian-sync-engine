@@ -104,6 +104,7 @@ export function registerClientInviteBuildRoutes(
 		void createInvite({
 			store,
 			serverUrl,
+			ownerClientId,
 			logger,
 			now,
 			onProgress: (progress) => {

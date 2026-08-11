@@ -63,12 +63,15 @@ export async function cleanupExpiredClientInvites(
 
 export async function getInviteStatus(
 	token: string,
+	ownerClientId: string,
 	now = new Date(),
 	logger: Logger = serverLogger,
 ): Promise<ClientInviteStatus> {
 	const [row] = await sql<{ expires_at: Date }[]>`
 		SELECT expires_at FROM client_invites
-		WHERE token_hash = ${hashToken(token)} AND expires_at > ${now}
+		WHERE token_hash = ${hashToken(token)}
+			AND owner_client_id = ${ownerClientId}
+			AND expires_at > ${now}
 	`;
 	if (!row) {
 		await cleanupExpiredClientInvites(now, logger);
@@ -97,7 +100,14 @@ async function inviteExists(
 	now = new Date(),
 	logger: Logger = serverLogger,
 ): Promise<boolean> {
-	return (await getInviteStatus(token, now, logger)).status === "available";
+	const [row] = await sql<{ exists: boolean }[]>`
+		SELECT EXISTS (
+			SELECT 1 FROM client_invites
+			WHERE token_hash = ${hashToken(token)} AND expires_at > ${now}
+		) AS exists
+	`;
+	if (!row.exists) await cleanupExpiredClientInvites(now, logger);
+	return row.exists;
 }
 
 async function consumeInvite(
@@ -126,6 +136,7 @@ async function consumeInvite(
 export async function createInvite(options: {
 	store: ObjectStore;
 	serverUrl: string;
+	ownerClientId: string;
 	now?: () => Date;
 	logger?: Logger;
 	onProgress?: (progress: ClientArchiveProgressSnapshot) => void;
@@ -151,9 +162,9 @@ export async function createInvite(options: {
 		const expiresAt = new Date(now().getTime() + CLIENT_INVITE_LIFETIME_MS);
 		await sql`
 			INSERT INTO client_invites (
-				token_hash, client_id, archive, expires_at
+				token_hash, client_id, owner_client_id, archive, expires_at
 			) VALUES (
-				${hashToken(token)}, ${clientId}, ${archive}, ${expiresAt}
+				${hashToken(token)}, ${clientId}, ${options.ownerClientId}, ${archive}, ${expiresAt}
 			)
 		`;
 		const timer = setTimeout(() => {
@@ -232,7 +243,13 @@ export function registerClientInviteRoutes(
 				clientId: authorized,
 				serverUrl,
 			});
-			const invite = await createInvite({ store, serverUrl, logger, now });
+			const invite = await createInvite({
+				store,
+				serverUrl,
+				ownerClientId: authorized,
+				logger,
+				now,
+			});
 			const response: ClientInvite = {
 				url: `${serverUrl}/client-invites/${invite.token}`,
 				expiresAt: invite.expiresAt.toISOString(),
@@ -254,7 +271,7 @@ export function registerClientInviteRoutes(
 				logger.warn("status.rejected", { reason: "missing_invite_token" });
 				return c.json({ error: "Client invite token is required" }, 400, noStoreHeaders());
 			}
-			const status = await getInviteStatus(token, now(), logger);
+			const status = await getInviteStatus(token, authorized, now(), logger);
 			logger.debug("status.served", {
 				clientId: authorized,
 				status: status.status,
