@@ -1,7 +1,7 @@
 import { Context, Hono } from "hono";
 import { join, resolve } from "node:path";
 import { sql } from "bun";
-import { zipSync } from "fflate";
+import { Zip, ZipDeflate } from "fflate";
 import {
 	type ClientAuthorizer,
 	getClientIdFromAuthorization,
@@ -31,14 +31,22 @@ export { InvalidPathError };
  */
 const REVISION_LOCK_KEY = "obsidian-sync-revision";
 const PLUGIN_ID = "obsidian-sync-engine";
+const COMMUNITY_PLUGINS_PATH = ".obsidian/community-plugins.json";
+const ARCHIVE_FILE_BATCH_SIZE = 50;
+const ARCHIVE_COMPRESSION_CHUNK_SIZE = 64 * 1024;
+const ARCHIVE_YIELD_EVERY_FILES = 10;
 const PLUGIN_DIR = resolve(
 	process.env.PLUGIN_DIST_DIR ?? join(import.meta.dir, "../../../plugin"),
 );
 
-async function addPluginToArchive(
-	entries: Record<string, Uint8Array>,
-): Promise<void> {
+type ArchiveEntry = {
+	path: string;
+	content: Uint8Array;
+};
+
+async function loadPluginArchiveEntries(): Promise<ArchiveEntry[]> {
 	const pluginVaultDir = `.obsidian/plugins/${PLUGIN_ID}`;
+	const entries: ArchiveEntry[] = [];
 	for (const name of ["main.js", "manifest.json"] as const) {
 		const file = Bun.file(join(PLUGIN_DIR, name));
 		if (!(await file.exists())) {
@@ -46,19 +54,23 @@ async function addPluginToArchive(
 				`Plugin artifact ${name} is missing from ${PLUGIN_DIR}; build the plugin before starting the server`,
 			);
 		}
-		entries[`${pluginVaultDir}/${name}`] = new Uint8Array(
-			await file.arrayBuffer(),
-		);
+		entries.push({
+			path: `${pluginVaultDir}/${name}`,
+			content: new Uint8Array(await file.arrayBuffer()),
+		});
 	}
 	const styles = Bun.file(join(PLUGIN_DIR, "styles.css"));
 	if (await styles.exists()) {
-		entries[`${pluginVaultDir}/styles.css`] = new Uint8Array(
-			await styles.arrayBuffer(),
-		);
+		entries.push({
+			path: `${pluginVaultDir}/styles.css`,
+			content: new Uint8Array(await styles.arrayBuffer()),
+		});
 	}
-	const communityPluginsPath = ".obsidian/community-plugins.json";
+	return entries;
+}
+
+function enablePlugin(existing?: Uint8Array): Uint8Array {
 	let communityPlugins: string[] = [];
-	const existing = entries[communityPluginsPath];
 	if (existing) {
 		try {
 			const parsed = JSON.parse(new TextDecoder().decode(existing));
@@ -74,9 +86,67 @@ async function addPluginToArchive(
 	if (!communityPlugins.includes(PLUGIN_ID)) {
 		communityPlugins.push(PLUGIN_ID);
 	}
-	entries[communityPluginsPath] = new TextEncoder().encode(
-		JSON.stringify(communityPlugins),
-	);
+	return new TextEncoder().encode(JSON.stringify(communityPlugins));
+}
+
+class ArchiveBuffer {
+	private buffer = Buffer.allocUnsafe(64 * 1024);
+	private length = 0;
+
+	write(chunk: Uint8Array): void {
+		const requiredLength = this.length + chunk.byteLength;
+		if (requiredLength > this.buffer.byteLength) {
+			let nextCapacity = this.buffer.byteLength;
+			while (nextCapacity < requiredLength) {
+				nextCapacity *= 2;
+			}
+			const next = Buffer.allocUnsafe(nextCapacity);
+			this.buffer.copy(next, 0, 0, this.length);
+			this.buffer = next;
+		}
+		this.buffer.set(chunk, this.length);
+		this.length = requiredLength;
+	}
+
+	finish(): Buffer {
+		return this.buffer.subarray(0, this.length);
+	}
+}
+
+async function yieldToServer(): Promise<void> {
+	await new Promise<void>((resolveYield) => setImmediate(resolveYield));
+}
+
+async function addArchiveEntry(
+	archive: Zip,
+	path: string,
+	content: Uint8Array,
+	getArchiveError: () => Error | null,
+): Promise<void> {
+	const file = new ZipDeflate(path, { level: 6 });
+	archive.add(file);
+
+	if (content.byteLength === 0) {
+		file.push(content, true);
+	} else {
+		for (
+			let offset = 0;
+			offset < content.byteLength;
+			offset += ARCHIVE_COMPRESSION_CHUNK_SIZE
+		) {
+			const end = Math.min(
+				offset + ARCHIVE_COMPRESSION_CHUNK_SIZE,
+				content.byteLength,
+			);
+			file.push(content.subarray(offset, end), end === content.byteLength);
+			const archiveError = getArchiveError();
+			if (archiveError) throw archiveError;
+			if (end < content.byteLength) await yieldToServer();
+		}
+	}
+
+	const archiveError = getArchiveError();
+	if (archiveError) throw archiveError;
 }
 
 export type ObjectStoreUploadContent = {
@@ -312,54 +382,96 @@ export class ObjectStore {
 		return data;
     }
 
-    async createClientArchive(options: {
+	async createClientArchive(options: {
 		serverUrl: string;
 		clientName: string;
 		clientSecret: string;
-	}): Promise<Uint8Array> {
+	}): Promise<Buffer> {
 		const startedAt = Date.now();
 		this.logger.info("client_archive.started", {
 			serverUrl: options.serverUrl,
 			clientName: options.clientName,
 		});
-		const entries: Record<string, Uint8Array> = {};
+		const output = new ArchiveBuffer();
+		let archiveError: Error | null = null;
+		const archive = new Zip((error, chunk) => {
+			if (error) {
+				archiveError = error;
+				return;
+			}
+			if (chunk) output.write(chunk);
+		});
+		const addEntry = (path: string, content: Uint8Array) =>
+			addArchiveEntry(archive, path, content, () => archiveError);
 
 		// Snapshot the tip before reading rows. A concurrent write can then cause
 		// at worst an extra inbox fetch, never a missing file hidden behind the tip.
 		const revision = await this.getTipRevision();
-		const files = await sql<{ file_path: string; content: Buffer }[]>`
-			SELECT file_path, content FROM files
-			WHERE file_is_deleted = FALSE
-		`;
+		const pluginEntries = await loadPluginArchiveEntries();
+		const bundledPluginPaths = new Set(pluginEntries.map(({ path }) => path));
+		let afterPath = "";
+		let fileCount = 0;
+		let communityPluginsAdded = false;
+
+		while (true) {
+			const files = await sql<{ file_path: string; content: Buffer }[]>`
+				SELECT file_path, content FROM files
+				WHERE file_is_deleted = FALSE AND file_path > ${afterPath}
+				ORDER BY file_path
+				LIMIT ${ARCHIVE_FILE_BATCH_SIZE}
+			`;
+			if (files.length === 0) break;
+
+			for (const file of files) {
+				afterPath = file.file_path;
+				if (file.file_path === CLIENT_DATA_PATH) continue;
+				const canonicalPath = canonicalizePath(file.file_path);
+				if (bundledPluginPaths.has(canonicalPath)) continue;
+				if (canonicalPath === COMMUNITY_PLUGINS_PATH) {
+					await addEntry(canonicalPath, enablePlugin(file.content));
+					communityPluginsAdded = true;
+				} else {
+					await addEntry(canonicalPath, file.content);
+				}
+				fileCount++;
+				if (fileCount % ARCHIVE_YIELD_EVERY_FILES === 0) {
+					await yieldToServer();
+				}
+			}
+		}
 		this.logger.info("client_archive.files_loaded", {
-			fileCount: files.length,
+			fileCount,
 			revision,
 		});
-		for (const file of files) {
-			if (file.file_path === CLIENT_DATA_PATH) continue;
-			const canonicalPath = canonicalizePath(file.file_path);
-			entries[canonicalPath] = new Uint8Array(file.content);
+
+		if (!communityPluginsAdded) {
+			await addEntry(COMMUNITY_PLUGINS_PATH, enablePlugin());
+		}
+		for (const entry of pluginEntries) {
+			await addEntry(entry.path, entry.content);
 		}
 
-		await addPluginToArchive(entries);
 		const clientConfig: ClientConfig = {
 			clientName: options.clientName,
 			clientSecret: options.clientSecret,
 			revision,
 			serverUrl: options.serverUrl,
 		};
-		entries[CLIENT_DATA_PATH] = new TextEncoder().encode(
-			JSON.stringify(clientConfig, null, 2),
+		await addEntry(
+			CLIENT_DATA_PATH,
+			new TextEncoder().encode(JSON.stringify(clientConfig, null, 2)),
 		);
-		const archive = zipSync(entries, { level: 6 });
+		archive.end();
+		if (archiveError) throw archiveError;
+		const archiveBytes = output.finish();
 		this.logger.info("client_archive.completed", {
-			fileCount: files.length,
+			fileCount,
 			revision,
-			bytes: archive.byteLength,
+			bytes: archiveBytes.byteLength,
 			durationMs: Date.now() - startedAt,
 		});
-		return archive;
-    }
+		return archiveBytes;
+	}
 
     async client_zip_create(
 		path: string,

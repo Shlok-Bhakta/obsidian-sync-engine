@@ -3,6 +3,7 @@ import { testClient } from "hono/testing";
 import { join } from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { unzipSync } from "fflate";
 import {
 	CLIENT_DATA_PATH,
 	clientConfigSchema,
@@ -300,6 +301,44 @@ describe("object store", () => {
             await rm(tmp, { recursive: true, force: true });
         }
     });
+	it("packages a 1,500-file vault without starving the server event loop", async () => {
+		const client = await createClientFixture({ client_name: "large-vault-owner" });
+		const fileCount = 1_500;
+		await sql`
+			INSERT INTO files (file_path, author_id, content, file_is_deleted)
+			SELECT
+				'bulk/note-' || LPAD(i::text, 4, '0') || '.md',
+				${client.id},
+				convert_to(repeat('vault-content-' || i::text || '-', 32), 'UTF8'),
+				FALSE
+			FROM generate_series(1, ${fileCount}) AS generated(i)
+		`;
+
+		let heartbeatCount = 0;
+		const heartbeat = setInterval(() => heartbeatCount++, 1);
+		let archive: Buffer;
+		try {
+			archive = await new ObjectStore().createClientArchive({
+				serverUrl: "https://sync.example",
+				clientName: "large-vault-client",
+				clientSecret: "obs_sync_large_vault",
+			});
+		} finally {
+			clearInterval(heartbeat);
+		}
+
+		const entries = unzipSync(archive);
+		const vaultEntries = Object.keys(entries).filter((path) =>
+			path.startsWith("bulk/note-"),
+		);
+		expect(vaultEntries).toHaveLength(fileCount);
+		expect(new TextDecoder().decode(entries["bulk/note-1500.md"])).toContain(
+			"vault-content-1500",
+		);
+		// A synchronous all-at-once ZIP build only lets this timer fire around
+		// database I/O. Streaming compression yields at least once per ten files.
+		expect(heartbeatCount).toBeGreaterThan(50);
+	}, 15_000);
     it("rejects a path traversal attempt on upload with 400", async () => {
         const client = await createClientFixture({ client_name: "alice" });
         const app = createTestApp();

@@ -1,7 +1,7 @@
 {
 	"id": "obsidian-sync-engine",
 	"name": "Obsidian Sync Engine",
-	"version": "1.0.1",
+	"version": "1.0.2",
 	"minAppVersion": "1.7.2",
 	"description": "Self-hosted sync engine for your Obsidian vault.",
 	"author": "Shlok Bhakta",

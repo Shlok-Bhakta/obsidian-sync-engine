@@ -103,14 +103,14 @@ async function consumeInvite(
 async function createInvite(options: {
 	store: ObjectStore;
 	serverUrl: string;
-	now?: Date;
+	now?: () => Date;
 	logger?: Logger;
 }): Promise<{ token: string; expiresAt: Date }> {
 	const logger = (options.logger ?? serverLogger).child("client_invites");
 	const startedAt = Date.now();
-	const now = options.now ?? new Date();
+	const now = options.now ?? (() => new Date());
 	logger.info("create.started", { serverUrl: options.serverUrl });
-	await cleanupExpiredClientInvites(now, logger);
+	await cleanupExpiredClientInvites(now(), logger);
 	const clientName = `client-${randomUUID()}`;
 	const clientSecret = await createClient(clientName, logger);
 	const clientId = await getClientIdFromAuthorization(clientSecret, logger);
@@ -121,12 +121,14 @@ async function createInvite(options: {
 			clientSecret,
 		});
 		const token = randomBytes(32).toString("base64url");
-		const expiresAt = new Date(now.getTime() + CLIENT_INVITE_LIFETIME_MS);
+		// Archive creation can take minutes for a large vault. Start the full
+		// download window only once the package is ready.
+		const expiresAt = new Date(now().getTime() + CLIENT_INVITE_LIFETIME_MS);
 		await sql`
 			INSERT INTO client_invites (
 				token_hash, client_id, archive, expires_at
 			) VALUES (
-				${hashToken(token)}, ${clientId}, ${Buffer.from(archive)}, ${expiresAt}
+				${hashToken(token)}, ${clientId}, ${archive}, ${expiresAt}
 			)
 		`;
 		const timer = setTimeout(() => {
@@ -189,6 +191,7 @@ export function registerClientInviteRoutes(
 	store: ObjectStore = objectStore,
 	authorize: ClientAuthorizer = getClientIdFromAuthorization,
 	injectedLogger: Logger = serverLogger,
+	now: () => Date = () => new Date(),
 ) {
 	const logger = injectedLogger.child("client_invite_routes");
 	return app
@@ -204,7 +207,7 @@ export function registerClientInviteRoutes(
 				clientId: authorized,
 				serverUrl,
 			});
-			const invite = await createInvite({ store, serverUrl, logger });
+			const invite = await createInvite({ store, serverUrl, logger, now });
 			const response: ClientInvite = {
 				url: `${serverUrl}/client-invites/${invite.token}`,
 				expiresAt: invite.expiresAt.toISOString(),
@@ -217,7 +220,7 @@ export function registerClientInviteRoutes(
 		})
 		.get("/client-invites/:token", async (c) => {
 			const token = c.req.param("token");
-			if (!(await inviteExists(token, new Date(), logger))) {
+			if (!(await inviteExists(token, now(), logger))) {
 				logger.warn("landing.unavailable");
 				return c.html("This client package has expired or was already used.", 410, noStoreHeaders());
 			}
@@ -229,7 +232,7 @@ export function registerClientInviteRoutes(
 			});
 		})
 		.post("/client-invites/:token/download", async (c) => {
-			const archive = await consumeInvite(c.req.param("token"), new Date(), logger);
+			const archive = await consumeInvite(c.req.param("token"), now(), logger);
 			if (!archive) {
 				logger.warn("download.unavailable");
 				return c.text("This client package has expired or was already used.", 410, noStoreHeaders());
