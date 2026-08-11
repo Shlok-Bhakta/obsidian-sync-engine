@@ -13,8 +13,12 @@ import {
 	normalizeServerUrl,
 	serverIdentityFor,
 } from "./sync/serverIdentity";
-import type { ClientInvite } from "./clientInvites";
+import type {
+	ClientArchiveBuildProgress,
+	ClientInvite,
+} from "./clientInvites";
 import type { ServerConnectionState } from "./serverConnection";
+import { describeClientArchiveProgress } from "./ui/clientInviteProgress";
 
 export {
 	normalizeServerUrl,
@@ -51,6 +55,10 @@ export class SyncSettingTab extends PluginSettingTab {
 	private clientSecretInput: TextComponent | null = null;
 	private serverUrlInput: TextComponent | null = null;
 	private serverStatusIndicator: HTMLElement | null = null;
+	private clientInviteBuilding = false;
+	private clientInviteProgress: ClientArchiveBuildProgress | null = null;
+	private clientInviteProgressEl: HTMLElement | null = null;
+	private clientInviteProgressBar: HTMLProgressElement | null = null;
 
 	constructor(app: App, plugin: ObsidianSyncPlugin) {
 		super(app, plugin);
@@ -164,40 +172,80 @@ export class SyncSettingTab extends PluginSettingTab {
 				}),
 		);
 
+		const clientPackageDesc = activeDocument.createDocumentFragment();
+		clientPackageDesc.appendText(
+			"Create a one-time vault package. Its link expires in five minutes.",
+		);
+		this.clientInviteProgressEl = activeDocument.createElement("div");
+		this.clientInviteProgressEl.className = "obsidian-sync-client-invite-progress";
+		this.clientInviteProgressEl.setAttribute("role", "status");
+		this.clientInviteProgressEl.setAttribute("aria-live", "polite");
+		this.clientInviteProgressBar = activeDocument.createElement("progress");
+		this.clientInviteProgressBar.max = 100;
+		this.clientInviteProgressBar.className = "obsidian-sync-client-invite-progress__bar";
+		this.clientInviteProgressEl.append(this.clientInviteProgressBar);
+		this.clientInviteProgressEl.append(
+			activeDocument.createElement("span"),
+			activeDocument.createElement("small"),
+		);
+		clientPackageDesc.append(this.clientInviteProgressEl);
+
 		new Setting(containerEl)
 		.setName("Add another client")
-		.setDesc("Create a one-time vault package. Its link expires in five minutes.")
+		.setDesc(clientPackageDesc)
 		.addButton((button) =>
 			button
-				.setButtonText("Create client package")
+				.setButtonText(
+					this.clientInviteBuilding ? "Building package" : "Create client package",
+				)
+				.setDisabled(this.clientInviteBuilding)
 				.setCta()
 				.onClick(async () => {
+					if (this.clientInviteBuilding) return;
+					this.clientInviteBuilding = true;
+					this.clientInviteProgress = {
+						phase: "preparing",
+						processedFiles: 0,
+						totalFiles: 0,
+						percent: 0,
+						estimatedSecondsRemaining: null,
+					};
 					button.setDisabled(true);
+					button.setButtonText("Building package");
+					this.renderClientInviteProgress();
 					try {
-						this.clientInvite = await this.plugin.createClientInvite();
+						this.clientInvite = await this.plugin.createClientInvite((progress) => {
+							this.clientInviteProgress = progress;
+							this.renderClientInviteProgress();
+						});
+						this.clientInviteBuilding = false;
+						this.clientInviteProgress = null;
 						this.display();
-							try {
-								await navigator.clipboard.writeText(this.clientInvite.url);
-								this.plugin.logger.info("client_invite.clipboard_copy_completed");
-								new Notice("Client link copied to clipboard");
-							} catch (error) {
-								this.plugin.logger.warn("client_invite.clipboard_copy_failed", {
-									error,
-								});
-								new Notice("Client package created. Copy its link below.");
-							}
+						try {
+							await navigator.clipboard.writeText(this.clientInvite.url);
+							this.plugin.logger.info("client_invite.clipboard_copy_completed");
+							new Notice("Client link copied to clipboard");
 						} catch (error) {
-							this.plugin.logger.error("client_invite.create_failed", {
+							this.plugin.logger.warn("client_invite.clipboard_copy_failed", {
 								error,
 							});
+							new Notice("Client package created. Copy its link below.");
+						}
+					} catch (error) {
+						this.plugin.logger.error("client_invite.create_failed", {
+							error,
+						});
+						this.clientInviteBuilding = false;
+						this.clientInviteProgress = null;
 						new Notice(
 							"Could not create client package: " +
 								(error instanceof Error ? error.message : String(error)),
 						);
-						button.setDisabled(false);
+						this.display();
 					}
 				}),
 		);
+		this.renderClientInviteProgress();
 
 		if (this.clientInvite) {
 			new Setting(containerEl)
@@ -236,6 +284,22 @@ export class SyncSettingTab extends PluginSettingTab {
 				.setValue(this.plugin.settings.revision.toString())
 				.setDisabled(true)
 		);
+	}
+
+	private renderClientInviteProgress(): void {
+		const container = this.clientInviteProgressEl;
+		const progressBar = this.clientInviteProgressBar;
+		const progress = this.clientInviteProgress;
+		if (!container || !progressBar) return;
+		container.toggle(this.clientInviteBuilding && progress !== null);
+		if (!this.clientInviteBuilding || !progress) return;
+		const copy = describeClientArchiveProgress(progress);
+		progressBar.value = progress.percent;
+		progressBar.setAttribute("aria-label", `${copy.summary}. ${copy.detail}`);
+		const summary = container.querySelector("span");
+		const detail = container.querySelector("small");
+		if (summary) summary.textContent = copy.summary;
+		if (detail) detail.textContent = copy.detail;
 	}
 
 	private updateConnectionIndicator(value: string): void {

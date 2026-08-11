@@ -315,6 +315,11 @@ describe("object store", () => {
 		`;
 
 		let heartbeatCount = 0;
+		const progressUpdates: Array<{
+			phase: "preparing" | "archiving" | "finalizing";
+			processedFiles: number;
+			totalFiles: number;
+		}> = [];
 		const heartbeat = setInterval(() => heartbeatCount++, 1);
 		let archive: Buffer;
 		try {
@@ -322,6 +327,7 @@ describe("object store", () => {
 				serverUrl: "https://sync.example",
 				clientName: "large-vault-client",
 				clientSecret: "obs_sync_large_vault",
+				onProgress: (progress) => progressUpdates.push(progress),
 			});
 		} finally {
 			clearInterval(heartbeat);
@@ -338,6 +344,21 @@ describe("object store", () => {
 		// A synchronous all-at-once ZIP build only lets this timer fire around
 		// database I/O. Streaming compression yields at least once per ten files.
 		expect(heartbeatCount).toBeGreaterThan(50);
+		expect(progressUpdates[0]).toEqual({
+			phase: "preparing",
+			processedFiles: 0,
+			totalFiles: 0,
+		});
+		expect(progressUpdates).toContainEqual({
+			phase: "archiving",
+			processedFiles: 750,
+			totalFiles: fileCount,
+		});
+		expect(progressUpdates.at(-1)).toEqual({
+			phase: "finalizing",
+			processedFiles: fileCount,
+			totalFiles: fileCount,
+		});
 	}, 15_000);
     it("rejects a path traversal attempt on upload with 400", async () => {
         const client = await createClientFixture({ client_name: "alice" });

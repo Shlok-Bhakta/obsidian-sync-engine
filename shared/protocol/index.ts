@@ -126,6 +126,42 @@ export const clientInviteSchema = z.object({
 });
 export type ClientInvite = z.infer<typeof clientInviteSchema>;
 
+export const clientArchiveBuildProgressSchema = z
+	.object({
+		phase: z.enum(["preparing", "archiving", "finalizing"]),
+		processedFiles: z.number().int().safe().nonnegative(),
+		totalFiles: z.number().int().safe().nonnegative(),
+		percent: z.number().int().min(0).max(100),
+		estimatedSecondsRemaining: z.number().int().safe().nonnegative().nullable(),
+	})
+	.refine(
+		(progress) => progress.processedFiles <= progress.totalFiles,
+		"processedFiles cannot exceed totalFiles",
+	);
+export type ClientArchiveBuildProgress = z.infer<
+	typeof clientArchiveBuildProgressSchema
+>;
+
+const clientInviteBuildBaseSchema = z.object({
+	buildId: z.string().uuid(),
+	progress: clientArchiveBuildProgressSchema,
+});
+
+export const clientInviteBuildSchema = z.discriminatedUnion("status", [
+	clientInviteBuildBaseSchema.extend({
+		status: z.literal("building"),
+	}),
+	clientInviteBuildBaseSchema.extend({
+		status: z.literal("ready"),
+		invite: clientInviteSchema,
+	}),
+	clientInviteBuildBaseSchema.extend({
+		status: z.literal("failed"),
+		error: z.string().min(1),
+	}),
+]);
+export type ClientInviteBuild = z.infer<typeof clientInviteBuildSchema>;
+
 /** The portable settings written into a newly packaged client's data.json. */
 export const clientConfigSchema = z.object({
 	serverUrl: httpUrlSchema,

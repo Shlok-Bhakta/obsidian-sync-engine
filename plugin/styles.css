@@ -21,6 +21,30 @@
 	width: var(--input-height);
 }
 
+.obsidian-sync-client-invite-progress {
+	display: grid;
+	gap: 4px;
+	margin-top: 10px;
+	min-width: min(360px, 100%);
+}
+
+.obsidian-sync-client-invite-progress__bar {
+	accent-color: var(--interactive-accent);
+	height: 6px;
+	width: 100%;
+}
+
+.obsidian-sync-client-invite-progress span {
+	color: var(--text-normal);
+	font-size: var(--font-ui-small);
+	font-weight: var(--font-medium);
+}
+
+.obsidian-sync-client-invite-progress small {
+	color: var(--text-muted);
+	font-size: var(--font-ui-smaller);
+}
+
 .obsidian-sync-connection-status {
 	background: currentColor;
 	border-radius: 50%;

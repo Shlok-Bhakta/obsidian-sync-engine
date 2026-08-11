@@ -6,6 +6,7 @@ import {
 	cleanupExpiredClientInvites,
 	registerClientInviteRoutes,
 } from "./invites/clientInvites";
+import { registerClientInviteBuildRoutes } from "./invites/clientInviteBuilds";
 import { MAX_REQUEST_BODY_SIZE } from "./config";
 import { serverLogger } from "./logger";
 import { registerHealthRoute } from "./health";
@@ -84,6 +85,7 @@ registerHealthRoute(app, undefined, serverLogger);
 registerAuthRoutes(app, serverLogger);
 registerObjectStoreRoutes(app, objectStore, undefined, serverLogger);
 registerClientInviteRoutes(app, objectStore, undefined, serverLogger);
+registerClientInviteBuildRoutes(app, objectStore, undefined, serverLogger);
 
 const inviteCleanup = setInterval(() => {
 	void cleanupExpiredClientInvites(new Date(), serverLogger).catch((error) => {

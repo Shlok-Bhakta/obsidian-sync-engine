@@ -8,6 +8,7 @@ import {
 	requireClientId,
 } from "../auth/auth";
 import { objectStore, type ObjectStore } from "../object/object_store";
+import type { ClientArchiveProgressSnapshot } from "../object/object_store";
 import type { ClientInvite } from "obsidian-sync-protocol";
 import { serverLogger, type Logger } from "../logger";
 
@@ -100,11 +101,12 @@ async function consumeInvite(
 	return archive;
 }
 
-async function createInvite(options: {
+export async function createInvite(options: {
 	store: ObjectStore;
 	serverUrl: string;
 	now?: () => Date;
 	logger?: Logger;
+	onProgress?: (progress: ClientArchiveProgressSnapshot) => void;
 }): Promise<{ token: string; expiresAt: Date }> {
 	const logger = (options.logger ?? serverLogger).child("client_invites");
 	const startedAt = Date.now();
@@ -119,6 +121,7 @@ async function createInvite(options: {
 			serverUrl: options.serverUrl,
 			clientName,
 			clientSecret,
+			onProgress: options.onProgress,
 		});
 		const token = randomBytes(32).toString("base64url");
 		// Archive creation can take minutes for a large vault. Start the full

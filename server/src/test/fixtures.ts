@@ -2,10 +2,12 @@ import { sql } from "bun";
 import { Hono } from "hono";
 import { registerObjectStoreRoutes } from "../object/object_store";
 import { registerClientInviteRoutes } from "../invites/clientInvites";
+import { registerClientInviteBuildRoutes } from "../invites/clientInviteBuilds";
 
 export function createTestApp() {
 	const app = registerObjectStoreRoutes(new Hono());
 	registerClientInviteRoutes(app);
+	registerClientInviteBuildRoutes(app);
 	return app;
 }
 

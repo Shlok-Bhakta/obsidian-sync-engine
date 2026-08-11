@@ -348,7 +348,9 @@ export default class ObsidianSyncPlugin extends Plugin {
 		}
 	}
 
-	async createClientInvite(): Promise<ClientInvite> {
+	async createClientInvite(
+		onProgress?: Parameters<typeof requestClientInvite>[0]["onProgress"],
+	): Promise<ClientInvite> {
 		if (this.isSyncSuspended()) {
 			throw new Error("The sync connection is changing");
 		}
@@ -359,6 +361,7 @@ export default class ObsidianSyncPlugin extends Plugin {
 			clientSecret: this.settings.clientSecret,
 			request: requestUrl,
 			logger: this.logger,
+			onProgress,
 		});
 		this.logger.info("client_invite.request_completed", {
 			expiresAt: invite.expiresAt,

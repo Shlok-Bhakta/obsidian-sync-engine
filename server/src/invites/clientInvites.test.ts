@@ -5,6 +5,7 @@ import { Hono } from "hono";
 import {
 	CLIENT_DATA_PATH,
 	clientConfigSchema,
+	clientInviteBuildSchema,
 	clientInviteSchema,
 } from "obsidian-sync-protocol";
 import { FakeLogger } from "../logger";
@@ -14,6 +15,7 @@ import {
 	CLIENT_INVITE_LIFETIME_MS,
 	registerClientInviteRoutes,
 } from "./clientInvites";
+import { registerClientInviteBuildRoutes } from "./clientInviteBuilds";
 
 const decoder = new TextDecoder();
 
@@ -33,6 +35,158 @@ describe("client invite packages", () => {
 			method: "POST",
 		});
 		expect(response.status).toBe(401);
+	});
+
+	it("builds an archive in the background and exposes authenticated progress", async () => {
+		const owner = await createClientFixture({ client_name: "polling-owner" });
+		const other = await createClientFixture({ client_name: "other-client" });
+		const store = new ObjectStore();
+		await store.upload({
+			path: "notes/safety-check.md",
+			content: "archive preserves this note",
+			id: owner.id,
+		});
+		const createArchive = store.createClientArchive.bind(store);
+		let releaseArchive!: () => void;
+		const archiveReleased = new Promise<void>((resolve) => {
+			releaseArchive = resolve;
+		});
+		let reportProgress!: () => void;
+		const progressReported = new Promise<void>((resolve) => {
+			reportProgress = resolve;
+		});
+		let currentTimeMs = 1_000;
+		store.createClientArchive = async (options) => {
+			currentTimeMs = 5_000;
+			options.onProgress?.({
+				phase: "archiving",
+				processedFiles: 25,
+				totalFiles: 100,
+			});
+			reportProgress();
+			await archiveReleased;
+			return createArchive(options);
+		};
+		const app = registerClientInviteRoutes(new Hono(), store);
+		registerClientInviteBuildRoutes(
+			app,
+			store,
+			undefined,
+			undefined,
+			undefined,
+			() => currentTimeMs,
+		);
+		const unauthorized = await app.request(
+			"https://sync.example/client-invite-builds",
+			{ method: "POST" },
+		);
+		expect(unauthorized.status).toBe(401);
+
+		const start = await app.request("https://sync.example/client-invite-builds", {
+			method: "POST",
+			headers: { Authorization: owner.client_secret },
+		});
+		expect(start.status).toBe(202);
+		const started = clientInviteBuildSchema.parse(await start.json());
+		expect(started.status).toBe("building");
+		await progressReported;
+
+		const active = await app.request(
+			`https://sync.example/client-invite-builds/${started.buildId}`,
+			{ headers: { Authorization: owner.client_secret } },
+		);
+		const building = clientInviteBuildSchema.parse(await active.json());
+		expect(building).toMatchObject({
+			status: "building",
+			progress: {
+				phase: "archiving",
+				processedFiles: 25,
+				totalFiles: 100,
+				percent: 26,
+			},
+		});
+		expect(building.progress.estimatedSecondsRemaining).toBeGreaterThan(0);
+
+		const duplicateStart = await app.request(
+			"https://sync.example/client-invite-builds",
+			{ method: "POST", headers: { Authorization: owner.client_secret } },
+		);
+		expect((await duplicateStart.json() as { buildId: string }).buildId).toBe(
+			started.buildId,
+		);
+		const hidden = await app.request(
+			`https://sync.example/client-invite-builds/${started.buildId}`,
+			{ headers: { Authorization: other.client_secret } },
+		);
+		expect(hidden.status).toBe(404);
+
+		releaseArchive();
+		let readyResponse: Response | undefined;
+		for (let attempt = 0; attempt < 50; attempt++) {
+			readyResponse = await app.request(
+				`https://sync.example/client-invite-builds/${started.buildId}`,
+				{ headers: { Authorization: owner.client_secret } },
+			);
+			const body = clientInviteBuildSchema.parse(await readyResponse.clone().json());
+			if (body.status === "ready") break;
+			await Bun.sleep(10);
+		}
+		const ready = clientInviteBuildSchema.parse(await readyResponse?.json());
+		expect(ready.status).toBe("ready");
+		if (ready.status !== "ready") throw new Error("archive did not become ready");
+		expect(ready.progress).toMatchObject({
+			phase: "finalizing",
+			percent: 100,
+			estimatedSecondsRemaining: 0,
+		});
+		expect(new URL(ready.invite.url).origin).toBe("https://sync.example");
+		const download = await app.request(`${ready.invite.url}/download`, {
+			method: "POST",
+		});
+		expect(download.status).toBe(200);
+		const archive = unzipSync(new Uint8Array(await download.arrayBuffer()));
+		expect(decoder.decode(archive["notes/safety-check.md"])).toBe(
+			"archive preserves this note",
+		);
+		const config = clientConfigSchema.parse(
+			JSON.parse(decoder.decode(archive[CLIENT_DATA_PATH])),
+		);
+		expect(config.revision).toBe(1);
+		expect(config.serverUrl).toBe("https://sync.example");
+	});
+
+	it("reports background archive failures without leaking details or orphaning a client", async () => {
+		const owner = await createClientFixture({ client_name: "failed-build-owner" });
+		const store = new ObjectStore();
+		store.createClientArchive = async () => {
+			throw new Error("private archive failure detail");
+		};
+		const app = registerClientInviteBuildRoutes(new Hono(), store);
+		const start = await app.request("https://sync.example/client-invite-builds", {
+			method: "POST",
+			headers: { Authorization: owner.client_secret },
+		});
+		const started = clientInviteBuildSchema.parse(await start.json());
+
+		let failed: ReturnType<typeof clientInviteBuildSchema.parse> | undefined;
+		for (let attempt = 0; attempt < 50; attempt++) {
+			const response = await app.request(
+				`https://sync.example/client-invite-builds/${started.buildId}`,
+				{ headers: { Authorization: owner.client_secret } },
+			);
+			failed = clientInviteBuildSchema.parse(await response.json());
+			if (failed.status === "failed") break;
+			await Bun.sleep(10);
+		}
+		expect(failed).toMatchObject({
+			status: "failed",
+			error: "Archive build failed. Try again.",
+		});
+		expect(JSON.stringify(failed)).not.toContain("private archive failure detail");
+		const [{ count }] = await sql<{ count: string }[]>`
+			SELECT COUNT(*)::text AS count FROM clients
+		`;
+		expect(Number(count)).toBe(1);
 	});
 
 	it("creates a five-minute preview-safe link and consumes its ZIP once", async () => {
