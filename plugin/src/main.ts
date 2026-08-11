@@ -11,6 +11,7 @@ import {
 	transitionServerSettings,
 } from './settings';
 import { SyncStatusView, SYNC_STATUS_VIEW_TYPE } from './ui/syncStatusView';
+import { SyncStatusControl } from './ui/syncStatusControl';
 import {
 	registerVaultSync,
 	replaceVaultSyncRuntime,
@@ -86,9 +87,7 @@ export default class ObsidianSyncPlugin extends Plugin {
 			(leaf) => new SyncStatusView(leaf, this, this.sync),
 		);
 
-		this.addRibbonIcon('refresh-cw', 'Open sync status', () => {
-			void this.openSyncStatusView();
-		});
+		SyncStatusControl.create(this, this.sync);
 
 		this.addCommand({
 			id: 'open-sync-status',

@@ -601,6 +601,44 @@ describe("SyncEngine", () => {
 		}
 	});
 
+	test("manual inbox callbacks cover only the request, not inbox application", async () => {
+		const fs = new MemoryVaultFs();
+		const transport = new FakeTransport();
+		transport.simulateRemoteOp("put", "remote.md", "remote");
+		const revision = createRevisionStore(0);
+		let releaseWrite!: () => void;
+		let signalWriteStarted!: () => void;
+		const writeStarted = new Promise<void>((resolve) => {
+			signalWriteStarted = resolve;
+		});
+		const writeBinary = fs.writeBinary.bind(fs);
+		fs.writeBinary = async (path, data) => {
+			signalWriteStarted();
+			await new Promise<void>((resolve) => { releaseWrite = resolve; });
+			await writeBinary(path, data);
+		};
+		const phases: string[] = [];
+		const engine = new SyncEngine({
+			fs,
+			transport,
+			outboxPath: OUTBOX,
+			inboxPath: INBOX,
+			getRevision: revision.get,
+			setRevision: revision.set,
+		});
+
+		const tick = engine.tick({
+			onInboxRequestStarted: () => phases.push("request-started"),
+			onInboxRequestFinished: () => phases.push("request-finished"),
+		});
+		await writeStarted;
+		expect(phases).toEqual(["request-started", "request-finished"]);
+		expect(engine.isTickActive()).toBe(true);
+		releaseWrite();
+		await tick;
+		expect(engine.isTickActive()).toBe(false);
+	});
+
 	test("dead-lettering a permanent 413 failure does not block later outbox ops", async () => {
 		const fs = new MemoryVaultFs();
 		await fs.write("big.md", "too big");

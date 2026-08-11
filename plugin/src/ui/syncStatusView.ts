@@ -56,7 +56,7 @@ export class SyncStatusView extends ItemView {
 			});
 			return [];
 		});
-		const { status } = this.sync;
+		const status = this.sync.status.get();
 
 		const container = this.contentEl;
 		container.empty();
@@ -71,9 +71,9 @@ export class SyncStatusView extends ItemView {
 			text: `Pending outbox items: ${outboxOps.length}`,
 		});
 		list.createEl('li', {
-			text: `Last tick: ${
-				status.lastTickAt
-					? new Date(status.lastTickAt).toLocaleTimeString()
+			text: `Last successful sync: ${
+				status.lastSuccessfulSyncAt
+					? new Date(status.lastSuccessfulSyncAt).toLocaleTimeString()
 					: 'never'
 			}`,
 		});
@@ -83,7 +83,7 @@ export class SyncStatusView extends ItemView {
 		logger.debug("render.completed", {
 			revision: this.plugin.settings.revision,
 			pendingOutboxItems: outboxOps.length,
-			lastTickAt: status.lastTickAt,
+			lastSuccessfulSyncAt: status.lastSuccessfulSyncAt,
 			lastError: status.lastError,
 		});
 	}

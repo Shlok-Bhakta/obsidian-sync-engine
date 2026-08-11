@@ -46,3 +46,81 @@
 .obsidian-sync-connection-status--failed {
 	color: var(--text-error);
 }
+
+.obsidian-sync-status-control-container {
+	align-items: center;
+	display: inline-flex;
+	padding: 0;
+}
+
+.obsidian-sync-status-control {
+	appearance: none;
+	align-items: center;
+	background: transparent;
+	border: 0;
+	border-radius: var(--radius-s, 4px);
+	box-shadow: none;
+	color: inherit;
+	cursor: pointer;
+	display: inline-flex;
+	font: inherit;
+	gap: 6px;
+	height: 28px;
+	justify-content: center;
+	min-width: 76px;
+	padding: 0 4px;
+}
+
+.obsidian-sync-status-control:hover,
+.obsidian-sync-status-control:focus-visible {
+	background: var(--background-modifier-hover);
+	color: var(--text-normal);
+}
+
+.obsidian-sync-status-control:focus-visible {
+	outline: 2px solid var(--background-modifier-border-focus);
+	outline-offset: -2px;
+}
+
+.obsidian-sync-status-control--error,
+.obsidian-sync-status-control--error:hover,
+.obsidian-sync-status-control--error:focus-visible {
+	color: var(--text-error);
+}
+
+.obsidian-sync-status-control__indicator {
+	align-items: center;
+	display: inline-flex;
+	gap: 2px;
+}
+
+.obsidian-sync-status-control__icon,
+.obsidian-sync-status-control__spinner {
+	display: inline-flex;
+}
+
+.obsidian-sync-status-control__icon svg,
+.obsidian-sync-status-control__spinner svg {
+	height: 13px;
+	width: 13px;
+}
+
+.obsidian-sync-status-control__spinner {
+	animation: obsidian-sync-spin 0.8s linear infinite;
+}
+
+.obsidian-sync-status-control__accessible-label {
+	clip: rect(0 0 0 0);
+	clip-path: inset(50%);
+	height: 1px;
+	overflow: hidden;
+	position: absolute;
+	white-space: nowrap;
+	width: 1px;
+}
+
+@keyframes obsidian-sync-spin {
+	to {
+		transform: rotate(360deg);
+	}
+}

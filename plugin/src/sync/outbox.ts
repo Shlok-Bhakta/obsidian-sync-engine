@@ -101,6 +101,7 @@ export async function drain(
 	outboxPath: string,
 	handler: (op: OutboxOp) => Promise<void>,
 	injectedLogger: Logger = new NoopLogger(),
+	onQueueChanged?: () => void,
 ): Promise<void> {
 	const logger = injectedLogger.child("outbox");
 	logger.debug("drain.snapshot_waiting_for_lock", { outboxPath });
@@ -127,6 +128,7 @@ export async function drain(
 			if (index >= 0) {
 				current.splice(index, 1);
 				await writeLines(fs, outboxPath, current, logger);
+				onQueueChanged?.();
 				logger.info("drain.acknowledged", {
 					path: op.path,
 					operation: op.op,
