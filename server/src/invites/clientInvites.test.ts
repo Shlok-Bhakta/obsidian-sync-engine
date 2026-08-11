@@ -7,6 +7,7 @@ import {
 	clientConfigSchema,
 	clientInviteBuildSchema,
 	clientInviteSchema,
+	clientInviteStatusSchema,
 } from "obsidian-sync-protocol";
 import { FakeLogger } from "../logger";
 import { ObjectStore } from "../object/object_store";
@@ -26,6 +27,24 @@ async function createInvite(app: ReturnType<typeof createTestApp>, secret: strin
 	});
 	expect(response.status).toBe(201);
 	return clientInviteSchema.parse(await response.json());
+}
+
+function inviteToken(inviteUrl: string): string {
+	const token = new URL(inviteUrl).pathname.split("/").filter(Boolean).at(-1);
+	if (!token) throw new Error("invite URL did not contain a token");
+	return token;
+}
+
+async function requestInviteStatus(
+	app: Hono,
+	inviteUrl: string,
+	secret?: string,
+): Promise<Response> {
+	const headers: Record<string, string> = {
+		"X-Client-Invite-Token": inviteToken(inviteUrl),
+	};
+	if (secret) headers.Authorization = secret;
+	return await app.request("https://sync.example/client-invite-status", { headers });
 }
 
 describe("client invite packages", () => {
@@ -140,6 +159,25 @@ describe("client invite packages", () => {
 			estimatedSecondsRemaining: 0,
 		});
 		expect(new URL(ready.invite.url).origin).toBe("https://sync.example");
+		const unauthorizedStatus = await requestInviteStatus(app, ready.invite.url);
+		expect(unauthorizedStatus.status).toBe(401);
+		const missingTokenStatus = await app.request(
+			"https://sync.example/client-invite-status",
+			{ headers: { Authorization: owner.client_secret } },
+		);
+		expect(missingTokenStatus.status).toBe(400);
+		const availableStatusResponse = await requestInviteStatus(
+			app,
+			ready.invite.url,
+			owner.client_secret,
+		);
+		expect(availableStatusResponse.status).toBe(200);
+		const availableStatus = clientInviteStatusSchema.parse(
+			await availableStatusResponse.json(),
+		);
+		expect(availableStatus.status).toBe("available");
+		expect(availableStatus.remainingSeconds).toBeGreaterThanOrEqual(299);
+		expect(availableStatus.remainingSeconds).toBeLessThanOrEqual(300);
 		const download = await app.request(`${ready.invite.url}/download`, {
 			method: "POST",
 		});
@@ -153,6 +191,14 @@ describe("client invite packages", () => {
 		);
 		expect(config.revision).toBe(1);
 		expect(config.serverUrl).toBe("https://sync.example");
+		const consumedStatusResponse = await requestInviteStatus(
+			app,
+			ready.invite.url,
+			owner.client_secret,
+		);
+		expect(
+			clientInviteStatusSchema.parse(await consumedStatusResponse.json()),
+		).toEqual({ status: "unavailable", remainingSeconds: 0 });
 	});
 
 	it("reports background archive failures without leaking details or orphaning a client", async () => {
@@ -257,7 +303,8 @@ describe("client invite packages", () => {
 		const buildStartedAt = Date.parse("2026-08-11T00:00:00.000Z");
 		const archiveCompletedAt = buildStartedAt + 4 * 60 * 1000;
 		const clockReadings = [buildStartedAt, archiveCompletedAt];
-		const now = () => new Date(clockReadings.shift() ?? archiveCompletedAt);
+		let statusTime = archiveCompletedAt;
+		const now = () => new Date(clockReadings.shift() ?? statusTime);
 		const logger = new FakeLogger();
 		const app = registerClientInviteRoutes(
 			new Hono(),
@@ -281,6 +328,32 @@ describe("client invite packages", () => {
 			9 * 60 * 1000,
 		);
 		expect(clockReadings).toHaveLength(0);
+
+		statusTime += 2 * 60 * 1000;
+		const activeStatus = clientInviteStatusSchema.parse(
+			await (await requestInviteStatus(
+				app,
+				invite.url,
+				owner.client_secret,
+			)).json(),
+		);
+		expect(activeStatus).toMatchObject({
+			status: "available",
+			remainingSeconds: 180,
+		});
+
+		statusTime = archiveCompletedAt + CLIENT_INVITE_LIFETIME_MS;
+		const expiredStatus = clientInviteStatusSchema.parse(
+			await (await requestInviteStatus(
+				app,
+				invite.url,
+				owner.client_secret,
+			)).json(),
+		);
+		expect(expiredStatus).toEqual({
+			status: "unavailable",
+			remainingSeconds: 0,
+		});
 	});
 
 	it("allows only one concurrent download", async () => {

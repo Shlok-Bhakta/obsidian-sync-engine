@@ -1,9 +1,11 @@
 import {
 	clientInviteBuildSchema,
 	clientInviteSchema,
+	clientInviteStatusSchema,
 	type ClientArchiveBuildProgress,
 	type ClientInvite,
 	type ClientInviteBuild,
+	type ClientInviteStatus,
 } from "obsidian-sync-protocol";
 import type { HttpRequestFn } from "./http";
 import { NoopLogger, type Logger } from "./logger";
@@ -11,6 +13,7 @@ import { NoopLogger, type Logger } from "./logger";
 export type {
 	ClientArchiveBuildProgress,
 	ClientInvite,
+	ClientInviteStatus,
 } from "obsidian-sync-protocol";
 
 const DEFAULT_POLL_INTERVAL_MS = 500;
@@ -152,4 +155,39 @@ export async function requestClientInvite(options: {
 		durationMs: Date.now() - startedAt,
 	});
 	return invite;
+}
+
+export async function requestClientInviteStatus(options: {
+	invite: ClientInvite;
+	clientSecret: string;
+	request: HttpRequestFn;
+	logger?: Logger;
+}): Promise<ClientInviteStatus> {
+	const logger = (options.logger ?? new NoopLogger()).child("client_invite_status_http");
+	const inviteUrl = new URL(options.invite.url);
+	const token = inviteUrl.pathname.split("/").filter(Boolean).at(-1);
+	if (!token) throw new Error("Client link does not contain an invite token");
+	const response = await options.request({
+		url: `${inviteUrl.origin}/client-invite-status`,
+		method: "GET",
+		headers: {
+			Authorization: options.clientSecret,
+			"X-Client-Invite-Token": token,
+		},
+		throw: false,
+	});
+	if (response.status !== 200) {
+		logger.warn("request.rejected", { status: response.status });
+		throw new Error(`Could not check client link (${response.status})`);
+	}
+	const parsed = clientInviteStatusSchema.safeParse(responseJson(response));
+	if (!parsed.success) {
+		logger.error("response.invalid", { status: response.status });
+		throw new Error("Server returned an invalid client link status");
+	}
+	logger.debug("request.completed", {
+		status: parsed.data.status,
+		remainingSeconds: parsed.data.remainingSeconds,
+	});
+	return parsed.data;
 }

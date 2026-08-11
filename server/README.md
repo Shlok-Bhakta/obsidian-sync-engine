@@ -37,6 +37,10 @@ start a progress-reporting archive with `POST /client-invite-builds` and poll
 synchronous `POST /client-invites` endpoint remains available for older plugin
 versions. The unauthenticated landing page is preview-safe; its ZIP download is
 single-use and expires five minutes after the archive finishes building.
+Authenticated clients can poll `GET /client-invite-status` with the invite token
+in `X-Client-Invite-Token` for the server-calculated remaining lifetime and
+whether the package is still available. Keeping the token out of the URL also
+keeps it out of access logs.
 
 ## Test
 

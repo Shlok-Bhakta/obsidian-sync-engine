@@ -45,6 +45,47 @@
 	font-size: var(--font-ui-smaller);
 }
 
+.obsidian-sync-client-package-setting {
+	flex-wrap: wrap;
+}
+
+.obsidian-sync-client-invite-link {
+	border-top: 1px solid var(--background-modifier-border);
+	display: grid;
+	flex: 1 0 100%;
+	gap: 6px;
+	margin-top: 12px;
+	min-width: 0;
+	padding-top: 12px;
+}
+
+.obsidian-sync-client-invite-link__row {
+	align-items: center;
+	display: flex;
+	gap: 8px;
+	min-width: 0;
+}
+
+.obsidian-sync-client-invite-link__url {
+	background: var(--background-modifier-form-field);
+	border: 1px solid var(--background-modifier-border);
+	border-radius: var(--input-radius);
+	color: var(--text-accent);
+	flex: 1 1 auto;
+	font-family: var(--font-monospace);
+	font-size: var(--font-ui-smaller);
+	min-width: 0;
+	overflow: hidden;
+	padding: 7px 9px;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.obsidian-sync-client-invite-link small {
+	color: var(--text-muted);
+	font-variant-numeric: tabular-nums;
+}
+
 .obsidian-sync-connection-status {
 	background: currentColor;
 	border-radius: 50%;

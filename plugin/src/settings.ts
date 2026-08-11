@@ -16,9 +16,11 @@ import {
 import type {
 	ClientArchiveBuildProgress,
 	ClientInvite,
+	ClientInviteStatus,
 } from "./clientInvites";
 import type { ServerConnectionState } from "./serverConnection";
 import { describeClientArchiveProgress } from "./ui/clientInviteProgress";
+import { formatClientInviteRemainingTime } from "./ui/clientInviteStatus";
 
 export {
 	normalizeServerUrl,
@@ -48,6 +50,8 @@ const isHttpUrl = (value: string): boolean => {
 	}
 };
 
+const CLIENT_INVITE_STATUS_POLL_INTERVAL_MS = 1_000;
+
 export class SyncSettingTab extends PluginSettingTab {
 	plugin: ObsidianSyncPlugin;
 	private clientInvite: ClientInvite | null = null;
@@ -59,6 +63,13 @@ export class SyncSettingTab extends PluginSettingTab {
 	private clientInviteProgress: ClientArchiveBuildProgress | null = null;
 	private clientInviteProgressEl: HTMLElement | null = null;
 	private clientInviteProgressBar: HTMLProgressElement | null = null;
+	private clientInviteStatus: ClientInviteStatus | null = null;
+	private clientInviteStatusCheckFailed = false;
+	private clientInviteStatusTimer: number | null = null;
+	private clientInviteStatusPollGeneration = 0;
+	private clientInviteLinkEl: HTMLElement | null = null;
+	private clientInviteUrlEl: HTMLAnchorElement | null = null;
+	private clientInviteExpiryEl: HTMLElement | null = null;
 
 	constructor(app: App, plugin: ObsidianSyncPlugin) {
 		super(app, plugin);
@@ -72,6 +83,7 @@ export class SyncSettingTab extends PluginSettingTab {
 
 	display(): void {
 		const { containerEl } = this;
+		this.stopClientInviteStatusPolling();
 
 		containerEl.empty();
 		new Setting(containerEl)
@@ -190,7 +202,7 @@ export class SyncSettingTab extends PluginSettingTab {
 		);
 		clientPackageDesc.append(this.clientInviteProgressEl);
 
-		new Setting(containerEl)
+		const clientPackageSetting = new Setting(containerEl)
 		.setName("Add another client")
 		.setDesc(clientPackageDesc)
 		.addButton((button) =>
@@ -245,35 +257,33 @@ export class SyncSettingTab extends PluginSettingTab {
 					}
 				}),
 		);
+		clientPackageSetting.settingEl.addClass("obsidian-sync-client-package-setting");
+		this.clientInviteLinkEl = activeDocument.createElement("div");
+		this.clientInviteLinkEl.className = "obsidian-sync-client-invite-link";
+		const clientInviteLinkRow = activeDocument.createElement("div");
+		clientInviteLinkRow.className = "obsidian-sync-client-invite-link__row";
+		this.clientInviteUrlEl = activeDocument.createElement("a");
+		this.clientInviteUrlEl.className = "obsidian-sync-client-invite-link__url";
+		this.clientInviteUrlEl.target = "_blank";
+		this.clientInviteUrlEl.rel = "noopener noreferrer";
+		const copyClientInviteButton = activeDocument.createElement("button");
+		copyClientInviteButton.type = "button";
+		copyClientInviteButton.textContent = "Copy";
+		copyClientInviteButton.addEventListener("click", () => {
+			void this.copyClientInviteLink();
+		});
+		clientInviteLinkRow.append(
+			this.clientInviteUrlEl,
+			copyClientInviteButton,
+		);
+		this.clientInviteExpiryEl = activeDocument.createElement("small");
+		this.clientInviteExpiryEl.setAttribute("role", "status");
+		this.clientInviteExpiryEl.setAttribute("aria-live", "polite");
+		this.clientInviteLinkEl.append(clientInviteLinkRow, this.clientInviteExpiryEl);
+		clientPackageSetting.settingEl.append(this.clientInviteLinkEl);
 		this.renderClientInviteProgress();
-
-		if (this.clientInvite) {
-			new Setting(containerEl)
-				.setName("New client link")
-				.setDesc("Send this link to the other device. The zip can be downloaded once.")
-				.addText((text) =>
-					text
-						.setValue(this.clientInvite?.url ?? "")
-						.setDisabled(true),
-				)
-				.addButton((button) =>
-					button
-						.setButtonText("Copy")
-						.onClick(async () => {
-							if (!this.clientInvite) return;
-								try {
-									await navigator.clipboard.writeText(this.clientInvite.url);
-									this.plugin.logger.info("client_invite.clipboard_copy_completed");
-									new Notice("Client link copied to clipboard");
-								} catch (error) {
-									this.plugin.logger.warn("client_invite.clipboard_copy_failed", {
-										error,
-									});
-									new Notice("Could not copy the client link");
-							}
-						}),
-				);
-		}
+		this.renderClientInviteLink();
+		if (this.clientInvite) this.startClientInviteStatusPolling();
 
 		new Setting(containerEl)
 		.setName("Last synced revision")
@@ -284,6 +294,11 @@ export class SyncSettingTab extends PluginSettingTab {
 				.setValue(this.plugin.settings.revision.toString())
 				.setDisabled(true)
 		);
+	}
+
+	hide(): void {
+		this.stopClientInviteStatusPolling();
+		super.hide();
 	}
 
 	private renderClientInviteProgress(): void {
@@ -300,6 +315,96 @@ export class SyncSettingTab extends PluginSettingTab {
 		const detail = container.querySelector("small");
 		if (summary) summary.textContent = copy.summary;
 		if (detail) detail.textContent = copy.detail;
+	}
+
+	private renderClientInviteLink(): void {
+		const container = this.clientInviteLinkEl;
+		const url = this.clientInviteUrlEl;
+		const expiry = this.clientInviteExpiryEl;
+		const invite = this.clientInvite;
+		if (!container || !url || !expiry) return;
+		container.toggle(invite !== null);
+		if (!invite) return;
+		url.href = invite.url;
+		url.textContent = invite.url;
+		if (this.clientInviteStatus?.status === "available") {
+			expiry.textContent =
+				`Expires in ${formatClientInviteRemainingTime(this.clientInviteStatus.remainingSeconds)}` +
+				" · verified by server";
+		} else if (this.clientInviteStatusCheckFailed) {
+			expiry.textContent = "Could not confirm expiry with the server. Retrying…";
+		} else {
+			expiry.textContent = "Checking expiry with the server…";
+		}
+	}
+
+	private startClientInviteStatusPolling(): void {
+		this.stopClientInviteStatusPolling();
+		const invite = this.clientInvite;
+		if (!invite) return;
+		const generation = this.clientInviteStatusPollGeneration;
+		this.clientInviteStatus = null;
+		this.clientInviteStatusCheckFailed = false;
+		this.renderClientInviteLink();
+		const poll = async (): Promise<void> => {
+			try {
+				const status = await this.plugin.getClientInviteStatus(invite);
+				if (
+					generation !== this.clientInviteStatusPollGeneration ||
+					this.clientInvite !== invite
+				) return;
+				if (status.status === "unavailable") {
+					this.plugin.logger.info("client_invite.became_unavailable");
+					this.clientInvite = null;
+					this.clientInviteStatus = status;
+					this.clientInviteStatusCheckFailed = false;
+					this.renderClientInviteLink();
+					new Notice("Client link expired or was already used");
+					return;
+				}
+				this.clientInviteStatus = status;
+				this.clientInviteStatusCheckFailed = false;
+				this.renderClientInviteLink();
+			} catch (error) {
+				if (
+					generation !== this.clientInviteStatusPollGeneration ||
+					this.clientInvite !== invite
+				) return;
+				this.clientInviteStatusCheckFailed = true;
+				this.plugin.logger.warn("client_invite.status_check_failed", { error });
+				this.renderClientInviteLink();
+			}
+			if (
+				generation === this.clientInviteStatusPollGeneration &&
+				this.clientInvite === invite
+			) {
+				this.clientInviteStatusTimer = window.setTimeout(
+					() => void poll(),
+					CLIENT_INVITE_STATUS_POLL_INTERVAL_MS,
+				);
+			}
+		};
+		void poll();
+	}
+
+	private stopClientInviteStatusPolling(): void {
+		this.clientInviteStatusPollGeneration += 1;
+		if (this.clientInviteStatusTimer !== null) {
+			window.clearTimeout(this.clientInviteStatusTimer);
+			this.clientInviteStatusTimer = null;
+		}
+	}
+
+	private async copyClientInviteLink(): Promise<void> {
+		if (!this.clientInvite) return;
+		try {
+			await navigator.clipboard.writeText(this.clientInvite.url);
+			this.plugin.logger.info("client_invite.clipboard_copy_completed");
+			new Notice("Client link copied to clipboard");
+		} catch (error) {
+			this.plugin.logger.warn("client_invite.clipboard_copy_failed", { error });
+			new Notice("Could not copy the client link");
+		}
 	}
 
 	private updateConnectionIndicator(value: string): void {

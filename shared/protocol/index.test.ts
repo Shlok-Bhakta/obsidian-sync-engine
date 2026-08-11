@@ -4,6 +4,7 @@ import {
 	clientInviteBuildSchema,
 	clientConfigSchema,
 	clientInviteSchema,
+	clientInviteStatusSchema,
 	deserializeInboxNdjson,
 	isCanonicalSyncPath,
 	serializeInboxNdjson,
@@ -96,6 +97,29 @@ describe("HTTP contracts", () => {
 				clientName: "laptop",
 				clientSecret: "obs_sync_secret",
 				revision: -1,
+			}),
+		).toThrow();
+	});
+
+	test("validates server-authoritative invite availability", () => {
+		expect(
+			clientInviteStatusSchema.parse({
+				status: "available",
+				expiresAt: "2030-01-01T00:05:00.000Z",
+				remainingSeconds: 271,
+			}),
+		).toBeDefined();
+		expect(
+			clientInviteStatusSchema.parse({
+				status: "unavailable",
+				remainingSeconds: 0,
+			}),
+		).toBeDefined();
+		expect(() =>
+			clientInviteStatusSchema.parse({
+				status: "available",
+				expiresAt: "not-a-date",
+				remainingSeconds: 0,
 			}),
 		).toThrow();
 	});

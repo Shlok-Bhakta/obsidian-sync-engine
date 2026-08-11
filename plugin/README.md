@@ -29,7 +29,10 @@ Reload Obsidian and enable the plugin.
 
 1. Set the server URL and client name. An empty server enrolls this first client automatically.
 2. A client whose last synced revision is `0` automatically uploads its vault.
-3. Select **Create client package** to add another device. Obsidian displays file progress and a rough time estimate while the server builds the archive, then copies the five-minute link.
+3. Select **Create client package** to add another device. Obsidian displays file progress and a rough time estimate while the server builds the archive, then keeps the link visible beneath the button with a server-verified expiration countdown.
 4. On the other device, open the link and select **Download ZIP**. The download works once.
+
+While settings remain open, the plugin checks the server every second. The link
+disappears as soon as the package expires or is downloaded on another device.
 
 See the [repository README](../README.md) for limits, conflict policy, and privacy notes.

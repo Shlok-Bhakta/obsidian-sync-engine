@@ -126,6 +126,24 @@ export const clientInviteSchema = z.object({
 });
 export type ClientInvite = z.infer<typeof clientInviteSchema>;
 
+export const clientInviteStatusSchema = z.discriminatedUnion("status", [
+	z.object({
+		status: z.literal("available"),
+		expiresAt: z
+			.string()
+			.refine(
+				(value) => Number.isFinite(Date.parse(value)),
+				"expiresAt must be a valid date",
+			),
+		remainingSeconds: z.number().int().safe().positive(),
+	}),
+	z.object({
+		status: z.literal("unavailable"),
+		remainingSeconds: z.literal(0),
+	}),
+]);
+export type ClientInviteStatus = z.infer<typeof clientInviteStatusSchema>;
+
 export const clientArchiveBuildProgressSchema = z
 	.object({
 		phase: z.enum(["preparing", "archiving", "finalizing"]),

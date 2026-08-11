@@ -22,7 +22,9 @@ import { seedVaultIfRevisionZero } from "./sync/autoSeed";
 import { migrateServerState } from "./sync/stateMigration";
 import {
 	requestClientInvite,
+	requestClientInviteStatus,
 	type ClientInvite,
+	type ClientInviteStatus,
 } from "./clientInvites";
 import { createClientLogger, type Logger } from "./logger";
 import {
@@ -367,6 +369,15 @@ export default class ObsidianSyncPlugin extends Plugin {
 			expiresAt: invite.expiresAt,
 		});
 		return invite;
+	}
+
+	async getClientInviteStatus(invite: ClientInvite): Promise<ClientInviteStatus> {
+		return requestClientInviteStatus({
+			invite,
+			clientSecret: this.settings.clientSecret,
+			request: requestUrl,
+			logger: this.logger,
+		});
 	}
 
 	async openSyncStatusView(): Promise<void> {

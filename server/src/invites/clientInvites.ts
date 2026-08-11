@@ -9,7 +9,10 @@ import {
 } from "../auth/auth";
 import { objectStore, type ObjectStore } from "../object/object_store";
 import type { ClientArchiveProgressSnapshot } from "../object/object_store";
-import type { ClientInvite } from "obsidian-sync-protocol";
+import type {
+	ClientInvite,
+	ClientInviteStatus,
+} from "obsidian-sync-protocol";
 import { serverLogger, type Logger } from "../logger";
 
 export const CLIENT_INVITE_LIFETIME_MS = 5 * 60 * 1000;
@@ -58,24 +61,43 @@ export async function cleanupExpiredClientInvites(
 	return count;
 }
 
+export async function getInviteStatus(
+	token: string,
+	now = new Date(),
+	logger: Logger = serverLogger,
+): Promise<ClientInviteStatus> {
+	const [row] = await sql<{ expires_at: Date }[]>`
+		SELECT expires_at FROM client_invites
+		WHERE token_hash = ${hashToken(token)} AND expires_at > ${now}
+	`;
+	if (!row) {
+		await cleanupExpiredClientInvites(now, logger);
+		logger.child("client_invites").debug("status.completed", {
+			status: "unavailable",
+		});
+		return { status: "unavailable", remainingSeconds: 0 };
+	}
+	const remainingSeconds = Math.max(
+		1,
+		Math.ceil((row.expires_at.getTime() - now.getTime()) / 1000),
+	);
+	logger.child("client_invites").debug("lookup.completed", {
+		status: "available",
+		remainingSeconds,
+	});
+	return {
+		status: "available",
+		expiresAt: row.expires_at.toISOString(),
+		remainingSeconds,
+	};
+}
+
 async function inviteExists(
 	token: string,
 	now = new Date(),
 	logger: Logger = serverLogger,
 ): Promise<boolean> {
-	const [row] = await sql<{ exists: boolean }[]>`
-		SELECT EXISTS (
-			SELECT 1 FROM client_invites
-			WHERE token_hash = ${hashToken(token)} AND expires_at > ${now}
-		) AS exists
-	`;
-	if (!row.exists) {
-		await cleanupExpiredClientInvites(now, logger);
-	}
-	logger.child("client_invites").debug("lookup.completed", {
-		exists: row.exists,
-	});
-	return row.exists;
+	return (await getInviteStatus(token, now, logger)).status === "available";
 }
 
 async function consumeInvite(
@@ -220,6 +242,25 @@ export function registerClientInviteRoutes(
 				expiresAt: response.expiresAt,
 			});
 			return c.json(response, 201);
+		})
+		.get("/client-invite-status", async (c) => {
+			const authorized = await requireClientId(c, authorize, logger);
+			if (authorized instanceof Response) {
+				logger.warn("status.rejected", { reason: "unauthorized" });
+				return authorized;
+			}
+			const token = c.req.header("X-Client-Invite-Token");
+			if (!token) {
+				logger.warn("status.rejected", { reason: "missing_invite_token" });
+				return c.json({ error: "Client invite token is required" }, 400, noStoreHeaders());
+			}
+			const status = await getInviteStatus(token, now(), logger);
+			logger.debug("status.served", {
+				clientId: authorized,
+				status: status.status,
+				remainingSeconds: status.remainingSeconds,
+			});
+			return c.json(status, 200, noStoreHeaders());
 		})
 		.get("/client-invites/:token", async (c) => {
 			const token = c.req.param("token");
