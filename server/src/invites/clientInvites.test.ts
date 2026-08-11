@@ -401,4 +401,33 @@ describe("client invite packages", () => {
 			`)[0].count),
 		).toBe(0);
 	});
+
+	it("prevents deleting an owner while its client package is pending", async () => {
+		const owner = await createClientFixture({ client_name: "protected-owner" });
+		const app = createTestApp();
+		await createInvite(app, owner.client_secret);
+		const [pending] = await sql<{ client_id: string }[]>`
+			SELECT client_id FROM client_invites WHERE owner_client_id = ${owner.id}
+		`;
+
+		let deletionError: unknown;
+		try {
+			await sql`DELETE FROM clients WHERE id = ${owner.id}`;
+		} catch (error) {
+			deletionError = error;
+		}
+		expect(deletionError).toBeInstanceOf(Error);
+		expect(
+			Number((await sql<{ count: string }[]>`
+				SELECT COUNT(*)::text AS count
+				FROM clients WHERE id IN (${owner.id}, ${pending.client_id})
+			`)[0].count),
+		).toBe(2);
+		expect(
+			Number((await sql<{ count: string }[]>`
+				SELECT COUNT(*)::text AS count
+				FROM client_invites WHERE owner_client_id = ${owner.id}
+			`)[0].count),
+		).toBe(1);
+	});
 });

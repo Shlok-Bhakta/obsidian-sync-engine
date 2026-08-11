@@ -21,4 +21,16 @@ describe("MigrationRunner env", () => {
 		`;
 		expect(Number(count)).toBe(1);
 	});
+
+	it("validates the invite-owner foreign key with restrictive deletion", async () => {
+		const [constraint] = await sql<{
+			validated: boolean;
+			deleteAction: string;
+		}[]>`
+			SELECT convalidated AS validated, confdeltype AS "deleteAction"
+			FROM pg_constraint
+			WHERE conname = 'client_invites_owner_client_id_fkey'
+		`;
+		expect(constraint).toEqual({ validated: true, deleteAction: "r" });
+	});
 });
