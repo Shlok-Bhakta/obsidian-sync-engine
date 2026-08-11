@@ -1,12 +1,19 @@
 import { sql } from "bun";
 import { describe, expect, it } from "bun:test";
 import { unzipSync } from "fflate";
+import { Hono } from "hono";
 import {
 	CLIENT_DATA_PATH,
 	clientConfigSchema,
 	clientInviteSchema,
 } from "obsidian-sync-protocol";
+import { FakeLogger } from "../logger";
+import { ObjectStore } from "../object/object_store";
 import { createClientFixture, createTestApp } from "../test/fixtures";
+import {
+	CLIENT_INVITE_LIFETIME_MS,
+	registerClientInviteRoutes,
+} from "./clientInvites";
 
 const decoder = new TextDecoder();
 
@@ -89,6 +96,37 @@ describe("client invite packages", () => {
 			method: "POST",
 		});
 		expect(replay.status).toBe(410);
+	});
+
+	it("starts the five-minute lifetime after the archive finishes building", async () => {
+		const owner = await createClientFixture({ client_name: "slow-vault-owner" });
+		const buildStartedAt = Date.parse("2026-08-11T00:00:00.000Z");
+		const archiveCompletedAt = buildStartedAt + 4 * 60 * 1000;
+		const clockReadings = [buildStartedAt, archiveCompletedAt];
+		const now = () => new Date(clockReadings.shift() ?? archiveCompletedAt);
+		const logger = new FakeLogger();
+		const app = registerClientInviteRoutes(
+			new Hono(),
+			new ObjectStore(logger),
+			undefined,
+			logger,
+			now,
+		);
+
+		const response = await app.request("https://sync.example/client-invites", {
+			method: "POST",
+			headers: { Authorization: owner.client_secret },
+		});
+		expect(response.status).toBe(201);
+		const invite = clientInviteSchema.parse(await response.json());
+
+		expect(new Date(invite.expiresAt).getTime()).toBe(
+			archiveCompletedAt + CLIENT_INVITE_LIFETIME_MS,
+		);
+		expect(new Date(invite.expiresAt).getTime() - buildStartedAt).toBe(
+			9 * 60 * 1000,
+		);
+		expect(clockReadings).toHaveLength(0);
 	});
 
 	it("allows only one concurrent download", async () => {
