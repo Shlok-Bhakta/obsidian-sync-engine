@@ -126,7 +126,7 @@ async function createInvite(options: {
 			INSERT INTO client_invites (
 				token_hash, client_id, archive, expires_at
 			) VALUES (
-				${hashToken(token)}, ${clientId}, ${Buffer.from(archive)}, ${expiresAt}
+				${hashToken(token)}, ${clientId}, ${archive}, ${expiresAt}
 			)
 		`;
 		const timer = setTimeout(() => {
