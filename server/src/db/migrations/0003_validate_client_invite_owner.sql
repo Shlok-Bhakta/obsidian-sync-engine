@@ -1,0 +1,2 @@
+ALTER TABLE client_invites
+VALIDATE CONSTRAINT client_invites_owner_client_id_fkey;

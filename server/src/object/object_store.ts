@@ -163,6 +163,12 @@ export type ObjectStoreOutboxItem = {
     isDeleted: boolean;
 };
 
+export type ClientArchiveProgressSnapshot = {
+	phase: "preparing" | "archiving" | "finalizing";
+	processedFiles: number;
+	totalFiles: number;
+};
+
 type FileContentRow = { last_updated_revision: number };
 
 /** Normalizes any upload body shape into a Buffer suitable for a BYTEA column. */
@@ -386,6 +392,7 @@ export class ObjectStore {
 		serverUrl: string;
 		clientName: string;
 		clientSecret: string;
+		onProgress?: (progress: ClientArchiveProgressSnapshot) => void;
 	}): Promise<Buffer> {
 		const startedAt = Date.now();
 		this.logger.info("client_archive.started", {
@@ -403,15 +410,32 @@ export class ObjectStore {
 		});
 		const addEntry = (path: string, content: Uint8Array) =>
 			addArchiveEntry(archive, path, content, () => archiveError);
+		options.onProgress?.({
+			phase: "preparing",
+			processedFiles: 0,
+			totalFiles: 0,
+		});
 
 		// Snapshot the tip before reading rows. A concurrent write can then cause
 		// at worst an extra inbox fetch, never a missing file hidden behind the tip.
 		const revision = await this.getTipRevision();
 		const pluginEntries = await loadPluginArchiveEntries();
 		const bundledPluginPaths = new Set(pluginEntries.map(({ path }) => path));
+		const [countRow] = await sql<{ count: string }[]>`
+			SELECT COUNT(*)::text AS count
+			FROM files
+			WHERE file_is_deleted = FALSE
+		`;
+		const totalFiles = Number(countRow?.count ?? 0);
 		let afterPath = "";
 		let fileCount = 0;
+		let processedFiles = 0;
 		let communityPluginsAdded = false;
+		options.onProgress?.({
+			phase: "archiving",
+			processedFiles,
+			totalFiles,
+		});
 
 		while (true) {
 			const files = await sql<{ file_path: string; content: Buffer }[]>`
@@ -424,16 +448,30 @@ export class ObjectStore {
 
 			for (const file of files) {
 				afterPath = file.file_path;
-				if (file.file_path === CLIENT_DATA_PATH) continue;
-				const canonicalPath = canonicalizePath(file.file_path);
-				if (bundledPluginPaths.has(canonicalPath)) continue;
-				if (canonicalPath === COMMUNITY_PLUGINS_PATH) {
-					await addEntry(canonicalPath, enablePlugin(file.content));
-					communityPluginsAdded = true;
-				} else {
-					await addEntry(canonicalPath, file.content);
+				if (file.file_path !== CLIENT_DATA_PATH) {
+					const canonicalPath = canonicalizePath(file.file_path);
+					if (!bundledPluginPaths.has(canonicalPath)) {
+						if (canonicalPath === COMMUNITY_PLUGINS_PATH) {
+							await addEntry(canonicalPath, enablePlugin(file.content));
+							communityPluginsAdded = true;
+						} else {
+							await addEntry(canonicalPath, file.content);
+						}
+						fileCount++;
+					}
 				}
-				fileCount++;
+				processedFiles++;
+				const reportedTotalFiles = Math.max(totalFiles, processedFiles);
+				if (
+					processedFiles % ARCHIVE_YIELD_EVERY_FILES === 0 ||
+					processedFiles === reportedTotalFiles
+				) {
+					options.onProgress?.({
+						phase: "archiving",
+						processedFiles,
+						totalFiles: reportedTotalFiles,
+					});
+				}
 				if (fileCount % ARCHIVE_YIELD_EVERY_FILES === 0) {
 					await yieldToServer();
 				}
@@ -442,6 +480,11 @@ export class ObjectStore {
 		this.logger.info("client_archive.files_loaded", {
 			fileCount,
 			revision,
+		});
+		options.onProgress?.({
+			phase: "finalizing",
+			processedFiles: Math.max(totalFiles, processedFiles),
+			totalFiles: Math.max(totalFiles, processedFiles),
 		});
 
 		if (!communityPluginsAdded) {

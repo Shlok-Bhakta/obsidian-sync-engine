@@ -1,8 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import {
 	CLIENT_DATA_PATH,
+	clientInviteBuildSchema,
 	clientConfigSchema,
 	clientInviteSchema,
+	clientInviteStatusSchema,
 	deserializeInboxNdjson,
 	isCanonicalSyncPath,
 	serializeInboxNdjson,
@@ -95,6 +97,76 @@ describe("HTTP contracts", () => {
 				clientName: "laptop",
 				clientSecret: "obs_sync_secret",
 				revision: -1,
+			}),
+		).toThrow();
+	});
+
+	test("validates server-authoritative invite availability", () => {
+		expect(
+			clientInviteStatusSchema.parse({
+				status: "available",
+				expiresAt: "2030-01-01T00:05:00.000Z",
+				remainingSeconds: 271,
+			}),
+		).toBeDefined();
+		expect(
+			clientInviteStatusSchema.parse({
+				status: "unavailable",
+				remainingSeconds: 0,
+			}),
+		).toBeDefined();
+		expect(() =>
+			clientInviteStatusSchema.parse({
+				status: "available",
+				expiresAt: "not-a-date",
+				remainingSeconds: 0,
+			}),
+		).toThrow();
+	});
+
+	test("validates polling states for client archive builds", () => {
+		const buildId = "550e8400-e29b-41d4-a716-446655440000";
+		expect(
+			clientInviteBuildSchema.parse({
+				buildId,
+				status: "building",
+				progress: {
+					phase: "archiving",
+					processedFiles: 25,
+					totalFiles: 100,
+					percent: 25,
+					estimatedSecondsRemaining: 9,
+				},
+			}),
+		).toBeDefined();
+		expect(
+			clientInviteBuildSchema.parse({
+				buildId,
+				status: "ready",
+				progress: {
+					phase: "finalizing",
+					processedFiles: 100,
+					totalFiles: 100,
+					percent: 100,
+					estimatedSecondsRemaining: 0,
+				},
+				invite: {
+					url: "https://sync.example/client-invites/abc",
+					expiresAt: "2030-01-01T00:05:00.000Z",
+				},
+			}),
+		).toBeDefined();
+		expect(() =>
+			clientInviteBuildSchema.parse({
+				buildId,
+				status: "building",
+				progress: {
+					phase: "archiving",
+					processedFiles: 101,
+					totalFiles: 100,
+					percent: 50,
+					estimatedSecondsRemaining: -1,
+				},
 			}),
 		).toThrow();
 	});

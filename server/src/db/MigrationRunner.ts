@@ -1,5 +1,7 @@
 import { sql } from "bun";
 import migration0001 from "./migrations/0001_init.sql" with { type: "file" };
+import migration0002 from "./migrations/0002_client_invite_owner.sql" with { type: "file" };
+import migration0003 from "./migrations/0003_validate_client_invite_owner.sql" with { type: "file" };
 import { serverLogger, type Logger } from "../logger";
 
 type Migration = {
@@ -12,6 +14,14 @@ const migrationsManifest: Migration[] = [
         name: "0001_init",
         sql: migration0001,
     },
+	{
+		name: "0002_client_invite_owner",
+		sql: migration0002,
+	},
+	{
+		name: "0003_validate_client_invite_owner",
+		sql: migration0003,
+	},
 ]
 
 
@@ -20,6 +30,9 @@ export async function bootstrapDB(injectedLogger: Logger = serverLogger) {
 	const startedAt = Date.now();
 	logger.info("bootstrap.started", { migrationCount: migrationsManifest.length });
     await canConnect(logger);
+	// Run schema setup and each migration in separate transactions. In
+	// particular, this lets a NOT VALID foreign key commit before the following
+	// migration validates it with a less restrictive PostgreSQL lock.
     await sql.begin(async (tx) => {
         await tx`SELECT pg_advisory_xact_lock(hashtext('obsidian-sync-migrations'))`;
         await tx`
@@ -40,32 +53,37 @@ export async function bootstrapDB(injectedLogger: Logger = serverLogger) {
 			CREATE UNIQUE INDEX IF NOT EXISTS migrations_name_unique
 			ON migrations (name)
 		`;
-        const applied = await tx<MigrationRow[]>`SELECT name FROM migrations`;
-        const appliedNames = new Set(applied.map(({ name }) => name));
-		logger.info("manifest.loaded", {
-			applied: [...appliedNames],
-			pending: migrationsManifest
-				.map(({ name }) => name)
-				.filter((name) => !appliedNames.has(name)),
-		});
-        for (const migration of migrationsManifest) {
-            if (appliedNames.has(migration.name)) {
+    });
+	const applied = await sql<MigrationRow[]>`SELECT name FROM migrations`;
+	const appliedNames = new Set(applied.map(({ name }) => name));
+	logger.info("manifest.loaded", {
+		applied: [...appliedNames],
+		pending: migrationsManifest
+			.map(({ name }) => name)
+			.filter((name) => !appliedNames.has(name)),
+	});
+	for (const migration of migrationsManifest) {
+		await sql.begin(async (tx) => {
+			await tx`SELECT pg_advisory_xact_lock(hashtext('obsidian-sync-migrations'))`;
+			const [appliedMigration] = await tx<MigrationRow[]>`
+				SELECT name FROM migrations WHERE name = ${migration.name}
+			`;
+			if (appliedMigration) {
 				logger.debug("migration.skipped", {
 					migration: migration.name,
 					reason: "already_applied",
 				});
-                continue;
-            }
+				return;
+			}
 			logger.info("migration.started", { migration: migration.name });
-            await tx.unsafe(await Bun.file(migration.sql).text());
-            await tx`
-                INSERT INTO migrations (name, created_at)
-                VALUES (${migration.name}, NOW())
-                ON CONFLICT (name) DO NOTHING
-            `;
-            logger.info("migration.completed", { migration: migration.name });
-        }
-    });
+			await tx.unsafe(await Bun.file(migration.sql).text());
+			await tx`
+				INSERT INTO migrations (name, created_at)
+				VALUES (${migration.name}, NOW())
+			`;
+			logger.info("migration.completed", { migration: migration.name });
+		});
+	}
 	logger.info("bootstrap.completed", {
 		durationMs: Date.now() - startedAt,
 	});

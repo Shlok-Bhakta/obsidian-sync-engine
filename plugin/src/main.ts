@@ -22,7 +22,9 @@ import { seedVaultIfRevisionZero } from "./sync/autoSeed";
 import { migrateServerState } from "./sync/stateMigration";
 import {
 	requestClientInvite,
+	requestClientInviteStatus,
 	type ClientInvite,
+	type ClientInviteStatus,
 } from "./clientInvites";
 import { createClientLogger, type Logger } from "./logger";
 import {
@@ -348,7 +350,9 @@ export default class ObsidianSyncPlugin extends Plugin {
 		}
 	}
 
-	async createClientInvite(): Promise<ClientInvite> {
+	async createClientInvite(
+		onProgress?: Parameters<typeof requestClientInvite>[0]["onProgress"],
+	): Promise<ClientInvite> {
 		if (this.isSyncSuspended()) {
 			throw new Error("The sync connection is changing");
 		}
@@ -359,11 +363,21 @@ export default class ObsidianSyncPlugin extends Plugin {
 			clientSecret: this.settings.clientSecret,
 			request: requestUrl,
 			logger: this.logger,
+			onProgress,
 		});
 		this.logger.info("client_invite.request_completed", {
 			expiresAt: invite.expiresAt,
 		});
 		return invite;
+	}
+
+	async getClientInviteStatus(invite: ClientInvite): Promise<ClientInviteStatus> {
+		return requestClientInviteStatus({
+			invite,
+			clientSecret: this.settings.clientSecret,
+			request: requestUrl,
+			logger: this.logger,
+		});
 	}
 
 	async openSyncStatusView(): Promise<void> {
