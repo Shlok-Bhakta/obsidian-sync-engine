@@ -298,18 +298,19 @@ export function registerClientInviteRoutes(
 				logger.warn("download.unavailable");
 				return c.text("This client package has expired or was already used.", 410, noStoreHeaders());
 			}
-			const body = archive.buffer.slice(
+			const body = Buffer.from(
+				archive.buffer,
 				archive.byteOffset,
-				archive.byteOffset + archive.byteLength,
-			) as ArrayBuffer;
-			logger.info("download.served", { bytes: archive.byteLength });
+				archive.byteLength,
+			);
+			logger.info("download.served", { bytes: body.byteLength });
 			return new Response(body, {
 				status: 200,
 				headers: {
 					...noStoreHeaders(),
 					"Content-Type": "application/zip",
 					"Content-Disposition": `attachment; filename="obsidian-sync-client-${Date.now()}.zip"`,
-					"Content-Length": String(archive.byteLength),
+					"Content-Length": String(body.byteLength),
 				},
 			});
 		});

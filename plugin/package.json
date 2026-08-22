@@ -1,6 +1,6 @@
 {
 	"name": "obsidian-sync-engine",
-	"version": "1.0.3",
+	"version": "1.0.4",
 	"description": "Self-hosted sync engine for your Obsidian vault.",
 	"main": "main.js",
 	"type": "module",

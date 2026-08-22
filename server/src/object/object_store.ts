@@ -1,7 +1,6 @@
 import { Context, Hono } from "hono";
 import { join, resolve } from "node:path";
 import { sql } from "bun";
-import { Zip, ZipDeflate } from "fflate";
 import {
 	type ClientAuthorizer,
 	getClientIdFromAuthorization,
@@ -17,6 +16,7 @@ import {
 	type UploadResponse,
 } from "obsidian-sync-protocol";
 import { canonicalizePath, InvalidPathError } from "./paths";
+import { ZipArchiveWriter } from "./zipArchive";
 import { serverLogger, type Logger } from "../logger";
 
 export { InvalidPathError };
@@ -33,7 +33,6 @@ const REVISION_LOCK_KEY = "obsidian-sync-revision";
 const PLUGIN_ID = "obsidian-sync-engine";
 const COMMUNITY_PLUGINS_PATH = ".obsidian/community-plugins.json";
 const ARCHIVE_FILE_BATCH_SIZE = 50;
-const ARCHIVE_COMPRESSION_CHUNK_SIZE = 64 * 1024;
 const ARCHIVE_YIELD_EVERY_FILES = 10;
 const PLUGIN_DIR = resolve(
 	process.env.PLUGIN_DIST_DIR ?? join(import.meta.dir, "../../../plugin"),
@@ -89,64 +88,8 @@ function enablePlugin(existing?: Uint8Array): Uint8Array {
 	return new TextEncoder().encode(JSON.stringify(communityPlugins));
 }
 
-class ArchiveBuffer {
-	private buffer = Buffer.allocUnsafe(64 * 1024);
-	private length = 0;
-
-	write(chunk: Uint8Array): void {
-		const requiredLength = this.length + chunk.byteLength;
-		if (requiredLength > this.buffer.byteLength) {
-			let nextCapacity = this.buffer.byteLength;
-			while (nextCapacity < requiredLength) {
-				nextCapacity *= 2;
-			}
-			const next = Buffer.allocUnsafe(nextCapacity);
-			this.buffer.copy(next, 0, 0, this.length);
-			this.buffer = next;
-		}
-		this.buffer.set(chunk, this.length);
-		this.length = requiredLength;
-	}
-
-	finish(): Buffer {
-		return this.buffer.subarray(0, this.length);
-	}
-}
-
 async function yieldToServer(): Promise<void> {
 	await new Promise<void>((resolveYield) => setImmediate(resolveYield));
-}
-
-async function addArchiveEntry(
-	archive: Zip,
-	path: string,
-	content: Uint8Array,
-	getArchiveError: () => Error | null,
-): Promise<void> {
-	const file = new ZipDeflate(path, { level: 6 });
-	archive.add(file);
-
-	if (content.byteLength === 0) {
-		file.push(content, true);
-	} else {
-		for (
-			let offset = 0;
-			offset < content.byteLength;
-			offset += ARCHIVE_COMPRESSION_CHUNK_SIZE
-		) {
-			const end = Math.min(
-				offset + ARCHIVE_COMPRESSION_CHUNK_SIZE,
-				content.byteLength,
-			);
-			file.push(content.subarray(offset, end), end === content.byteLength);
-			const archiveError = getArchiveError();
-			if (archiveError) throw archiveError;
-			if (end < content.byteLength) await yieldToServer();
-		}
-	}
-
-	const archiveError = getArchiveError();
-	if (archiveError) throw archiveError;
 }
 
 export type ObjectStoreUploadContent = {
@@ -399,17 +342,10 @@ export class ObjectStore {
 			serverUrl: options.serverUrl,
 			clientName: options.clientName,
 		});
-		const output = new ArchiveBuffer();
-		let archiveError: Error | null = null;
-		const archive = new Zip((error, chunk) => {
-			if (error) {
-				archiveError = error;
-				return;
-			}
-			if (chunk) output.write(chunk);
-		});
-		const addEntry = (path: string, content: Uint8Array) =>
-			addArchiveEntry(archive, path, content, () => archiveError);
+		const zip = new ZipArchiveWriter();
+		const addEntry = (path: string, content: Uint8Array) => {
+			zip.add(path, content);
+		};
 		options.onProgress?.({
 			phase: "preparing",
 			processedFiles: 0,
@@ -452,10 +388,10 @@ export class ObjectStore {
 					const canonicalPath = canonicalizePath(file.file_path);
 					if (!bundledPluginPaths.has(canonicalPath)) {
 						if (canonicalPath === COMMUNITY_PLUGINS_PATH) {
-							await addEntry(canonicalPath, enablePlugin(file.content));
+							await addEntry(canonicalPath, enablePlugin(file.content ?? undefined));
 							communityPluginsAdded = true;
 						} else {
-							await addEntry(canonicalPath, file.content);
+							await addEntry(canonicalPath, file.content ?? new Uint8Array());
 						}
 						fileCount++;
 					}
@@ -504,9 +440,7 @@ export class ObjectStore {
 			CLIENT_DATA_PATH,
 			new TextEncoder().encode(JSON.stringify(clientConfig, null, 2)),
 		);
-		archive.end();
-		if (archiveError) throw archiveError;
-		const archiveBytes = output.finish();
+		const archiveBytes = zip.finish();
 		this.logger.info("client_archive.completed", {
 			fileCount,
 			revision,

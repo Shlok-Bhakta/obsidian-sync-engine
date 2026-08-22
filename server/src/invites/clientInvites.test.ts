@@ -13,6 +13,11 @@ import { FakeLogger } from "../logger";
 import { ObjectStore } from "../object/object_store";
 import { createClientFixture, createTestApp } from "../test/fixtures";
 import {
+	assertSystemUnzipExtracts,
+	assertZipEndsAtCentralDirectory,
+	assertZipHasKnownSizesInLocalHeaders,
+} from "../test/zipAssert";
+import {
 	CLIENT_INVITE_LIFETIME_MS,
 	registerClientInviteRoutes,
 } from "./clientInvites";
@@ -307,6 +312,70 @@ describe("client invite packages", () => {
 			method: "POST",
 		});
 		expect(replay.status).toBe(410);
+	});
+
+	it("downloads a zip that Info-ZIP, Python, and header-strict unzippers can extract", async () => {
+		const owner = await createClientFixture({ client_name: "zip-compat-owner" });
+		const app = createTestApp();
+		const png = Uint8Array.from([
+			0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+			0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+			0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xde, 0x00, 0x00, 0x00,
+			0x0c, 0x49, 0x44, 0x41, 0x54, 0x08, 0xd7, 0x63, 0xf8, 0xff, 0xff, 0x3f,
+			0x00, 0x05, 0xfe, 0x02, 0xfe, 0xa7, 0x35, 0x81, 0x84, 0x00, 0x00, 0x00,
+			0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+		]);
+		const large = Uint8Array.from({ length: 80_000 }, (_, index) => index & 0xff);
+		await app.request("https://sync.example/files", {
+			method: "POST",
+			headers: {
+				Authorization: owner.client_secret,
+				"X-Obsidian-Path": encodeURIComponent("pixel.png"),
+			},
+			body: png,
+		});
+		await app.request("https://sync.example/files", {
+			method: "POST",
+			headers: {
+				Authorization: owner.client_secret,
+				"X-Obsidian-Path": encodeURIComponent("empty.md"),
+			},
+			body: new Uint8Array(),
+		});
+		await app.request("https://sync.example/files", {
+			method: "POST",
+			headers: {
+				Authorization: owner.client_secret,
+				"X-Obsidian-Path": encodeURIComponent("Inbox/回复.md"),
+			},
+			body: "from another device",
+		});
+		await app.request("https://sync.example/files", {
+			method: "POST",
+			headers: {
+				Authorization: owner.client_secret,
+				"X-Obsidian-Path": encodeURIComponent("attachments/noise.bin"),
+			},
+			body: large,
+		});
+
+		const invite = await createInvite(app, owner.client_secret);
+		const download = await app.request(`${invite.url}/download`, {
+			method: "POST",
+		});
+		expect(download.status).toBe(200);
+		expect(download.headers.get("Content-Type")).toContain("application/zip");
+		const zipBytes = new Uint8Array(await download.arrayBuffer());
+		expect(download.headers.get("Content-Length")).toBe(String(zipBytes.byteLength));
+		assertZipHasKnownSizesInLocalHeaders(zipBytes);
+		assertZipEndsAtCentralDirectory(zipBytes);
+		await assertSystemUnzipExtracts(zipBytes);
+
+		const extracted = unzipSync(zipBytes);
+		expect(extracted["pixel.png"]).toEqual(png);
+		expect(extracted["empty.md"]?.byteLength ?? 0).toBe(0);
+		expect(decoder.decode(extracted["Inbox/回复.md"])).toBe("from another device");
+		expect(extracted["attachments/noise.bin"]).toEqual(large);
 	});
 
 	it("starts the five-minute lifetime after the archive finishes building", async () => {
