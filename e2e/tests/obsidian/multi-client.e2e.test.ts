@@ -137,6 +137,8 @@ describe("obsidian multi-client e2e", () => {
 		const res = await fetch(`${localInviteUrl}/download`, { method: "POST" });
 		expect(res.ok).toBe(true);
 		await writeFile(zipPath, Buffer.from(await res.arrayBuffer()));
+		const unzipTest = await $`unzip -t ${zipPath}`.nothrow();
+		expect(unzipTest.exitCode).toBe(0);
 		expect(
 			(await fetch(`${localInviteUrl}/download`, { method: "POST" })).status,
 		).toBe(410);
@@ -458,6 +460,8 @@ describe("obsidian multi-client e2e", () => {
 			expect(response.status).toBe(200);
 			const zipPath = join(RUN_ROOT, archiveName);
 			await writeFile(zipPath, Buffer.from(await response.arrayBuffer()));
+			const unzipTest = await $`unzip -t ${zipPath}`.nothrow();
+			expect(unzipTest.exitCode).toBe(0);
 			await rm(client.vaultHostDir, { recursive: true, force: true });
 			await mkdir(client.vaultHostDir, { recursive: true });
 			await mkdir(client.configHostDir, { recursive: true });
