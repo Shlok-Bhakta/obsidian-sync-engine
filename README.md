@@ -94,6 +94,13 @@ Reload Obsidian, enable **Obsidian Sync Engine** under **Settings → Community
 plugins**, then set **Server URL** to the deployed server (for example,
 `https://sync.example.com`).
 
+## Run without Obsidian
+
+[`rust-client/`](rust-client/README.md) is a standalone Rust client that keeps a
+vault directory in sync with no Obsidian app running, as a systemd service. It uses
+the same `data.json` and journals as the plugin and pauses while Obsidian is open on
+the same machine.
+
 ## Development setup
 
 ### Database (Podman)
@@ -173,7 +180,9 @@ DATABASE_URL=postgres://postgres:postgres@localhost:5434/test_db \
   bun test --cwd server
 ```
 
-GitHub Actions runs plugin unit tests, server unit tests (Postgres service), lint, and Obsidian e2e.
+The Rust client has its own tests, described in [`rust-client/README.md`](rust-client/README.md).
+
+GitHub Actions runs plugin unit tests, server unit tests (Postgres service), Rust client tests, lint, and Obsidian e2e.
 
 Pushing a tag that exactly matches `plugin/manifest.json` publishes the plugin
 files and installable ZIP to GitHub Releases and publishes the server image to

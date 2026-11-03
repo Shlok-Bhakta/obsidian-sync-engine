@@ -1,0 +1,19 @@
+[Unit]
+Description=Obsidian Sync Engine headless client
+Documentation=https://github.com/Shlok-Bhakta/obsidian-sync-engine/tree/master/rust-client
+# The client waits for the server itself, so no network target is needed. User
+# managers do not have network-online.target anyway.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# The server URL, client name and secret come from data.json inside the vault.
+ExecStart=%h/.local/bin/obsidian-sync-client run --vault %h/obsidian-notes
+Restart=on-failure
+RestartSec=10
+UMask=0077
+TimeoutStopSec=60
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target
