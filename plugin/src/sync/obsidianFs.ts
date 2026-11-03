@@ -384,14 +384,18 @@ export class ObsidianFs implements VaultBlobFs {
 	 * it, and a non-recursive rmdir can't take anything created in the meantime.
 	 */
 	private async pruneEmptyParents(path: string): Promise<void> {
+		const trace = ((globalThis as unknown as { __pruneTrace?: unknown[] }).__pruneTrace ??= []);
+		trace.push({ path, step: "start" });
 		let slash = path.lastIndexOf("/");
 		while (slash > 0) {
 			const folderPath = path.slice(0, slash);
 			try {
 				const listed = await this.adapter.list(folderPath);
+				trace.push({ folderPath, listed });
 				if (listed.files.length > 0 || listed.folders.length > 0) return;
 				await this.adapter.rmdir(folderPath, false);
 			} catch (error) {
+				trace.push({ folderPath, error: String(error) });
 				this.logger.debug("prune_folder.skipped", { folderPath, error });
 				return;
 			}

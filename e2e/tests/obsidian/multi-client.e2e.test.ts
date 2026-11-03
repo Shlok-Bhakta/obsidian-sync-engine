@@ -259,6 +259,13 @@ describe("obsidian multi-client e2e", () => {
 			label: "folder delete converges",
 		});
 
+		console.log("PRUNE-DEBUG", JSON.stringify(await clientB.evalAsync(`(async () => ({
+			trace: globalThis.__pruneTrace ?? null,
+			hasPrune: String(app.plugins.getPlugin("obsidian-sync-engine").sync.fs.pruneEmptyParents).slice(0, 80),
+			list: await app.vault.adapter.list("doomed-folder").catch((e) => String(e)),
+			indexed: String(app.vault.getAbstractFileByPath("doomed-folder")?.path),
+			diagnostics: app.plugins.getPlugin("obsidian-sync-engine").sync.engine.isPending?.("doomed-folder/deep/note.md"),
+		}))()`)));
 		await waitFor(
 			async () => {
 				await clientB.forceTick();
@@ -267,7 +274,7 @@ describe("obsidian multi-client e2e", () => {
 					() => true,
 				);
 			},
-			{ timeoutMs: 60_000, label: "doomed-folder gone on B" },
+			{ timeoutMs: 15_000, label: "doomed-folder gone on B" },
 		);
 		expect(await readFile(clientB.vaultPath("kept-folder/stays.md"), "utf8")).toBe(
 			"stays",
