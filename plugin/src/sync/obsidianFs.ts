@@ -379,19 +379,18 @@ export class ObsidianFs implements VaultBlobFs {
 
 	/**
 	 * The server only tracks files, so a folder deleted on another device arrives
-	 * as deletes of its files. Removes the folders that leaves empty. Without
-	 * `force`, Obsidian refuses a folder that still has hidden children.
+	 * as deletes of its files. Removes the folders that leaves empty. This asks
+	 * the adapter because the vault index still lists a file just after deleting
+	 * it, and a non-recursive rmdir can't take anything created in the meantime.
 	 */
 	private async pruneEmptyParents(path: string): Promise<void> {
-		if (!this.vault) return;
 		let slash = path.lastIndexOf("/");
 		while (slash > 0) {
 			const folderPath = path.slice(0, slash);
-			const folder = this.vault.getAbstractFileByPath(folderPath);
-			if (!(folder instanceof TFolder) || folder.children.length > 0) return;
 			try {
-				// eslint-disable-next-line obsidianmd/prefer-file-manager-trash-file
-				await this.vault.delete(folder, false);
+				const listed = await this.adapter.list(folderPath);
+				if (listed.files.length > 0 || listed.folders.length > 0) return;
+				await this.adapter.rmdir(folderPath, false);
 			} catch (error) {
 				this.logger.debug("prune_folder.skipped", { folderPath, error });
 				return;
