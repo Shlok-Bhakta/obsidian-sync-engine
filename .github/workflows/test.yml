@@ -81,6 +81,56 @@ jobs:
       - run: bun install
       - run: bun test
 
+  rust-client:
+    name: Rust client (cargo + interop)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_DB: test_db
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5434:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d test_db"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      E2E_DATABASE_URL: postgres://postgres:postgres@localhost:5434/test_db
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: latest
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22.x
+      - name: Check formatting
+        working-directory: rust-client
+        run: cargo fmt --check
+      - name: Lint
+        working-directory: rust-client
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Unit tests
+        working-directory: rust-client
+        run: cargo test --locked
+      - name: Build client
+        working-directory: rust-client
+        run: cargo build --locked
+      - name: Install protocol, plugin, server and e2e deps
+        run: |
+          npm ci --prefix shared/protocol
+          npm ci --prefix plugin
+          bun install --cwd server
+          bun install --cwd e2e
+      - name: Interop with the plugin engine
+        working-directory: e2e
+        run: bun test tests/rust-client
+
   obsidian-e2e:
     name: Obsidian e2e (CLI + docker)
     runs-on: ubuntu-latest

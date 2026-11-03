@@ -502,6 +502,39 @@ describe("SyncEngine", () => {
 		]);
 	});
 
+	test("an edit made during a remote put's download is not overwritten", async () => {
+		const fs = new MemoryVaultFs();
+		await fs.write("a.md", "old");
+		const transport = new FakeTransport();
+		transport.remoteFiles.set("a.md", "old");
+		transport.revision = 1;
+		transport.log.push({ rev: 1, op: "put", path: "a.md" });
+		const revision = createRevisionStore(0);
+		const engine = new SyncEngine({
+			fs,
+			transport,
+			outboxPath: OUTBOX,
+			inboxPath: INBOX,
+			getRevision: revision.get,
+			setRevision: revision.set,
+			debounceMs: 0,
+		});
+		const download = transport.download.bind(transport);
+		transport.download = async (path) => {
+			const data = await download(path);
+			await fs.write("a.md", "edited during download");
+			engine.enqueuePut("a.md");
+			return data;
+		};
+
+		await engine.tick();
+		transport.download = download;
+		await engine.tick();
+
+		expect(await fs.read("a.md")).toBe("edited during download");
+		expect(transport.remoteFiles.get("a.md")).toBe("edited during download");
+	});
+
 	test("a remote put whose download 404s is skipped so apply can advance", async () => {
 		const fs = new MemoryVaultFs();
 		const transport = new FakeTransport();

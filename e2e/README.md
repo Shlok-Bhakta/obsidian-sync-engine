@@ -37,6 +37,7 @@ cd e2e && bun test tests/obsidian
 | E2 | Preview-safe, single-use client package as a second client without startup re-uploads |
 | E3 | Edit on A → appears on B |
 | E4 | Delete on A → gone on B |
+| E4b | Folder delete on A → folder gone on B, folders with other files stay |
 | E5 | Self-echo does not duplicate |
 | E6 | Offline edits drain after reconnect |
 | E7 | Binary / html / nested round-trip |
@@ -51,3 +52,19 @@ explicit sync rounds. Polling observes those conditions directly; fixed sleeps
 are not used as correctness gates.
 
 Runtime artifacts land in `e2e/.run/` (gitignored).
+
+## Rust client interop
+
+`tests/rust-client` runs the compiled Rust client against the real server, with the
+plugin's own `SyncEngine` and `HttpTransport` as the second device. It needs no
+Obsidian image.
+
+```bash
+cargo build --manifest-path rust-client/Cargo.toml
+cd e2e && bun test tests/rust-client
+```
+
+On a machine that filters loopback traffic, new connections to the Bun server can
+stall on connect and tests time out, with sockets piling up in `LAST-ACK`. If you see
+that, run the suite in a network namespace that has Postgres in it, such as the
+database container's (`podman unshare nsenter --net=/proc/<pid>/ns/net ...`).

@@ -314,23 +314,34 @@ describe("object store", () => {
 			FROM generate_series(1, ${fileCount}) AS generated(i)
 		`;
 
-		let heartbeatCount = 0;
+		let eventLoopTurns = 0;
+		let progressUpdatesAfterEventLoopTurn = 0;
 		const progressUpdates: Array<{
 			phase: "preparing" | "archiving" | "finalizing";
 			processedFiles: number;
 			totalFiles: number;
 		}> = [];
-		const heartbeat = setInterval(() => heartbeatCount++, 1);
+		let countTurns = true;
+		const countTurn = () => {
+			if (!countTurns) return;
+			eventLoopTurns++;
+			setImmediate(countTurn);
+		};
+		setImmediate(countTurn);
 		let archive: Buffer;
 		try {
 			archive = await new ObjectStore().createClientArchive({
 				serverUrl: "https://sync.example",
 				clientName: "large-vault-client",
 				clientSecret: "obs_sync_large_vault",
-				onProgress: (progress) => progressUpdates.push(progress),
+				onProgress: (progress) => {
+					progressUpdates.push(progress);
+					if (eventLoopTurns > 0) progressUpdatesAfterEventLoopTurn++;
+					eventLoopTurns = 0;
+				},
 			});
 		} finally {
-			clearInterval(heartbeat);
+			countTurns = false;
 		}
 
 		const entries = unzipSync(archive);
@@ -341,9 +352,10 @@ describe("object store", () => {
 		expect(new TextDecoder().decode(entries["bulk/note-1500.md"])).toContain(
 			"vault-content-1500",
 		);
-		// A synchronous all-at-once ZIP build only lets this timer fire around
-		// database I/O. Streaming compression yields at least once per ten files.
-		expect(heartbeatCount).toBeGreaterThan(50);
+		// Progress is reported every ten files. Without a yield per ten files, the
+		// event loop only turns around each 50-file database batch, about 30 times.
+		// This counts turns rather than a timer, so a fast machine can't fail it.
+		expect(progressUpdatesAfterEventLoopTurn).toBeGreaterThan(50);
 		expect(progressUpdates[0]).toEqual({
 			phase: "preparing",
 			processedFiles: 0,

@@ -729,6 +729,16 @@ export class SyncEngine {
 			throw error;
 		}
 		this.assertActive();
+		// The download can return content older than an edit made while it ran.
+		// Writing it would lose that edit, and the queued put would then upload
+		// the older content. The local edit wins, as it does for a deferred op.
+		if (this.pendingOutboxPaths.has(path)) {
+			this.logger.info("inbox.put_skipped", {
+				path,
+				reason: "local_edit_during_download",
+			});
+			return;
+		}
 		await this.fs.writeBinary(path, data);
 	}
 

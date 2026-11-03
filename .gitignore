@@ -29,5 +29,8 @@ logfile
 mprocs.log
 object-data
 
+# Rust client build output
+rust-client/target
+
 # e2e runtime artifacts
 e2e/.run/
