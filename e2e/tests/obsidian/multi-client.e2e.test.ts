@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { join } from "node:path";
-import { mkdir, rm, writeFile, readFile } from "node:fs/promises";
+import { mkdir, rm, stat, writeFile, readFile } from "node:fs/promises";
 import { $ } from "bun";
 import { ObsidianClient } from "../../src/obsidian-client";
 import { startStack, type Stack } from "../../src/stack";
@@ -244,6 +244,35 @@ describe("obsidian multi-client e2e", () => {
 			{ timeoutMs: 60_000, label: "ToDelete.md gone on B" },
 		);
 	}, 120_000);
+
+	test("E4b: a folder deleted on A disappears on B", async () => {
+		await clientA.writeNote("doomed-folder/deep/note.md", "temporary");
+		await clientA.writeNote("kept-folder/stays.md", "stays");
+		await clientA.writeNote("kept-folder/goes.md", "goes");
+		await waitForStableConvergence([clientA, clientB], stack, {
+			label: "folders exist before delete",
+		});
+
+		await clientA.deleteNote("doomed-folder");
+		await clientA.deleteNote("kept-folder/goes.md");
+		await waitForStableConvergence([clientA, clientB], stack, {
+			label: "folder delete converges",
+		});
+
+		await waitFor(
+			async () => {
+				await clientB.forceTick();
+				return stat(clientB.vaultPath("doomed-folder")).then(
+					() => false,
+					() => true,
+				);
+			},
+			{ timeoutMs: 60_000, label: "doomed-folder gone on B" },
+		);
+		expect(await readFile(clientB.vaultPath("kept-folder/stays.md"), "utf8")).toBe(
+			"stays",
+		);
+	}, 180_000);
 
 	test("E5: self-echo does not duplicate content on A", async () => {
 		await clientA.appendNote("Welcome.md", "\\n<!-- e5 -->");

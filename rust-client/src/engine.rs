@@ -815,6 +815,13 @@ impl SyncEngine {
         for tracked in self.tracker.tracked_under(path) {
             self.tracker.forget(&tracked);
         }
+        // The server only tracks files, so a folder deleted on another device
+        // arrives as deletes of its files. Hidden folders hold app config.
+        if !path.split('/').any(|segment| segment.starts_with('.'))
+            && let Err(error) = self.fs.prune_empty_parents(path)
+        {
+            crate::warning!("inbox.prune_failed", path = path, error = error.to_string(),);
+        }
         Ok(())
     }
 }
@@ -1194,6 +1201,27 @@ mod tests {
         assert!(h.server().uploads.is_empty());
         assert_eq!(h.server().deletes.len(), 1);
         assert!(h.outbox().is_empty());
+    }
+
+    #[test]
+    fn a_remote_delete_prunes_visible_folders_only() {
+        let mut h = Harness::new(0);
+        h.engine.startup_reconcile(true).unwrap();
+        h.server().remote_delete("folder/note.md");
+        h.server().remote_delete(".obsidian/snippets/old.css");
+        assert!(h.engine.tick().ok());
+        assert_eq!(h.fs.pruned(), ["folder/note.md"]);
+    }
+
+    #[test]
+    fn a_failed_prune_still_applies_the_delete() {
+        let mut h = Harness::new(0);
+        h.engine.startup_reconcile(true).unwrap();
+        h.server().remote_delete("folder/note.md");
+        h.fs.fail_next("prune", 1);
+        assert!(h.engine.tick().ok());
+        assert_eq!(h.rev(), 1);
+        assert!(h.inbox().is_empty());
     }
 
     #[test]

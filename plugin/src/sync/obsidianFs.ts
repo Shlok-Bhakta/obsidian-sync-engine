@@ -353,6 +353,7 @@ export class ObsidianFs implements VaultBlobFs {
 				}
 				throw error;
 			}
+			await this.pruneEmptyParents(normalized);
 			this.logger.debug("remove.completed", {
 				path: normalized,
 				existed: true,
@@ -373,6 +374,29 @@ export class ObsidianFs implements VaultBlobFs {
 				existed: false,
 				target: "adapter",
 			});
+		}
+	}
+
+	/**
+	 * The server only tracks files, so a folder deleted on another device arrives
+	 * as deletes of its files. Removes the folders that leaves empty. Without
+	 * `force`, Obsidian refuses a folder that still has hidden children.
+	 */
+	private async pruneEmptyParents(path: string): Promise<void> {
+		if (!this.vault) return;
+		let slash = path.lastIndexOf("/");
+		while (slash > 0) {
+			const folderPath = path.slice(0, slash);
+			const folder = this.vault.getAbstractFileByPath(folderPath);
+			if (!(folder instanceof TFolder) || folder.children.length > 0) return;
+			try {
+				// eslint-disable-next-line obsidianmd/prefer-file-manager-trash-file
+				await this.vault.delete(folder, false);
+			} catch (error) {
+				this.logger.debug("prune_folder.skipped", { folderPath, error });
+				return;
+			}
+			slash = folderPath.lastIndexOf("/");
 		}
 	}
 

@@ -149,6 +149,10 @@ Changed on purpose:
 - A bare `404` in an error message does not count as a missing file. Only a real 404
   status does.
 
+Both clients remove a visible folder once a delete from another device leaves it empty,
+because the server only tracks files. Hidden folders and folders you emptied yourself
+stay. An empty folder you create does not sync.
+
 If you start the service after editing files with nothing running, those edits are
 detected at startup. The exception is when `data.json` has moved past the manifest,
 which means the plugin ran or the client crashed. The client then rebuilds the

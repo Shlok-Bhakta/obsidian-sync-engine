@@ -35,6 +35,9 @@ pub trait SyncFs {
     fn write_binary(&self, path: &str, data: &[u8]) -> io::Result<()>;
     /// Removes a file, or a directory recursively. Missing paths are fine.
     fn remove(&self, path: &str) -> io::Result<()>;
+    /// Removes the empty folders above `path`, deepest first, stopping at the
+    /// first one still in use. Never removes the vault root.
+    fn prune_empty_parents(&self, path: &str) -> io::Result<()>;
     /// Every regular file at or below `prefix` (`""` for the whole vault).
     fn list_files_under(&self, prefix: &str) -> io::Result<Vec<String>>;
 }
@@ -300,6 +303,19 @@ impl SyncFs for LocalFs {
         }
     }
 
+    fn prune_empty_parents(&self, path: &str) -> io::Result<()> {
+        self.assert_no_symlinked_ancestor(path)?;
+        for dir in ancestor_dirs(path).into_iter().rev() {
+            match fs::remove_dir(self.resolve(&dir)?) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                // Not empty, or not a plain folder: everything above it stays too.
+                Err(_) => return Ok(()),
+            }
+        }
+        Ok(())
+    }
+
     fn list_files_under(&self, prefix: &str) -> io::Result<Vec<String>> {
         let mut files = Vec::new();
         let start = if prefix.is_empty() {
@@ -358,11 +374,17 @@ pub mod memory {
         clock: AtomicU64,
         /// Remaining forced failures per operation name.
         failures: Mutex<BTreeMap<&'static str, u32>>,
+        /// Paths passed to `prune_empty_parents`. This fake stores no folders.
+        pruned: Mutex<Vec<String>>,
     }
 
     impl MemoryFs {
         pub fn new() -> Self {
             Self::default()
+        }
+
+        pub fn pruned(&self) -> Vec<String> {
+            self.pruned.lock().unwrap().clone()
         }
 
         pub fn put(&self, path: &str, data: &[u8]) {
@@ -492,6 +514,12 @@ pub mod memory {
                 .lock()
                 .unwrap()
                 .retain(|key, _| key != path && !key.starts_with(&prefix));
+            Ok(())
+        }
+
+        fn prune_empty_parents(&self, path: &str) -> io::Result<()> {
+            self.check_failure("prune")?;
+            self.pruned.lock().unwrap().push(path.to_string());
             Ok(())
         }
 
@@ -636,6 +664,35 @@ mod tests {
         fs.remove("b.md/child").unwrap();
         fs.remove("folder").unwrap();
         assert!(!dir.path().join("folder").exists());
+    }
+
+    #[test]
+    fn pruning_removes_only_empty_parents() {
+        let (dir, fs) = local();
+        fs.write_binary("a/b/c/note.md", b"x").unwrap();
+        fs.write_binary("a/keep.md", b"x").unwrap();
+        fs.remove("a/b/c/note.md").unwrap();
+        fs.prune_empty_parents("a/b/c/note.md").unwrap();
+        assert!(!dir.path().join("a/b").exists());
+        assert!(dir.path().join("a/keep.md").exists());
+
+        fs.remove("a/keep.md").unwrap();
+        fs.prune_empty_parents("a/keep.md").unwrap();
+        assert!(!dir.path().join("a").exists());
+        assert!(dir.path().exists());
+        fs.prune_empty_parents("top-level.md").unwrap();
+        fs.prune_empty_parents("never/existed.md").unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pruning_never_follows_a_symlink() {
+        let (dir, fs) = local();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
+        assert!(fs.prune_empty_parents("link/gone.md").is_err());
+        assert!(outside.path().exists());
+        assert!(dir.path().join("link").exists());
     }
 
     #[test]

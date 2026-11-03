@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { chmod, copyFile, cp, mkdir, mkdtemp, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, copyFile, cp, mkdir, mkdtemp, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { $ } from "bun";
@@ -342,6 +342,20 @@ describe("rust client interop", () => {
 			expect(files["remove-from-plugin.md"]).toBeUndefined();
 			expect(files["remove-from-rust.md"]).toBeUndefined();
 		}
+	}, 60_000);
+
+	test("a folder deleted on the other device disappears here", async () => {
+		await plugin.write("doomed/nested/note.md", "x");
+		await plugin.write("kept/stays.md", "y");
+		await plugin.write("kept/goes.md", "z");
+		await plugin.tick();
+		await converge("folders exist");
+		await plugin.delete("doomed/nested/note.md");
+		await plugin.delete("kept/goes.md");
+		await plugin.tick();
+		await converge("files deleted");
+		await expect(stat(join(rustVault, "doomed"))).rejects.toThrow();
+		expect(await readFile(join(rustVault, "kept/stays.md"), "utf8")).toBe("y");
 	}, 60_000);
 
 	test("file and folder renames propagate as delete plus put", async () => {
