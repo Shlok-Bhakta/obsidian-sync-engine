@@ -381,7 +381,8 @@ export class ObsidianFs implements VaultBlobFs {
 	 * The server only tracks files, so a folder deleted on another device arrives
 	 * as deletes of its files. Removes the folders that leaves empty. This asks
 	 * the adapter because the vault index still lists a file just after deleting
-	 * it, and a non-recursive rmdir can't take anything created in the meantime.
+	 * it. `rmdir` has to be recursive because the desktop adapter fails with
+	 * EISDIR otherwise, so the listing is what keeps it to empty folders.
 	 */
 	private async pruneEmptyParents(path: string): Promise<void> {
 		let slash = path.lastIndexOf("/");
@@ -390,7 +391,7 @@ export class ObsidianFs implements VaultBlobFs {
 			try {
 				const listed = await this.adapter.list(folderPath);
 				if (listed.files.length > 0 || listed.folders.length > 0) return;
-				await this.adapter.rmdir(folderPath, false);
+				await this.adapter.rmdir(folderPath, true);
 			} catch (error) {
 				this.logger.debug("prune_folder.skipped", { folderPath, error });
 				return;

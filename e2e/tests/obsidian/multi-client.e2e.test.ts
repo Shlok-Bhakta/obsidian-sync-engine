@@ -262,10 +262,14 @@ describe("obsidian multi-client e2e", () => {
 		await waitFor(
 			async () => {
 				await clientB.forceTick();
-				return stat(clientB.vaultPath("doomed-folder")).then(
-					() => false,
+				const onDisk = await stat(clientB.vaultPath("doomed-folder")).then(
 					() => true,
+					() => false,
 				);
+				const inIndex = await clientB.evalAsync<boolean>(
+					`Promise.resolve(Boolean(app.vault.getAbstractFileByPath("doomed-folder")))`,
+				);
+				return !onDisk && !inIndex;
 			},
 			{ timeoutMs: 60_000, label: "doomed-folder gone on B" },
 		);

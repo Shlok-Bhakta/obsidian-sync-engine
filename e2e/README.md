@@ -37,6 +37,7 @@ cd e2e && bun test tests/obsidian
 | E2 | Preview-safe, single-use client package as a second client without startup re-uploads |
 | E3 | Edit on A → appears on B |
 | E4 | Delete on A → gone on B |
+| E4b | Folder delete on A → folder gone on B, folders with other files stay |
 | E5 | Self-echo does not duplicate |
 | E6 | Offline edits drain after reconnect |
 | E7 | Binary / html / nested round-trip |
